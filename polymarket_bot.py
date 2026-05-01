@@ -38,16 +38,176 @@ recent_market_trades = defaultdict(list)
 CATEGORY_KEYWORDS = {
     "politics": ["election","president","senate","congress","vote","trump","biden",
                  "democrat","republican","political","governor","primary","ballot",
-                 "policy","government","fed ","federal reserve","tariff","nato"],
+                 "policy","government","fed ","federal reserve","tariff","nato",
+                 "white house","supreme court","legislation","minister","parliament",
+                 "impeach","cabinet","veto","sanctions","diplomatic"],
     "crypto":   ["bitcoin","btc","ethereum","eth","crypto","solana","sol","coin",
-                 "token","defi","nft","blockchain","binance","coinbase","doge","xrp"],
-    "sports":   ["nba","nfl","mlb","nhl","soccer","football","basketball","baseball",
-                 "hockey","tennis","golf","ufc","mma","championship","super bowl",
-                 "world cup","playoffs","finals","league","suns","lakers","warriors"],
-    "finance":  ["stock","market","s&p","nasdaq","dow","fed rate","interest rate",
-                 "gdp","inflation","recession","earnings","ipo","merger"],
+                 "token","defi","nft","blockchain","binance","coinbase","doge","xrp",
+                 "avalanche","avax","polygon","matic","chainlink","link","uniswap",
+                 "pepe","shib","shiba","cardano","ada","polkadot","dot","crypto market"],
+        "sports":   [
+        # Generic sports terms
+        "nba","nfl","mlb","nhl","ufc","mma","ncaa","espn","match","game","season",
+        "playoff","playoffs","finals","championship","tournament","trophy","medal",
+        "super bowl","world cup","world series","stanley cup","nba finals",
+        "win","wins","beat","defeat","score","roster","draft","trade","signing",
+        "coach","manager","referee","athlete","player","team","sport","league",
+        "fixture","kickoff","kick off","halftime","overtime","extra time","penalty",
+        "transfer","contract","injured","injury","suspended","ban","relegation","promotion",
+
+        # === NBA ALL 30 TEAMS ===
+        "atlanta hawks","boston celtics","brooklyn nets","charlotte hornets",
+        "chicago bulls","cleveland cavaliers","dallas mavericks","denver nuggets",
+        "detroit pistons","golden state warriors","houston rockets","indiana pacers",
+        "los angeles clippers","los angeles lakers","memphis grizzlies","miami heat",
+        "milwaukee bucks","minnesota timberwolves","new orleans pelicans","new york knicks",
+        "oklahoma city thunder","orlando magic","philadelphia 76ers","phoenix suns",
+        "portland trail blazers","sacramento kings","san antonio spurs","toronto raptors",
+        "utah jazz","washington wizards",
+        "hawks","celtics","nets","hornets","bulls","cavaliers","cavs","mavericks","mavs",
+        "nuggets","pistons","warriors","rockets","pacers","clippers","lakers","grizzlies",
+        "heat","bucks","timberwolves","wolves","pelicans","knicks","thunder","magic",
+        "76ers","sixers","suns","blazers","kings","spurs","raptors","jazz","wizards",
+        "lebron","curry","durant","giannis","jokic","embiid","tatum","luka","shai",
+        "kawhi","cp3","westbrook","harden","booker","morant","zion","wembanyama",
+
+        # === NFL ALL 32 TEAMS ===
+        "arizona cardinals","atlanta falcons","baltimore ravens","buffalo bills",
+        "carolina panthers","chicago bears","cincinnati bengals","cleveland browns",
+        "dallas cowboys","denver broncos","detroit lions","green bay packers",
+        "houston texans","indianapolis colts","jacksonville jaguars","kansas city chiefs",
+        "las vegas raiders","los angeles chargers","los angeles rams","miami dolphins",
+        "minnesota vikings","new england patriots","new orleans saints","new york giants",
+        "new york jets","philadelphia eagles","pittsburgh steelers","san francisco 49ers",
+        "seattle seahawks","tampa bay buccaneers","tennessee titans","washington commanders",
+        "cardinals","falcons","ravens","bills","panthers","bears","bengals","browns",
+        "cowboys","broncos","lions","packers","texans","colts","jaguars","jags","chiefs",
+        "raiders","chargers","rams","dolphins","vikings","patriots","saints","giants",
+        "jets","eagles","steelers","49ers","niners","seahawks","buccaneers","bucs",
+        "titans","commanders",
+        "mahomes","josh allen","lamar jackson","burrow","hurts","prescott","stroud",
+        "stafford","goff","cousins","fields","love","pickett","purdy",
+
+        # === MLB ALL 30 TEAMS ===
+        "arizona diamondbacks","atlanta braves","baltimore orioles","boston red sox",
+        "chicago cubs","chicago white sox","cincinnati reds","cleveland guardians",
+        "colorado rockies","detroit tigers","houston astros","kansas city royals",
+        "los angeles angels","los angeles dodgers","miami marlins","milwaukee brewers",
+        "minnesota twins","new york mets","new york yankees","oakland athletics",
+        "philadelphia phillies","pittsburgh pirates","san diego padres","san francisco giants",
+        "seattle mariners","st. louis cardinals","tampa bay rays","texas rangers",
+        "toronto blue jays","washington nationals",
+        "diamondbacks","dbacks","braves","orioles","red sox","cubs","white sox","reds",
+        "guardians","rockies","tigers","astros","royals","angels","dodgers","marlins",
+        "brewers","twins","mets","yankees","athletics","a's","phillies","pirates",
+        "padres","mariners","cardinals","rays","rangers","blue jays","nationals",
+        "world series","home run","pitcher","batting","strikeout","bullpen","lineup",
+
+        # === NHL ALL 32 TEAMS ===
+        "anaheim ducks","arizona coyotes","boston bruins","buffalo sabres",
+        "calgary flames","carolina hurricanes","chicago blackhawks","colorado avalanche",
+        "columbus blue jackets","dallas stars","detroit red wings","edmonton oilers",
+        "florida panthers","los angeles kings","minnesota wild","montreal canadiens",
+        "nashville predators","new jersey devils","new york islanders","new york rangers",
+        "ottawa senators","philadelphia flyers","pittsburgh penguins","san jose sharks",
+        "seattle kraken","st. louis blues","tampa bay lightning","toronto maple leafs",
+        "utah hockey club","vancouver canucks","vegas golden knights","washington capitals",
+        "winnipeg jets",
+        "ducks","bruins","sabres","flames","hurricanes","canes","blackhawks","avalanche",
+        "avs","blue jackets","stars","red wings","oilers","florida panthers","kings",
+        "wild","canadiens","habs","predators","preds","devils","islanders","rangers",
+        "senators","sens","flyers","penguins","pens","sharks","kraken","blues",
+        "lightning","bolts","maple leafs","leafs","canucks","golden knights","capitals",
+        "caps","jets","stanley cup","puck","goalie","hat trick","power play",
+
+        # === PREMIER LEAGUE (England) ===
+        "arsenal","aston villa","bournemouth","brentford","brighton","burnley",
+        "chelsea","crystal palace","everton","fulham","liverpool","luton",
+        "manchester city","manchester united","newcastle","nottingham forest",
+        "sheffield united","tottenham","west ham","wolves","wolverhampton",
+        "man city","man united","man utd","spurs","premier league","epl",
+
+        # === LA LIGA (Spain) ===
+        "real madrid","barcelona","atletico madrid","sevilla","real sociedad",
+        "villarreal","real betis","athletic bilbao","valencia","osasuna",
+        "getafe","rayo vallecano","celta vigo","cadiz","almeria","mallorca",
+        "las palmas","girona","deportivo alaves","granada","la liga",
+
+        # === BUNDESLIGA (Germany) ===
+        "bayern munich","borussia dortmund","bayer leverkusen","rb leipzig",
+        "union berlin","sc freiburg","eintracht frankfurt","wolfsburg",
+        "borussia monchengladbach","mainz","hoffenheim","werder bremen",
+        "augsburg","vfb stuttgart","bochum","cologne","darmstadt","heidenheim",
+        "bundesliga","bvb","fcb",
+
+        # === SERIE A (Italy) ===
+        "juventus","inter milan","ac milan","napoli","lazio","roma","atalanta",
+        "fiorentina","bologna","torino","monza","sassuolo","udinese","empoli",
+        "salernitana","lecce","cagliari","frosinone","genoa","verona","serie a",
+
+        # === LIGUE 1 (France) ===
+        "paris saint-germain","psg","marseille","lyon","monaco","lille","nice",
+        "rennes","lens","montpellier","strasbourg","nantes","reims","toulouse",
+        "lorient","metz","brest","le havre","clermont","ligue 1",
+
+        # === UEFA CHAMPIONS LEAGUE / EUROPA ===
+        "champions league","europa league","conference league","uefa","ucl",
+        "group stage","knockout","quarterfinal","semifinal","final",
+
+        # === MLS (USA/Canada) ===
+        "mls","major league soccer","la galaxy","inter miami","nycfc","red bulls",
+        "atlanta united","seattle sounders","portland timbers","toronto fc",
+        "austin fc","charlotte fc","chicago fire","colorado rapids","columbus crew",
+        "dc united","fc dallas","houston dynamo","minnesota united","montreal impact",
+        "cf montreal","nashville sc","new england revolution","orlando city",
+        "philadelphia union","real salt lake","san jose earthquakes","sporting kc",
+        "st. louis city","vancouver whitecaps","cruz azul","leon",
+
+        # === UFC / BOXING / COMBAT SPORTS ===
+        "ufc","mma","boxing","fight","bout","knockout","ko","tko","submission",
+        "round","heavyweight","lightweight","welterweight","middleweight",
+        "featherweight","bantamweight","flyweight","strawweight","title fight",
+        "jones","fury","wilder","canelo","crawford","usyk","joshua","haney",
+        "lomachenko","tank davis","garcia","shakur","benavidez","charlo",
+        "mcgregor","khabib","poirier","volkanovski","adesanya","pereira",
+        "strickland","sean o'malley","ngannou","aspinall","miocic","cormier",
+
+        # === TENNIS ===
+        "tennis","wimbledon","us open","french open","australian open","roland garros",
+        "atp","wta","grand slam","djokovic","federer","nadal","alcaraz","sinner",
+        "medvedev","zverev","tsitsipas","rublev","serena","swiatek","sabalenka",
+        "gauff","rybakina","keys","halep","murray","wawrinka",
+
+        # === GOLF ===
+        "golf","pga","masters","the open","us open golf","ryder cup","presidents cup",
+        "tiger woods","rory mcilroy","jon rahm","scottie scheffler","bryson","koepka",
+        "dustin johnson","phil mickelson","liv golf","augusta",
+
+        # === FORMULA 1 / MOTORSPORT ===
+        "formula 1","formula one","f1","nascar","indycar","grand prix","race",
+        "driver","lap","pole position","pit stop","ferrari","mercedes","red bull racing",
+        "mclaren","alpine","aston martin","williams","hamilton","verstappen","leclerc",
+        "norris","sainz","perez","alonso","russell","vettel","ricciardo",
+
+        # === OLYMPICS / INTERNATIONAL ===
+        "olympics","olympic games","world athletics","commonwealth games",
+        "swimming","gymnastics","track and field","cycling","rowing","volleyball",
+        "handball","rugby","cricket","icc","test match","odi","t20","ashes",
+        "rugby world cup","six nations","super rugby","all blacks","springboks",
+
+        # === ESPORTS ===
+        "esports","e-sports","league of legends","lol","valorant","csgo","cs2",
+        "dota","overwatch","call of duty","fortnite","gaming tournament",
+        "worlds","lcs","lec","blast","major","pro league",
+    ],
+    "finance":  ["stock","s&p","nasdaq","dow","fed rate","interest rate",
+                 "gdp","inflation","recession","earnings","ipo","merger",
+                 "wall street","hedge fund","bond","yield","treasury","forex",
+                 "gold","silver","oil","crude","commodity","real estate","housing"],
     "science":  ["ai","artificial intelligence","space","nasa","climate","covid",
-                 "vaccine","drug","fda","tech","technology","openai","gpt"],
+                 "vaccine","drug","fda","openai","gpt","chatgpt","deepmind",
+                 "spacex","rocket","mars","moon","cancer","medical","study",
+                 "research","discovery","experiment","physics","biology"],
 }
 
 def get_category(title):
