@@ -42,21 +42,32 @@ def run_prediction():
         print(f"Prediction error: {e}")
         traceback.print_exc()
 
+def run_postmortem():
+    try:
+        print("Post-mortem thread starting...")
+        subprocess.run([sys.executable, 'postmortem_agent.py'])
+    except Exception as e:
+        print(f"Post-mortem error: {e}")
+        traceback.print_exc()
+
 print("Launcher starting all processes...")
 t1 = threading.Thread(target=run_bot)
 t2 = threading.Thread(target=run_scanner)
 t3 = threading.Thread(target=run_research)
 t4 = threading.Thread(target=run_risk)
 t5 = threading.Thread(target=run_prediction)
+t6 = threading.Thread(target=run_postmortem)
 
 t1.start()
 t2.start()
 t3.start()
 t4.start()
 t5.start()
+t6.start()
 
 t1.join()
 t2.join()
 t3.join()
 t4.join()
 t5.join()
+t6.join()
