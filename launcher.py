@@ -18,12 +18,23 @@ def run_scanner():
         print(f"Scanner error: {e}")
         traceback.print_exc()
 
-print("Launcher starting both processes...")
+def run_research():
+    try:
+        print("Research thread starting...")
+        subprocess.run([sys.executable, 'research_agent.py'])
+    except Exception as e:
+        print(f"Research error: {e}")
+        traceback.print_exc()
+
+print("Launcher starting all processes...")
 t1 = threading.Thread(target=run_bot)
 t2 = threading.Thread(target=run_scanner)
+t3 = threading.Thread(target=run_research)
 
 t1.start()
 t2.start()
+t3.start()
 
 t1.join()
 t2.join()
+t3.join()
