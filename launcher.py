@@ -26,15 +26,26 @@ def run_research():
         print(f"Research error: {e}")
         traceback.print_exc()
 
+def run_risk():
+    try:
+        print("Risk thread starting...")
+        subprocess.run([sys.executable, 'risk_agent.py'])
+    except Exception as e:
+        print(f"Risk error: {e}")
+        traceback.print_exc()
+
 print("Launcher starting all processes...")
 t1 = threading.Thread(target=run_bot)
 t2 = threading.Thread(target=run_scanner)
 t3 = threading.Thread(target=run_research)
+t4 = threading.Thread(target=run_risk)
 
 t1.start()
 t2.start()
 t3.start()
+t4.start()
 
 t1.join()
 t2.join()
 t3.join()
+t4.join()
