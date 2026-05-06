@@ -4,12 +4,12 @@ import requests
 from datetime import datetime, timezone
 
 WEBHOOK_SCANNER = os.getenv("WEBHOOK_SCANNER", "")
-CHECK_INTERVAL  = int(os.getenv("SCANNER_INTERVAL", 300))  # every 5 mins
-MIN_LIQUIDITY   = float(os.getenv("MIN_LIQUIDITY", 10000))  # $10k min
-MAX_DAYS_LEFT   = int(os.getenv("MAX_DAYS_LEFT", 30))       # resolves within 30 days
-MIN_VOLUME      = float(os.getenv("MIN_VOLUME", 5000))      # $5k 24hr volume
+CHECK_INTERVAL  = int(os.getenv("SCANNER_INTERVAL", 300))
+MIN_LIQUIDITY   = float(os.getenv("MIN_LIQUIDITY", 10000))
+MAX_DAYS_LEFT   = int(os.getenv("MAX_DAYS_LEFT", 30))
+MIN_VOLUME      = float(os.getenv("MIN_VOLUME", 5000))
 
-DATA_API = "https://data-api.polymarket.com"
+DATA_API  = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
 seen_market_ids = set()
@@ -45,8 +45,6 @@ def calculate_edge(market):
         price = float(market.get("outcomePrices", ["0.5"])[0])
         if price <= 0 or price >= 1:
             return 0
-        # Edge = how far price is from 50/50
-        # Markets near 0.1 or 0.9 have more potential
         distance_from_even = abs(price - 0.5)
         return round(distance_from_even * 100, 1)
     except:
@@ -72,47 +70,54 @@ def get_signal_strength(liquidity, volume, days_left, edge):
     elif days_left <= 14: score += 1
     if edge >= 30: score += 2
     elif edge >= 15: score += 1
-    if score >= 7: return "🔥🔥🔥 STRONG"
-    if score >= 5: return "🔥🔥 MODERATE"
-    return "🔥 WEAK"
+    if score >= 7: return "STRONG"
+    if score >= 5: return "MODERATE"
+    return "WEAK"
 
 def build_scanner_embed(market, days_left, edge, signal):
-    question = market.get("question", "Unknown")
-    slug = market.get("slug", "")
-    liquidity = float(market.get("liquidity", 0))
+    question   = market.get("question", "Unknown")
+    slug       = market.get("slug", "")
+    liquidity  = float(market.get("liquidity", 0))
     volume_24h = float(market.get("volume24hr", 0))
-    prices = market.get("outcomePrices", ["0.5", "0.5"])
-    outcomes = market.get("outcomes", ["YES", "NO"])
-    end_date = market.get("endDate", "")
+    prices     = market.get("outcomePrices", ["0.5", "0.5"])
+    end_date   = market.get("endDate", "")
     market_url = f"https://polymarket.com/event/{slug}"
 
     try:
         yes_price = float(prices[0])
-        no_price = float(prices[1]) if len(prices) > 1 else 1 - yes_price
+        no_price  = float(prices[1]) if len(prices) > 1 else 1 - yes_price
     except:
         yes_price = 0.5
-        no_price = 0.5
+        no_price  = 0.5
 
-    color = 0x00D4FF
+    if signal == "STRONG":
+        color      = 0xFF6600
+        signal_str = "🔥🔥🔥 STRONG"
+    elif signal == "MODERATE":
+        color      = 0x00D4FF
+        signal_str = "🔥🔥 MODERATE"
+    else:
+        color      = 0x888888
+        signal_str = "🔥 WEAK"
 
     fields = [
-        {"name": "📊 Signal", "value": signal, "inline": True},
-        {"name": "💧 Liquidity", "value": format_usd(liquidity), "inline": True},
-        {"name": "📈 24hr Volume", "value": format_usd(volume_24h), "inline": True},
-        {"name": "✅ YES Price", "value": f"{yes_price:.1%}", "inline": True},
-        {"name": "❌ NO Price", "value": f"{no_price:.1%}", "inline": True},
-        {"name": "⏰ Days Left", "value": f"{days_left} days", "inline": True},
-        {"name": "🎯 Edge Score", "value": f"{edge}%", "inline": True},
-        {"name": "🔗 Market", "value": f"[View on Polymarket]({market_url})", "inline": False},
+        {"name": "📊 Signal",      "value": signal_str,              "inline": True},
+        {"name": "💧 Liquidity",   "value": format_usd(liquidity),   "inline": True},
+        {"name": "📈 24hr Volume", "value": format_usd(volume_24h),  "inline": True},
+        {"name": "✅ YES Price",   "value": f"{yes_price:.1%}",      "inline": True},
+        {"name": "❌ NO Price",    "value": f"{no_price:.1%}",       "inline": True},
+        {"name": "⏰ Days Left",   "value": f"{days_left} days",     "inline": True},
+        {"name": "🎯 Edge Score",  "value": f"{edge}%",              "inline": True},
+        {"name": "🔗 Market",      "value": f"[View on Polymarket]({market_url})", "inline": False},
     ]
 
     return {
         "title": f"🔍 SCANNER — {question[:80]}",
-        "url": market_url,
+        "url":   market_url,
         "color": color,
         "fields": fields,
-        "footer": {"text": f"PassivePoly Scanner  •  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"},
-        "timestamp": datetime.utcnow().isoformat()
+        "footer": {"text": f"PassivePoly Scanner  •  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"},
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 def send_discord(embed):
@@ -121,9 +126,14 @@ def send_discord(embed):
         return
     try:
         r = requests.post(WEBHOOK_SCANNER, json={"embeds": [embed]}, timeout=10)
-        if r.status_code not in (200, 204):
+        if r.status_code == 429:
+            retry_after = r.json().get("retry_after", 2)
+            print(f"[WARN] Rate limited — waiting {retry_after}s")
+            time.sleep(float(retry_after) + 0.5)
+            requests.post(WEBHOOK_SCANNER, json={"embeds": [embed]}, timeout=10)
+        elif r.status_code not in (200, 204):
             print(f"[WARN] Discord {r.status_code}: {r.text[:100]}")
-        time.sleep(0.5)
+        time.sleep(1.5)
     except Exception as e:
         print(f"[WARN] Send failed: {e}")
 
@@ -133,7 +143,7 @@ def run():
 
     while True:
         cycle_start = time.time()
-        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Scanning markets...")
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning markets...")
 
         markets = get_markets()
         flagged = 0
@@ -143,10 +153,10 @@ def run():
             if market_id in seen_market_ids:
                 continue
 
-            liquidity = float(market.get("liquidity", 0))
+            liquidity  = float(market.get("liquidity", 0))
             volume_24h = float(market.get("volume24hr", 0))
-            end_date = market.get("endDate", "")
-            days_left = days_until_resolution(end_date)
+            end_date   = market.get("endDate", "")
+            days_left  = days_until_resolution(end_date)
 
             if liquidity < MIN_LIQUIDITY:
                 continue
@@ -155,17 +165,16 @@ def run():
             if days_left > MAX_DAYS_LEFT:
                 continue
 
-            edge = calculate_edge(market)
+            edge   = calculate_edge(market)
             signal = get_signal_strength(liquidity, volume_24h, days_left, edge)
 
-            if "WEAK" in signal:
+            if signal == "WEAK":
                 continue
 
             seen_market_ids.add(market_id)
             embed = build_scanner_embed(market, days_left, edge, signal)
             send_discord(embed)
             flagged += 1
-            time.sleep(0.3)
 
         if len(seen_market_ids) > 10_000:
             seen_market_ids.clear()
