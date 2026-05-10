@@ -1,7 +1,10 @@
+import os
 import subprocess
 import sys
 import threading
 import traceback
+
+from polymarket_bot_endpoints import start_api_server
 
 def run_bot():
     try:
@@ -64,6 +67,16 @@ t3.start()
 t4.start()
 t5.start()
 t6.start()
+
+# HTTP API consumed by the ugc-pipeline (@passivepoly TikTok account).
+# Daemon thread so it never blocks shutdown — if the FastAPI server crashes,
+# the 6 agent threads keep running unaffected.
+threading.Thread(
+    target=start_api_server,
+    kwargs={"host": "0.0.0.0", "port": int(os.environ.get("PORT", 8000))},
+    daemon=True,
+).start()
+print("API server thread started on port", os.environ.get("PORT", 8000))
 
 t1.join()
 t2.join()
