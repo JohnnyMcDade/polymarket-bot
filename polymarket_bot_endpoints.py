@@ -47,9 +47,34 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+
+
+# ── Polymarket public APIs (same ones polymarket_bot.py + scanner_agent.py
+# + postmortem_agent.py use). Each `_fetch_*` below re-derives the answer
+# from these instead of reading the bot's in-memory state, because the bot
+# is a separate subprocess from this API server (launcher.py spawns it via
+# subprocess.run) and there is no shared persistence layer. The thresholds
+# and selection rules mirror the bot — same min trade size, same leaderboard
+# size, same resolution semantics — so the answers are equivalent to what
+# the bot would have alerted on for the window, not a separate signal.
+_DATA_API = "https://data-api.polymarket.com"
+_GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Defaults match polymarket_bot.py's CHECK_INTERVAL / MIN_TRADE_SIZE /
+# TOP_N_TRADERS env defaults — override on Railway to keep the API and bot
+# in sync if you tune the bot.
+_MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 1000))
+_TOP_N_TRADERS = int(os.getenv("TOP_N_TRADERS", 15))
+_HTTP_TIMEOUT = 15
+_MIN_NOTABLE_MARKET_VOLUME = float(os.getenv("MIN_NOTABLE_VOLUME", 10000))
+
+
+class _PolymarketUnavailable(Exception):
+    """Raised when a downstream Polymarket API call fails. Endpoints map to 502."""
 
 
 # --- Auth -------------------------------------------------------------------
@@ -127,6 +152,16 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(_PolymarketUnavailable)
+def _polymarket_unavailable_handler(_request, exc):
+    """Turn upstream Polymarket failures into clean 502s instead of 500s."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content={"detail": f"upstream Polymarket API unavailable: {exc}"},
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     """Liveness probe. Public (no auth) so Railway can hit it."""
@@ -195,48 +230,284 @@ def notable_resolution() -> NotableResolution:
     return NotableResolution(**row)
 
 
-# --- Data layer stubs (FILL THESE IN) ---------------------------------------
-# These are the only functions the rest of the file calls. Replace each body
-# with the read appropriate to your storage layer. Return the shape shown
-# inline. The endpoint handlers above wrap them in pydantic models.
-# ---------------------------------------------------------------------------
+# ── Data layer ────────────────────────────────────────────────────────────
+# Re-derives whale-tracker + win/loss data from Polymarket's public APIs
+# using the same thresholds polymarket_bot.py + postmortem_agent.py use.
+# NOT a read against bot in-memory state — that state lives in a separate
+# subprocess. See header comment for rationale.
+
+def _get_top_traders(top_n: int) -> list[dict[str, Any]]:
+    """Mirror of polymarket_bot.py:get_monthly_leaderboard — top monthly
+    traders sorted by PnL. Falls back to all-time leaderboard if the
+    monthly one is empty (same fallback behavior).
+    """
+    now = datetime.now(tz=timezone.utc)
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        r = requests.get(
+            f"{_DATA_API}/v1/leaderboard",
+            params={"startDate": int(start_of_month.timestamp())},
+            timeout=_HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        traders = r.json()
+        if not isinstance(traders, list) or not traders:
+            r2 = requests.get(f"{_DATA_API}/v1/leaderboard", timeout=_HTTP_TIMEOUT)
+            r2.raise_for_status()
+            traders = r2.json()
+        if not isinstance(traders, list):
+            return []
+        traders.sort(key=lambda t: float(t.get("pnl", 0) or 0), reverse=True)
+        return traders[:top_n]
+    except (requests.RequestException, ValueError) as e:
+        raise _PolymarketUnavailable(f"leaderboard fetch failed: {e}") from e
+
+
+def _get_recent_trades(wallet: str, since_ts: int, limit: int = 20) -> list[dict[str, Any]]:
+    """Mirror of polymarket_bot.py:get_recent_trades."""
+    try:
+        r = requests.get(
+            f"{_DATA_API}/activity",
+            params={
+                "user": wallet,
+                "type": "TRADE",
+                "start": since_ts,
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+                "limit": limit,
+            },
+            timeout=_HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        result = r.json()
+        return result if isinstance(result, list) else []
+    except (requests.RequestException, ValueError):
+        # Per-wallet failures are tolerated — we keep going through the
+        # leaderboard rather than 502'ing the whole request.
+        return []
+
+
+def _confidence_for(trade_value: float, rank: int) -> float:
+    """0.0-1.0 mapping mirroring polymarket_bot.py:get_confidence's tiers."""
+    if trade_value >= 10000 and rank <= 5:
+        return 0.95   # VERY HIGH
+    if trade_value >= 5000 or rank <= 5:
+        return 0.85   # HIGH
+    if trade_value >= 2000 or rank <= 10:
+        return 0.70   # MEDIUM
+    return 0.55       # MODERATE
+
 
 def _fetch_alerts_since(cutoff: datetime) -> list[dict[str, Any]]:
-    """Return a list of dicts shaped like WhaleAlert."""
-    raise NotImplementedError(
-        "Wire _fetch_alerts_since to read from the whale-tracker agent's data store."
+    """For each top trader, fetch their TRADE activity since `cutoff` and
+    return any trades whose value clears `_MIN_TRADE_SIZE` — exactly the
+    filter polymarket_bot.py applies before sending a Discord alert.
+    """
+    traders = _get_top_traders(_TOP_N_TRADERS)
+    if not traders:
+        return []
+
+    cutoff_ts = int(cutoff.timestamp())
+    out: list[dict[str, Any]] = []
+    seen_tx: set[str] = set()
+
+    for rank, trader in enumerate(traders, start=1):
+        wallet = trader.get("proxyWallet")
+        if not wallet:
+            continue
+        for trade in _get_recent_trades(wallet, cutoff_ts):
+            tx_hash = trade.get("transactionHash") or ""
+            if not tx_hash or tx_hash in seen_tx:
+                continue
+            share_size = float(trade.get("size", 0) or 0)
+            price = float(trade.get("price", 0) or 0)
+            trade_value = share_size * price
+            if trade_value < _MIN_TRADE_SIZE:
+                continue
+            seen_tx.add(tx_hash)
+
+            ts = int(trade.get("timestamp", 0) or 0)
+            timestamp = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(tz=timezone.utc)
+            side = trade.get("side", "?")
+            outcome = trade.get("outcome", "?")
+            out.append({
+                "id": tx_hash,
+                "timestamp": timestamp,
+                "market": trade.get("title", "Unknown market"),
+                "market_id": trade.get("conditionId") or trade.get("slug"),
+                "whale_address": wallet,
+                "amount_usd": round(trade_value, 2),
+                "direction": f"{side} {outcome}".strip(),
+                "implied_probability_before": None,   # not exposed by /activity
+                "implied_probability_after": round(price, 4) if 0 < price < 1 else None,
+                "system_confidence": _confidence_for(trade_value, rank),
+            })
+
+    out.sort(key=lambda a: a["timestamp"], reverse=True)
+    return out
+
+
+def _get_resolved_markets(limit: int, order: str = "endDate") -> list[dict[str, Any]]:
+    """Mirror of postmortem_agent.py:get_resolved_markets, plus an order
+    parameter so notable-resolution can ask for most-recent-first.
+    """
+    try:
+        r = requests.get(
+            f"{_GAMMA_API}/markets",
+            params={"closed": "true", "limit": limit, "order": order, "ascending": "false"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("markets", []) or []
+        return []
+    except (requests.RequestException, ValueError) as e:
+        raise _PolymarketUnavailable(f"resolved-markets fetch failed: {e}") from e
+
+
+def _model_call_was_correct(market: dict[str, Any]) -> tuple[bool, float, str]:
+    """Apply postmortem_agent.py's same heuristic: if YES price > 0.5 we'd
+    have recommended BUY_YES, else BUY_NO. Then compare to the winner.
+
+    Returns (was_correct, yes_price, winner_str). Caller decides what to do
+    on missing winner (typically: skip / count as pending).
+    """
+    try:
+        yes_price = float(market.get("outcomePrices", ["0.5"])[0] or 0.5)
+    except (ValueError, TypeError, IndexError):
+        yes_price = 0.5
+    winner = (market.get("winner") or "").lower()
+    our_rec = "yes" if yes_price > 0.5 else "no"
+    correct = (
+        (our_rec == "yes" and "yes" in winner) or
+        (our_rec == "no" and "no" in winner)
     )
+    return correct, yes_price, winner
 
 
 def _aggregate_win_loss_since(cutoff: datetime) -> dict[str, Any]:
-    """Return:
-      {
-        "wins": int,
-        "losses": int,
-        "pending": int,                    # optional
-        "biggest_win_pct": float | None,   # optional
-        "biggest_loss_pct": float | None,  # optional
-      }
+    """Count wins/losses among markets that resolved since `cutoff`.
+
+    PnL percentages are approximations — Polymarket's public markets endpoint
+    doesn't expose the bot's actual entry price for each trade, so we use
+    distance-from-0.5 (the edge our model would have bet on) as a proxy.
     """
-    raise NotImplementedError(
-        "Wire _aggregate_win_loss_since to compute over the postmortem agent's outputs."
-    )
+    markets = _get_resolved_markets(limit=100, order="volume24hr")
+    wins = 0
+    losses = 0
+    pending = 0
+    pnl_pcts: list[float] = []
+
+    for m in markets:
+        end_date_str = m.get("endDate", "")
+        if not end_date_str:
+            continue
+        try:
+            resolved_at = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if resolved_at < cutoff:
+            continue
+
+        winner = m.get("winner") or ""
+        if not winner:
+            pending += 1
+            continue
+
+        correct, yes_price, _ = _model_call_was_correct(m)
+        edge = abs(yes_price - 0.5)
+        if correct:
+            wins += 1
+            pnl_pcts.append(round(edge, 4))
+        else:
+            losses += 1
+            pnl_pcts.append(round(-edge, 4))
+
+    positive = [p for p in pnl_pcts if p > 0]
+    negative = [p for p in pnl_pcts if p < 0]
+    return {
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+        "biggest_win_pct": max(positive) if positive else None,
+        "biggest_loss_pct": min(negative) if negative else None,
+    }
 
 
 def _fetch_biggest_whale_move_since(cutoff: datetime) -> dict[str, Any] | None:
-    """Return a dict shaped like BiggestWhaleMove (without `window_hours`),
-    or None if there were no moves.
+    """Pick the single largest trade from the `_fetch_alerts_since` result.
+
+    Same filter set the bot applies (top-N traders × min trade size), so
+    the answer is "the biggest move the bot would have alerted on in the
+    window," not just "any large trade on Polymarket."
     """
-    raise NotImplementedError(
-        "Wire _fetch_biggest_whale_move_since to your whale-moves table."
-    )
+    alerts = _fetch_alerts_since(cutoff)
+    if not alerts:
+        return None
+    biggest = max(alerts, key=lambda a: a["amount_usd"])
+    return {
+        "whale_address": biggest.get("whale_address"),
+        "market": biggest["market"],
+        "market_id": biggest.get("market_id"),
+        "amount_usd": biggest["amount_usd"],
+        "direction": biggest["direction"],
+        "implied_prob_change": None,   # would need pre/post snapshots we don't have
+        "timestamp": biggest["timestamp"],
+    }
 
 
 def _fetch_notable_resolution() -> dict[str, Any] | None:
-    """Return a dict shaped like NotableResolution, or None."""
-    raise NotImplementedError(
-        "Wire _fetch_notable_resolution to your resolved-markets table."
-    )
+    """Most recent resolved market with at least `_MIN_NOTABLE_MARKET_VOLUME`
+    volume that has a `winner` set. Notability heuristic matches what makes
+    sense for the TikTok content surface: large enough to be recognizable,
+    resolved cleanly, ideally one our heuristic called correctly.
+    """
+    markets = _get_resolved_markets(limit=50, order="endDate")
+    best: dict[str, Any] | None = None
+
+    for m in markets:
+        winner = m.get("winner") or ""
+        if not winner:
+            continue
+        try:
+            volume = float(m.get("volume", 0) or 0)
+        except (ValueError, TypeError):
+            volume = 0.0
+        if volume < _MIN_NOTABLE_MARKET_VOLUME:
+            continue
+        end_date_str = m.get("endDate", "")
+        try:
+            resolved_at = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        correct, yes_price, _ = _model_call_was_correct(m)
+        confidence_at_call = round(abs(yes_price - 0.5) + 0.5, 4)
+
+        candidate = {
+            "market": m.get("question", "Unknown"),
+            "market_id": m.get("id"),
+            "resolved_at": resolved_at,
+            "outcome": winner,
+            "system_called_it_correctly": correct,
+            "system_confidence_at_call": confidence_at_call,
+            "_volume": volume,   # internal sort hint; stripped before return
+        }
+        # Prefer the most recent. Among same-day ties, prefer one we called
+        # correctly (more shareable on the TikTok content side).
+        if best is None or candidate["resolved_at"] > best["resolved_at"]:
+            best = candidate
+        elif (candidate["resolved_at"].date() == best["resolved_at"].date()
+              and candidate["system_called_it_correctly"]
+              and not best["system_called_it_correctly"]):
+            best = candidate
+
+    if best is None:
+        return None
+    best.pop("_volume", None)
+    return best
 
 
 # --- Server entry point -----------------------------------------------------
