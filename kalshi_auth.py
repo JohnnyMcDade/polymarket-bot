@@ -1,7 +1,6 @@
 import os
 import base64
 import time
-from datetime import datetime, timezone
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -11,9 +10,31 @@ KALSHI_BASE_URL    = "https://trading-api.kalshi.com/trade-api/v2"
 
 def load_private_key():
     if not KALSHI_PRIVATE_KEY:
+        print("[WARN] KALSHI_PRIVATE_KEY not set")
         return None
     try:
-        key_data = KALSHI_PRIVATE_KEY.encode("utf-8")
+        key_str = KALSHI_PRIVATE_KEY
+
+        # Fix newlines that get stripped when stored in env vars
+        # Replace literal \n with actual newlines
+        key_str = key_str.replace("\\n", "\n")
+
+        # If key is all on one line, reconstruct proper PEM format
+        if "-----BEGIN" in key_str and "\n" not in key_str:
+            # Extract the base64 body between the headers
+            if "RSA PRIVATE KEY" in key_str:
+                header = "-----BEGIN RSA PRIVATE KEY-----"
+                footer = "-----END RSA PRIVATE KEY-----"
+            else:
+                header = "-----BEGIN PRIVATE KEY-----"
+                footer = "-----END PRIVATE KEY-----"
+
+            body = key_str.replace(header, "").replace(footer, "").strip()
+            # Split into 64-char lines
+            body_lines = [body[i:i+64] for i in range(0, len(body), 64)]
+            key_str = header + "\n" + "\n".join(body_lines) + "\n" + footer + "\n"
+
+        key_data = key_str.encode("utf-8")
         private_key = serialization.load_pem_private_key(key_data, password=None)
         return private_key
     except Exception as e:
@@ -25,9 +46,9 @@ def sign_request(method, path):
     if not private_key:
         return None
 
-    timestamp_ms = str(int(time.time() * 1000))
+    timestamp_ms  = str(int(time.time() * 1000))
     path_no_query = path.split("?")[0]
-    message = timestamp_ms + method.upper() + path_no_query
+    message       = timestamp_ms + method.upper() + path_no_query
 
     try:
         signature = private_key.sign(
@@ -52,6 +73,6 @@ def sign_request(method, path):
 def get_auth_headers(method, path):
     headers = sign_request(method, path)
     if not headers:
-        print("[WARN] Could not generate auth headers — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY")
+        print("[WARN] Auth failed — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY")
         return {"Content-Type": "application/json"}
     return headers
