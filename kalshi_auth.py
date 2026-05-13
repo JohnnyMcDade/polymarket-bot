@@ -7,14 +7,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 KALSHI_API_KEY     = os.getenv("KALSHI_API_KEY", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
-KALSHI_BASE_URL    = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL    = "https://trading-api.kalshi.com/trade-api/v2"
 
 def load_private_key():
     if not KALSHI_PRIVATE_KEY:
         return None
     try:
         key_data = KALSHI_PRIVATE_KEY.encode("utf-8")
-        # Handle both PKCS8 and traditional RSA formats
         private_key = serialization.load_pem_private_key(key_data, password=None)
         return private_key
     except Exception as e:
@@ -27,7 +26,6 @@ def sign_request(method, path):
         return None
 
     timestamp_ms = str(int(time.time() * 1000))
-    # Strip query params from path before signing
     path_no_query = path.split("?")[0]
     message = timestamp_ms + method.upper() + path_no_query
 
