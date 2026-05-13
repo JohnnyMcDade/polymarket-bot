@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 KALSHI_API_KEY     = os.getenv("KALSHI_API_KEY", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
-KALSHI_BASE_URL    = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE_URL    = "https://api.elections.kalshi.com/trade-api/v2"
 
 def load_private_key():
     if not KALSHI_PRIVATE_KEY:
@@ -47,14 +47,14 @@ def get_auth_headers(method, path):
 
     timestamp_ms  = str(int(time.time() * 1000))
     path_no_query = path.split("?")[0]
-    message       = timestamp_ms + method.upper() + path_no_query
+    message       = f"{timestamp_ms}{method.upper()}{path_no_query}".encode("utf-8")
 
     try:
         signature = private_key.sign(
-            message.encode("utf-8"),
+            message,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH  # Kalshi requires DIGEST_LENGTH
+                salt_length=padding.PSS.DIGEST_LENGTH
             ),
             hashes.SHA256()
         )
