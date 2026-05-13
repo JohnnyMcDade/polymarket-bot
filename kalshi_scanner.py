@@ -2,30 +2,20 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
+from kalshi_auth import get_auth_headers, KALSHI_BASE_URL
 
 WEBHOOK_KALSHI_SCANNER = os.getenv("WEBHOOK_KALSHI_SCANNER", "")
 CHECK_INTERVAL         = int(os.getenv("KALSHI_SCANNER_INTERVAL", 600))
-KALSHI_API_KEY         = os.getenv("KALSHI_API_KEY", "")
-
-KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 
 seen_market_ids = set()
 
-def get_headers():
-    return {
-        "Authorization": f"Bearer {KALSHI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
 def get_markets():
+    path = "/trade-api/v2/markets"
     try:
-        params = {
-            "limit": 100,
-            "status": "open",
-        }
+        params = {"limit": 100, "status": "open"}
         r = requests.get(
-            f"{KALSHI_API}/markets",
-            headers=get_headers(),
+            f"{KALSHI_BASE_URL}/markets",
+            headers=get_auth_headers("GET", path),
             params=params,
             timeout=15
         )
@@ -34,19 +24,6 @@ def get_markets():
     except Exception as e:
         print(f"[WARN] Kalshi market fetch failed: {e}")
         return []
-
-def get_market_volume(ticker):
-    try:
-        r = requests.get(
-            f"{KALSHI_API}/markets/{ticker}",
-            headers=get_headers(),
-            timeout=15
-        )
-        r.raise_for_status()
-        return r.json().get("market", {})
-    except Exception as e:
-        print(f"[WARN] Market detail fetch failed: {e}")
-        return {}
 
 def days_until_expiry(close_time_str):
     try:
@@ -76,7 +53,7 @@ def get_signal_strength(volume, days_left, edge):
     if volume >= 100000: score += 3
     elif volume >= 50000: score += 2
     elif volume >= 10000: score += 1
-    if days_left <= 3:  score += 3
+    if days_left <= 3:    score += 3
     elif days_left <= 7:  score += 2
     elif days_left <= 14: score += 1
     if edge >= 10: score += 2
@@ -93,11 +70,11 @@ def format_usd(amount):
     return f"${amount:.2f}"
 
 def build_embed(market, days_left, edge, signal):
-    ticker    = market.get("ticker", "")
-    title     = market.get("title", "Unknown")
-    yes_price = market.get("yes_ask", 50)
-    no_price  = market.get("no_ask", 50)
-    volume    = market.get("volume", 0)
+    ticker     = market.get("ticker", "")
+    title      = market.get("title", "Unknown")
+    yes_price  = market.get("yes_ask", 50)
+    no_price   = market.get("no_ask", 50)
+    volume     = market.get("volume", 0)
     market_url = f"https://kalshi.com/markets/{ticker}"
 
     if signal == "STRONG":
@@ -113,13 +90,13 @@ def build_embed(market, days_left, edge, signal):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     fields = [
-        {"name": "📊 Signal",      "value": signal_str,           "inline": True},
-        {"name": "📈 Volume",      "value": format_usd(volume),   "inline": True},
-        {"name": "⏰ Days Left",   "value": f"{days_left} days",  "inline": True},
-        {"name": "✅ YES Price",   "value": f"{yes_price}¢",      "inline": True},
-        {"name": "❌ NO Price",    "value": f"{no_price}¢",       "inline": True},
-        {"name": "🎯 Edge Score",  "value": f"{edge}%",           "inline": True},
-        {"name": "🔗 Market",      "value": f"[View on Kalshi]({market_url})", "inline": False},
+        {"name": "📊 Signal",     "value": signal_str,          "inline": True},
+        {"name": "📈 Volume",     "value": format_usd(volume),  "inline": True},
+        {"name": "⏰ Days Left",  "value": f"{days_left} days", "inline": True},
+        {"name": "✅ YES Price",  "value": f"{yes_price}¢",     "inline": True},
+        {"name": "❌ NO Price",   "value": f"{no_price}¢",      "inline": True},
+        {"name": "🎯 Edge Score", "value": f"{edge}%",          "inline": True},
+        {"name": "🔗 Market",     "value": f"[View on Kalshi]({market_url})", "inline": False},
     ]
 
     return {
@@ -150,9 +127,6 @@ def send_discord(embed):
 
 def run():
     print("Kalshi Scanner starting...")
-    if not KALSHI_API_KEY:
-        print("[WARN] KALSHI_API_KEY not set!")
-
     while True:
         cycle_start = time.time()
         print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning Kalshi markets...")
@@ -162,21 +136,17 @@ def run():
 
         for market in markets:
             ticker    = market.get("ticker", "")
-            market_id = ticker
-
-            if market_id in seen_market_ids:
+            if ticker in seen_market_ids:
                 continue
 
-            volume    = market.get("volume", 0)
+            volume     = market.get("volume", 0)
             close_time = market.get("close_time", "")
-            yes_price = market.get("yes_ask", 50)
-            days_left = days_until_expiry(close_time)
+            yes_price  = market.get("yes_ask", 50)
+            days_left  = days_until_expiry(close_time)
 
             if volume < 10000:
                 continue
-            if days_left > 30:
-                continue
-            if days_left == 0:
+            if days_left > 30 or days_left == 0:
                 continue
 
             edge   = calculate_edge(yes_price)
@@ -185,7 +155,7 @@ def run():
             if signal == "WEAK":
                 continue
 
-            seen_market_ids.add(market_id)
+            seen_market_ids.add(ticker)
             embed = build_embed(market, days_left, edge, signal)
             send_discord(embed)
             flagged += 1
