@@ -1,4 +1,4 @@
- import os
+import os
 import subprocess
 import sys
 import threading
@@ -86,15 +86,12 @@ def run_kalshi_postmortem():
 
 print("Launcher starting all processes...")
 
-# Polymarket agents
 t1  = threading.Thread(target=run_bot)
 t2  = threading.Thread(target=run_scanner)
 t3  = threading.Thread(target=run_research)
 t4  = threading.Thread(target=run_risk)
 t5  = threading.Thread(target=run_prediction)
 t6  = threading.Thread(target=run_postmortem)
-
-# Kalshi agents
 t7  = threading.Thread(target=run_kalshi_scanner)
 t8  = threading.Thread(target=run_kalshi_tracker)
 t9  = threading.Thread(target=run_kalshi_execution)
@@ -111,9 +108,6 @@ t8.start()
 t9.start()
 t10.start()
 
-# HTTP API consumed by the ugc-pipeline (@passivepoly TikTok account).
-# Daemon thread so it never blocks shutdown — if the FastAPI server crashes,
-# the agent threads keep running unaffected.
 threading.Thread(
     target=start_api_server,
     kwargs={"host": "0.0.0.0", "port": int(os.environ.get("PORT", 8000))},
