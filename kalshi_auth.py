@@ -13,29 +13,32 @@ def load_private_key():
         print("[WARN] KALSHI_PRIVATE_KEY not set")
         return None
     try:
-        key_str = KALSHI_PRIVATE_KEY
+        key_str = KALSHI_PRIVATE_KEY.strip()
 
-        # Fix newlines that get stripped when stored in env vars
-        # Replace literal \n with actual newlines
+        # Replace literal \n with real newlines
         key_str = key_str.replace("\\n", "\n")
 
-        # If key is all on one line, reconstruct proper PEM format
-        if "-----BEGIN" in key_str and "\n" not in key_str:
-            # Extract the base64 body between the headers
-            if "RSA PRIVATE KEY" in key_str:
-                header = "-----BEGIN RSA PRIVATE KEY-----"
-                footer = "-----END RSA PRIVATE KEY-----"
-            else:
-                header = "-----BEGIN PRIVATE KEY-----"
-                footer = "-----END PRIVATE KEY-----"
+        # Detect header/footer
+        if "RSA PRIVATE KEY" in key_str:
+            header = "-----BEGIN RSA PRIVATE KEY-----"
+            footer = "-----END RSA PRIVATE KEY-----"
+        else:
+            header = "-----BEGIN PRIVATE KEY-----"
+            footer = "-----END PRIVATE KEY-----"
 
-            body = key_str.replace(header, "").replace(footer, "").strip()
-            # Split into 64-char lines
+        # If no real newlines, reconstruct from spaces
+        if "\n" not in key_str:
+            # Remove headers/footers and extract body
+            body = key_str
+            body = body.replace(header, "").replace(footer, "").strip()
+            # Body may be space-separated — join and rechunk into 64-char lines
+            body = body.replace(" ", "")
             body_lines = [body[i:i+64] for i in range(0, len(body), 64)]
             key_str = header + "\n" + "\n".join(body_lines) + "\n" + footer + "\n"
 
         key_data = key_str.encode("utf-8")
         private_key = serialization.load_pem_private_key(key_data, password=None)
+        print("[INFO] Kalshi private key loaded successfully")
         return private_key
     except Exception as e:
         print(f"[WARN] Failed to load private key: {e}")
