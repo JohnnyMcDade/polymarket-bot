@@ -11,10 +11,10 @@ MIN_TRADE_SIZE        = float(os.getenv("KALSHI_MIN_TRADE", 1000))
 seen_trade_ids = set()
 
 def get_recent_trades():
-    path = "/trade-api/v2/trades"
+    path = "/trade-api/v2/markets/trades"
     try:
         r = requests.get(
-            f"{KALSHI_BASE_URL}/trades",
+            f"{KALSHI_BASE_URL}/markets/trades",
             headers=get_auth_headers("GET", path),
             params={"limit": 100},
             timeout=15
@@ -58,8 +58,14 @@ def get_category(title):
 def build_embed(trade, market):
     ticker      = trade.get("ticker", "")
     side        = trade.get("taker_side", "yes")
-    price       = trade.get("yes_price", 50)
-    count       = trade.get("count", 0)
+    # Handle new fixed-point price format
+    price_dollars = trade.get("yes_price_dollars")
+    if price_dollars:
+        price = float(price_dollars) * 100
+    else:
+        price = trade.get("yes_price", 50)
+    count_fp    = trade.get("count_fp")
+    count       = float(count_fp) if count_fp else trade.get("count", 0)
     trade_value = (price / 100) * count
     title       = market.get("title", ticker)
     category    = get_category(title)
@@ -72,8 +78,8 @@ def build_embed(trade, market):
     fields = [
         {"name": "📊 Side",        "value": side_str,               "inline": True},
         {"name": "💰 Trade Value", "value": format_usd(trade_value), "inline": True},
-        {"name": "🪙 Contracts",   "value": f"{count:,}",           "inline": True},
-        {"name": "📊 Price",       "value": f"{price}¢",            "inline": True},
+        {"name": "🪙 Contracts",   "value": f"{count:,.1f}",        "inline": True},
+        {"name": "📊 Price",       "value": f"{price:.0f}¢",        "inline": True},
         {"name": "🏷️ Category",   "value": category,               "inline": True},
         {"name": "🕒 Time",        "value": now_str,                "inline": True},
         {"name": "📌 Market",      "value": f"[{title[:80]}]({market_url})", "inline": False},
@@ -118,8 +124,10 @@ def run():
             if trade_id in seen_trade_ids:
                 continue
 
-            price       = trade.get("yes_price", 50)
-            count       = trade.get("count", 0)
+            price_dollars = trade.get("yes_price_dollars")
+            price = float(price_dollars) * 100 if price_dollars else trade.get("yes_price", 50)
+            count_fp = trade.get("count_fp")
+            count = float(count_fp) if count_fp else trade.get("count", 0)
             trade_value = (price / 100) * count
 
             if trade_value < MIN_TRADE_SIZE:
