@@ -4,8 +4,13 @@ import requests
 from datetime import datetime, timezone
 from kalshi_auth import get_auth_headers, KALSHI_BASE_URL
 
+# NEW: feed downstream pipeline (research → prediction → risk → execution)
+import kalshi_queue
+
 WEBHOOK_KALSHI_SCANNER = os.getenv("WEBHOOK_KALSHI_SCANNER", "")
 CHECK_INTERVAL         = int(os.getenv("KALSHI_SCANNER_INTERVAL", 600))
+KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 10000))
+KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 
 seen_market_ids = set()
 
@@ -144,9 +149,9 @@ def run():
             yes_price  = market.get("yes_ask", 50)
             days_left  = days_until_expiry(close_time)
 
-            if volume < 10000:
+            if volume < KALSHI_MIN_VOLUME:
                 continue
-            if days_left > 30 or days_left == 0:
+            if days_left > KALSHI_MAX_DAYS or days_left == 0:
                 continue
 
             edge   = calculate_edge(yes_price)
@@ -158,6 +163,20 @@ def run():
             seen_market_ids.add(ticker)
             embed = build_embed(market, days_left, edge, signal)
             send_discord(embed)
+
+            # NEW: push to scanner_queue so kalshi_research can pick it up.
+            # Stores the raw market fields the downstream agents will need.
+            kalshi_queue.enqueue("scanner", ticker, {
+                "ticker": ticker,
+                "title": market.get("title", ""),
+                "yes_ask": yes_price,
+                "no_ask": market.get("no_ask", 50),
+                "volume": volume,
+                "days_left": days_left,
+                "close_time": close_time,
+                "scanner_edge": edge,
+                "scanner_signal": signal,
+            })
             flagged += 1
 
         if len(seen_market_ids) > 10_000:
