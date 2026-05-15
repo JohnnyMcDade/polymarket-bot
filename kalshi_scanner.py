@@ -11,6 +11,10 @@ WEBHOOK_KALSHI_SCANNER = os.getenv("WEBHOOK_KALSHI_SCANNER", "")
 CHECK_INTERVAL         = int(os.getenv("KALSHI_SCANNER_INTERVAL", 600))
 KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 10000))
 KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
+# Minimum distance from 0.5 expressed as a fraction (0..0.5).
+# Example: 0.03 means yes_ask must be <= 0.47 or >= 0.53.
+KALSHI_MIN_EDGE        = float(os.getenv("KALSHI_MIN_EDGE", 0))
+KALSHI_DEBUG           = os.getenv("KALSHI_DEBUG", "0") == "1"
 
 seen_market_ids = set()
 
@@ -25,7 +29,17 @@ def get_markets():
             timeout=15
         )
         r.raise_for_status()
-        return r.json().get("markets", [])
+        data = r.json()
+        markets = data.get("markets", [])
+        if KALSHI_DEBUG:
+            print(f"[DEBUG] HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
+            if markets:
+                m = markets[0]
+                print(f"[DEBUG] sample keys: {list(m.keys())}")
+                print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
+                      f"volume={m.get('volume')} yes_ask={m.get('yes_ask')} "
+                      f"close_time={m.get('close_time')}")
+        return markets
     except Exception as e:
         print(f"[WARN] Kalshi market fetch failed: {e}")
         return []
@@ -40,31 +54,38 @@ def days_until_expiry(close_time_str):
     except:
         return 999
 
-def calculate_edge(yes_price):
+def edge_fraction(yes_price):
     try:
         price = yes_price / 100
         if price <= 0 or price >= 1:
             return 0
-        distance = abs(price - 0.5)
-        if distance >= 0.3: return 12
-        if distance >= 0.2: return 8
-        if distance >= 0.1: return 5
-        return 2
+        return abs(price - 0.5)
     except:
         return 0
 
+def calculate_edge(yes_price):
+    distance = edge_fraction(yes_price)
+    if distance == 0:   return 0
+    if distance >= 0.3: return 12
+    if distance >= 0.2: return 8
+    if distance >= 0.1: return 5
+    return 2
+
 def get_signal_strength(volume, days_left, edge):
     score = 0
-    if volume >= 100000: score += 3
-    elif volume >= 50000: score += 2
-    elif volume >= 10000: score += 1
-    if days_left <= 3:    score += 3
+    # Volume tiers anchor on KALSHI_MIN_VOLUME so lowering the floor
+    # doesn't silently make every market WEAK.
+    if   volume >= max(100000, KALSHI_MIN_VOLUME * 20): score += 3
+    elif volume >= max(50000,  KALSHI_MIN_VOLUME * 10): score += 2
+    elif volume >= KALSHI_MIN_VOLUME:                   score += 1
+    if   days_left <= 3:  score += 3
     elif days_left <= 7:  score += 2
     elif days_left <= 14: score += 1
+    elif days_left <= 30: score += 1
     if edge >= 10: score += 2
     elif edge >= 5: score += 1
-    if score >= 6: return "STRONG"
-    if score >= 4: return "MODERATE"
+    if score >= 5: return "STRONG"
+    if score >= 3: return "MODERATE"
     return "WEAK"
 
 def format_usd(amount):
@@ -132,40 +153,56 @@ def send_discord(embed):
 
 def run():
     print("Kalshi Scanner starting...")
+    print(f"  config: MIN_VOLUME={KALSHI_MIN_VOLUME} MAX_DAYS={KALSHI_MAX_DAYS} "
+          f"MIN_EDGE={KALSHI_MIN_EDGE} DEBUG={KALSHI_DEBUG}")
     while True:
         cycle_start = time.time()
         print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning Kalshi markets...")
 
         markets = get_markets()
         flagged = 0
+        d_seen = d_vol = d_days = d_edge = d_weak = 0
+        max_vol_seen = 0
+        sample_logged = 0
 
         for market in markets:
             ticker    = market.get("ticker", "")
             if ticker in seen_market_ids:
+                d_seen += 1
                 continue
 
             volume     = market.get("volume", 0)
             close_time = market.get("close_time", "")
             yes_price  = market.get("yes_ask", 50)
             days_left  = days_until_expiry(close_time)
+            max_vol_seen = max(max_vol_seen, volume)
+
+            if KALSHI_DEBUG and sample_logged < 3:
+                print(f"[DEBUG] {ticker}: vol={volume} days={days_left} yes={yes_price} "
+                      f"edge_frac={edge_fraction(yes_price):.3f}")
+                sample_logged += 1
 
             if volume < KALSHI_MIN_VOLUME:
+                d_vol += 1
                 continue
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
+                d_days += 1
+                continue
+            if edge_fraction(yes_price) < KALSHI_MIN_EDGE:
+                d_edge += 1
                 continue
 
             edge   = calculate_edge(yes_price)
             signal = get_signal_strength(volume, days_left, edge)
 
             if signal == "WEAK":
+                d_weak += 1
                 continue
 
             seen_market_ids.add(ticker)
             embed = build_embed(market, days_left, edge, signal)
             send_discord(embed)
 
-            # NEW: push to scanner_queue so kalshi_research can pick it up.
-            # Stores the raw market fields the downstream agents will need.
             kalshi_queue.enqueue("scanner", ticker, {
                 "ticker": ticker,
                 "title": market.get("title", ""),
@@ -183,7 +220,9 @@ def run():
             seen_market_ids.clear()
 
         elapsed = time.time() - cycle_start
-        print(f"  Done in {elapsed:.1f}s — {flagged} Kalshi markets flagged.")
+        print(f"  Done in {elapsed:.1f}s — {flagged}/{len(markets)} flagged. "
+              f"max_volume_seen={max_vol_seen}  "
+              f"drops: seen={d_seen} vol={d_vol} days={d_days} edge={d_edge} weak={d_weak}")
         time.sleep(max(0, CHECK_INTERVAL - elapsed))
 
 if __name__ == "__main__":
