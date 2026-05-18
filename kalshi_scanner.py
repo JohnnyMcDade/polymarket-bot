@@ -16,11 +16,12 @@ KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 KALSHI_MIN_EDGE        = float(os.getenv("KALSHI_MIN_EDGE", 0))
 KALSHI_DEBUG           = os.getenv("KALSHI_DEBUG", "0") == "1"
 
-# Debug fallback: when debugging, relax the volume floor so we can see
-# whether ANY markets would pass the rest of the gates.
-if KALSHI_DEBUG and KALSHI_MIN_VOLUME > 100:
-    print(f"[DEBUG] lowering KALSHI_MIN_VOLUME from {KALSHI_MIN_VOLUME} to 100 (debug fallback)")
-    KALSHI_MIN_VOLUME = 100
+# TEMP DEBUG: hardcoded floor to surface ANY market with volume > 0.
+# Per Kalshi's OpenAPI spec, volume_24h_fp is a CONTRACT COUNT, not a
+# dollar amount — so the production default of 10000 has been comparing
+# dollars to contracts. Restore the env-driven value once we confirm
+# the units we actually want to gate on.
+KALSHI_MIN_VOLUME = 1
 
 seen_market_ids = set()
 
@@ -30,7 +31,15 @@ def get_markets():
     cursor = None
     try:
         for page in range(2):
-            params = {"limit": 1000, "status": "open"}
+            # NOTE: sort_by / order_direction are NOT in Kalshi's OpenAPI
+            # spec for /markets — kept here in case the API accepts them
+            # as undocumented hints, but expect them to be ignored.
+            params = {
+                "limit": 1000,
+                "status": "open",
+                "sort_by": "volume_24h",
+                "order_direction": "desc",
+            }
             if cursor:
                 params["cursor"] = cursor
             r = requests.get(
@@ -43,15 +52,21 @@ def get_markets():
             data = r.json()
             markets = data.get("markets", [])
             all_markets.extend(markets)
+            # Always dump first-market diagnostics on page 1 — independent
+            # of KALSHI_DEBUG — so we can see what the API actually returns.
+            if page == 0 and markets:
+                m = markets[0]
+                raw_v24 = m.get("volume_24h_fp", "<MISSING>")
+                raw_v   = m.get("volume_fp", "<MISSING>")
+                raw_yes = m.get("yes_ask_dollars", "<MISSING>")
+                print(f"[DIAG] page 1 HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
+                print(f"[DIAG] sample keys: {sorted(m.keys())}")
+                print(f"[DIAG] raw volume_24h_fp={raw_v24!r} (type={type(raw_v24).__name__})")
+                print(f"[DIAG] raw volume_fp   ={raw_v!r}   (type={type(raw_v).__name__})")
+                print(f"[DIAG] raw yes_ask_dollars={raw_yes!r} (type={type(raw_yes).__name__})")
+                print(f"[DIAG] sample: ticker={m.get('ticker')} status={m.get('status')} close_time={m.get('close_time')}")
             if KALSHI_DEBUG:
-                print(f"[DEBUG] page {page+1} HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
-                if page == 0 and markets:
-                    m = markets[0]
-                    print(f"[DEBUG] sample keys: {list(m.keys())}")
-                    print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
-                          f"volume={float(m.get('volume_24h_fp', 0) or 0)} "
-                          f"yes_ask={float(m.get('yes_ask_dollars', 0) or 0) * 100} "
-                          f"close_time={m.get('close_time')}")
+                print(f"[DEBUG] page {page+1} markets={len(markets)} cursor={data.get('cursor')!r}")
             cursor = data.get("cursor")
             if not cursor:
                 break
