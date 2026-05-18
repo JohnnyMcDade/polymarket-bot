@@ -16,6 +16,12 @@ KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 KALSHI_MIN_EDGE        = float(os.getenv("KALSHI_MIN_EDGE", 0))
 KALSHI_DEBUG           = os.getenv("KALSHI_DEBUG", "0") == "1"
 
+# Debug fallback: when debugging, relax the volume floor so we can see
+# whether ANY markets would pass the rest of the gates.
+if KALSHI_DEBUG and KALSHI_MIN_VOLUME > 100:
+    print(f"[DEBUG] lowering KALSHI_MIN_VOLUME from {KALSHI_MIN_VOLUME} to 100 (debug fallback)")
+    KALSHI_MIN_VOLUME = 100
+
 seen_market_ids = set()
 
 def get_markets():
@@ -24,7 +30,7 @@ def get_markets():
     cursor = None
     try:
         for page in range(2):
-            params = {"limit": 100, "status": "open"}
+            params = {"limit": 1000, "status": "open"}
             if cursor:
                 params["cursor"] = cursor
             r = requests.get(
