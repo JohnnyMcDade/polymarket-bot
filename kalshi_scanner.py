@@ -58,12 +58,16 @@ def get_markets():
                 m = markets[0]
                 raw_v24 = m.get("volume_24h_fp", "<MISSING>")
                 raw_v   = m.get("volume_fp", "<MISSING>")
+                raw_oi  = m.get("open_interest_fp", "<MISSING>")
+                raw_liq = m.get("liquidity_dollars", "<MISSING>")
                 raw_yes = m.get("yes_ask_dollars", "<MISSING>")
                 print(f"[DIAG] page 1 HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
                 print(f"[DIAG] sample keys: {sorted(m.keys())}")
-                print(f"[DIAG] raw volume_24h_fp={raw_v24!r} (type={type(raw_v24).__name__})")
-                print(f"[DIAG] raw volume_fp   ={raw_v!r}   (type={type(raw_v).__name__})")
-                print(f"[DIAG] raw yes_ask_dollars={raw_yes!r} (type={type(raw_yes).__name__})")
+                print(f"[DIAG] raw volume_24h_fp   ={raw_v24!r} (type={type(raw_v24).__name__})")
+                print(f"[DIAG] raw volume_fp      ={raw_v!r}   (type={type(raw_v).__name__})")
+                print(f"[DIAG] raw open_interest_fp={raw_oi!r}  (type={type(raw_oi).__name__})")
+                print(f"[DIAG] raw liquidity_dollars={raw_liq!r} (type={type(raw_liq).__name__})  [DEPRECATED per spec — always 0.0000]")
+                print(f"[DIAG] raw yes_ask_dollars ={raw_yes!r} (type={type(raw_yes).__name__})")
                 print(f"[DIAG] sample: ticker={m.get('ticker')} status={m.get('status')} close_time={m.get('close_time')}")
             if KALSHI_DEBUG:
                 print(f"[DEBUG] page {page+1} markets={len(markets)} cursor={data.get('cursor')!r}")
@@ -131,7 +135,7 @@ def build_embed(market, days_left, edge, signal):
     title      = market.get("title", "Unknown")
     yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
     no_price   = float(market.get("no_ask_dollars", 0.5) or 0.5) * 100
-    volume     = float(market.get("volume_24h_fp", 0) or 0)
+    volume     = float(market.get("open_interest_fp", 0) or 0)
     market_url = f"https://kalshi.com/markets/{ticker}"
 
     if signal == "STRONG":
@@ -202,7 +206,7 @@ def run():
                 d_seen += 1
                 continue
 
-            volume     = float(market.get("volume_24h_fp", 0) or 0)
+            volume     = float(market.get("open_interest_fp", 0) or 0)
             close_time = market.get("close_time", "")
             yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
             days_left  = days_until_expiry(close_time)
