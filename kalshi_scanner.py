@@ -9,19 +9,16 @@ import kalshi_queue
 
 WEBHOOK_KALSHI_SCANNER = os.getenv("WEBHOOK_KALSHI_SCANNER", "")
 CHECK_INTERVAL         = int(os.getenv("KALSHI_SCANNER_INTERVAL", 600))
-KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 10000))
+# Activity floor — now an open_interest_fp (contract count) threshold,
+# since /markets returns volume_24h_fp='0.00' for every market.
+# liquidity_dollars would have been ideal but is deprecated and always
+# returns '0.0000'. Default 100 contracts ~= a market with real interest.
+KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 100))
 KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 # Minimum distance from 0.5 expressed as a fraction (0..0.5).
 # Example: 0.03 means yes_ask must be <= 0.47 or >= 0.53.
 KALSHI_MIN_EDGE        = float(os.getenv("KALSHI_MIN_EDGE", 0))
 KALSHI_DEBUG           = os.getenv("KALSHI_DEBUG", "0") == "1"
-
-# TEMP DEBUG: hardcoded floor to surface ANY market with volume > 0.
-# Per Kalshi's OpenAPI spec, volume_24h_fp is a CONTRACT COUNT, not a
-# dollar amount — so the production default of 10000 has been comparing
-# dollars to contracts. Restore the env-driven value once we confirm
-# the units we actually want to gate on.
-KALSHI_MIN_VOLUME = 1
 
 seen_market_ids = set()
 
@@ -243,7 +240,7 @@ def run():
                 "title": market.get("title", ""),
                 "yes_ask": yes_price,
                 "no_ask": market.get("no_ask", 50),
-                "volume": volume,
+                "open_interest": volume,
                 "days_left": days_left,
                 "close_time": close_time,
                 "scanner_edge": edge,
