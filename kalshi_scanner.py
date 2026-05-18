@@ -37,7 +37,7 @@ def get_markets():
                 m = markets[0]
                 print(f"[DEBUG] sample keys: {list(m.keys())}")
                 print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
-                      f"volume={m.get('volume')} yes_ask={m.get('yes_ask')} "
+                      f"volume={m.get('volume_fp', 0) / 100} yes_ask={m.get('yes_ask_dollars', 0) * 100} "
                       f"close_time={m.get('close_time')}")
         return markets
     except Exception as e:
@@ -98,9 +98,9 @@ def format_usd(amount):
 def build_embed(market, days_left, edge, signal):
     ticker     = market.get("ticker", "")
     title      = market.get("title", "Unknown")
-    yes_price  = market.get("yes_ask", 50)
-    no_price   = market.get("no_ask", 50)
-    volume     = market.get("volume", 0)
+    yes_price  = market.get("yes_ask_dollars", 0.5) * 100
+    no_price   = market.get("no_ask_dollars", 0.5) * 100
+    volume     = market.get("volume_fp", 0) / 100
     market_url = f"https://kalshi.com/markets/{ticker}"
 
     if signal == "STRONG":
@@ -171,9 +171,9 @@ def run():
                 d_seen += 1
                 continue
 
-            volume     = market.get("volume", 0)
+            volume     = market.get("volume_fp", 0) / 100
             close_time = market.get("close_time", "")
-            yes_price  = market.get("yes_ask", 50)
+            yes_price  = market.get("yes_ask_dollars", 0.5) * 100
             days_left  = days_until_expiry(close_time)
             max_vol_seen = max(max_vol_seen, volume)
 
