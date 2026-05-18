@@ -37,7 +37,7 @@ def get_markets():
                 m = markets[0]
                 print(f"[DEBUG] sample keys: {list(m.keys())}")
                 print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
-                      f"volume={float(m.get('volume_fp', 0) or 0) / 100} "
+                      f"volume={float(m.get('volume_fp', 0) or 0)} "
                       f"yes_ask={float(m.get('yes_ask_dollars', 0) or 0) * 100} "
                       f"close_time={m.get('close_time')}")
         return markets
@@ -101,7 +101,7 @@ def build_embed(market, days_left, edge, signal):
     title      = market.get("title", "Unknown")
     yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
     no_price   = float(market.get("no_ask_dollars", 0.5) or 0.5) * 100
-    volume     = float(market.get("volume_fp", 0) or 0) / 100
+    volume     = float(market.get("volume_fp", 0) or 0)
     market_url = f"https://kalshi.com/markets/{ticker}"
 
     if signal == "STRONG":
@@ -172,7 +172,7 @@ def run():
                 d_seen += 1
                 continue
 
-            volume     = float(market.get("volume_fp", 0) or 0) / 100
+            volume     = float(market.get("volume_fp", 0) or 0)
             close_time = market.get("close_time", "")
             yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
             days_left  = days_until_expiry(close_time)
