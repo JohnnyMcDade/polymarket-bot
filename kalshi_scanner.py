@@ -20,30 +20,39 @@ seen_market_ids = set()
 
 def get_markets():
     path = "/trade-api/v2/markets"
+    all_markets = []
+    cursor = None
     try:
-        params = {"limit": 100, "status": "open"}
-        r = requests.get(
-            f"{KALSHI_BASE_URL}/markets",
-            headers=get_auth_headers("GET", path),
-            params=params,
-            timeout=15
-        )
-        r.raise_for_status()
-        data = r.json()
-        markets = data.get("markets", [])
-        if KALSHI_DEBUG:
-            print(f"[DEBUG] HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
-            if markets:
-                m = markets[0]
-                print(f"[DEBUG] sample keys: {list(m.keys())}")
-                print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
-                      f"volume={float(m.get('volume_fp', 0) or 0)} "
-                      f"yes_ask={float(m.get('yes_ask_dollars', 0) or 0) * 100} "
-                      f"close_time={m.get('close_time')}")
-        return markets
+        for page in range(2):
+            params = {"limit": 100, "status": "open"}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(
+                f"{KALSHI_BASE_URL}/markets",
+                headers=get_auth_headers("GET", path),
+                params=params,
+                timeout=15
+            )
+            r.raise_for_status()
+            data = r.json()
+            markets = data.get("markets", [])
+            all_markets.extend(markets)
+            if KALSHI_DEBUG:
+                print(f"[DEBUG] page {page+1} HTTP {r.status_code}  top-level keys={list(data.keys())}  markets={len(markets)}")
+                if page == 0 and markets:
+                    m = markets[0]
+                    print(f"[DEBUG] sample keys: {list(m.keys())}")
+                    print(f"[DEBUG] sample: ticker={m.get('ticker')} status={m.get('status')} "
+                          f"volume={float(m.get('volume_24h_fp', 0) or 0)} "
+                          f"yes_ask={float(m.get('yes_ask_dollars', 0) or 0) * 100} "
+                          f"close_time={m.get('close_time')}")
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return all_markets
     except Exception as e:
         print(f"[WARN] Kalshi market fetch failed: {e}")
-        return []
+        return all_markets
 
 def days_until_expiry(close_time_str):
     try:
@@ -101,7 +110,7 @@ def build_embed(market, days_left, edge, signal):
     title      = market.get("title", "Unknown")
     yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
     no_price   = float(market.get("no_ask_dollars", 0.5) or 0.5) * 100
-    volume     = float(market.get("volume_fp", 0) or 0)
+    volume     = float(market.get("volume_24h_fp", 0) or 0)
     market_url = f"https://kalshi.com/markets/{ticker}"
 
     if signal == "STRONG":
@@ -172,7 +181,7 @@ def run():
                 d_seen += 1
                 continue
 
-            volume     = float(market.get("volume_fp", 0) or 0)
+            volume     = float(market.get("volume_24h_fp", 0) or 0)
             close_time = market.get("close_time", "")
             yes_price  = float(market.get("yes_ask_dollars", 0.5) or 0.5) * 100
             days_left  = days_until_expiry(close_time)
