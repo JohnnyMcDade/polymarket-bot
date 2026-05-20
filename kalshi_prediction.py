@@ -64,7 +64,6 @@ def _ask_claude(prompt: str) -> dict[str, Any] | None:
     if not ANTHROPIC_API_KEY:
         print("[WARN] ANTHROPIC_API_KEY not set — skipping prediction")
         return None
-    r = None
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -80,23 +79,23 @@ def _ask_claude(prompt: str) -> dict[str, Any] | None:
             },
             timeout=30,
         )
+        # Log the body BEFORE any control flow diverges. flush=True so the
+        # line shows up immediately in Railway logs (default stdout
+        # buffering can otherwise hide error lines that come right before
+        # an exception — which is what we saw the last cycle).
+        if r.status_code != 200:
+            print(
+                f"[ERROR] Anthropic status={r.status_code} body: {r.text}",
+                flush=True,
+            )
         if r.status_code == 429:
-            print("[WARN] Anthropic rate limited — backing off this cycle")
+            print("[WARN] Anthropic rate limited — backing off this cycle", flush=True)
             time.sleep(10)
             return None
         r.raise_for_status()
         text = r.json()["content"][0]["text"]
     except Exception as e:
-        # Print the full upstream error body so we can see WHY Anthropic
-        # rejected the call. 400s in particular include a JSON detail
-        # explaining the specific validation failure (bad model name,
-        # malformed messages array, key auth failure, etc.).
-        try:
-            if r is not None:
-                print(f"[ERROR] Claude {r.status_code} response: {r.text}")
-        except Exception:
-            pass
-        print(f"[WARN] Claude prediction call failed: {e}")
+        print(f"[WARN] Claude prediction call failed: {e}", flush=True)
         return None
 
     fields: dict[str, Any] = {}

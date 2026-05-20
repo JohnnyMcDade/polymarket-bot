@@ -96,10 +96,19 @@ Be precise and analytical. Only recommend BUY if edge is above 5%."""
             json=payload,
             timeout=30
         )
+        # Log the upstream body BEFORE raise_for_status so we see the
+        # actual error detail on 400/401/etc. flush=True forces Railway
+        # to surface the line immediately instead of buffering it
+        # behind the WARN line that follows the exception.
+        if r.status_code != 200:
+            print(
+                f"[ERROR] Anthropic status={r.status_code} body: {r.text}",
+                flush=True,
+            )
         r.raise_for_status()
         return r.json()["content"][0]["text"]
     except Exception as e:
-        print(f"[WARN] Claude API failed: {e}")
+        print(f"[WARN] Claude API failed: {e}", flush=True)
         return None
 
 def parse_claude_response(response):
