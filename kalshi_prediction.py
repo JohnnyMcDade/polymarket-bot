@@ -24,7 +24,7 @@ import kalshi_queue
 WEBHOOK_KALSHI_PREDICTIONS = os.getenv("WEBHOOK_KALSHI_PREDICTIONS", "")
 CHECK_INTERVAL = int(os.getenv("KALSHI_PREDICTION_INTERVAL", "60"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_PREDICTION", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_PREDICTION", "claude-sonnet-4-6")
 KALSHI_MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.05"))
 
 

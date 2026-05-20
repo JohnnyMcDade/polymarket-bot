@@ -86,7 +86,7 @@ Be precise and analytical. Only recommend BUY if edge is above 5%."""
             "content-type": "application/json"
         }
         payload = {
-            "model": "claude-sonnet-4-5",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 500,
             "messages": [{"role": "user", "content": prompt}]
         }
