@@ -49,7 +49,7 @@ In 2-3 sentences: Why did this happen? What should we do differently? What signa
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-opus-4-5",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}]
             },

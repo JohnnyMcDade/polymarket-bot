@@ -55,7 +55,7 @@ Be concise and specific."""
             "content-type": "application/json"
         }
         payload = {
-            "model": "claude-opus-4-5",
+            "model": "claude-sonnet-4-5",
             "max_tokens": 300,
             "messages": [{"role": "user", "content": prompt}]
         }
