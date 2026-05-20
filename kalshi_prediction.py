@@ -64,6 +64,7 @@ def _ask_claude(prompt: str) -> dict[str, Any] | None:
     if not ANTHROPIC_API_KEY:
         print("[WARN] ANTHROPIC_API_KEY not set — skipping prediction")
         return None
+    r = None
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -86,6 +87,15 @@ def _ask_claude(prompt: str) -> dict[str, Any] | None:
         r.raise_for_status()
         text = r.json()["content"][0]["text"]
     except Exception as e:
+        # Print the full upstream error body so we can see WHY Anthropic
+        # rejected the call. 400s in particular include a JSON detail
+        # explaining the specific validation failure (bad model name,
+        # malformed messages array, key auth failure, etc.).
+        try:
+            if r is not None:
+                print(f"[ERROR] Claude {r.status_code} response: {r.text}")
+        except Exception:
+            pass
         print(f"[WARN] Claude prediction call failed: {e}")
         return None
 
@@ -164,9 +174,39 @@ def send_discord(embed: dict[str, Any]) -> None:
         print(f"[WARN] Discord send failed: {e}")
 
 
+def _diagnose_api_key() -> None:
+    """One-shot startup check: surface common Railway env-var corruption
+    (hidden newline / trailing space / non-printable byte) BEFORE the
+    first Anthropic call so a bad key shows up clearly in deploy logs
+    instead of as an opaque 401/400 per request.
+    """
+    key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not key:
+        print("[KEYCHECK] ANTHROPIC_API_KEY is empty")
+        return
+    raw_len = len(key)
+    stripped_len = len(key.strip())
+    has_ws = key != key.strip()
+    has_nonprint = any(not (32 <= ord(c) < 127) for c in key)
+    prefix_ok = key.startswith("sk-ant-")
+    print(
+        f"[KEYCHECK] len={raw_len} (stripped={stripped_len}) "
+        f"prefix_ok={prefix_ok} has_surrounding_whitespace={has_ws} "
+        f"has_nonprintable_char={has_nonprint} "
+        f"head={key[:10]!r} tail={key[-4:]!r}"
+    )
+    if has_ws or has_nonprint:
+        print(
+            "[KEYCHECK] WARNING: API key has whitespace or non-printable "
+            "bytes — Railway → Variables → ANTHROPIC_API_KEY → re-enter "
+            "the last character (or delete + re-paste cleanly)."
+        )
+
+
 def run() -> None:
     print("Kalshi Prediction Agent starting...")
     print(f"  model={ANTHROPIC_MODEL}  min_edge={KALSHI_MIN_EDGE:.0%}")
+    _diagnose_api_key()
     while True:
         cycle_start = time.time()
         items = kalshi_queue.drain_fresh("research")
