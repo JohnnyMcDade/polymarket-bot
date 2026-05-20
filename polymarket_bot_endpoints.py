@@ -368,72 +368,107 @@ def _get_resolved_markets(limit: int, order: str = "endDate") -> list[dict[str, 
         raise _PolymarketUnavailable(f"resolved-markets fetch failed: {e}") from e
 
 
-def _model_call_was_correct(market: dict[str, Any]) -> tuple[bool, float, str]:
-    """Apply postmortem_agent.py's same heuristic: if YES price > 0.5 we'd
-    have recommended BUY_YES, else BUY_NO. Then compare to the winner.
+def _derive_winner(market: dict[str, Any]) -> str:
+    """Return the winning outcome label (e.g. "Yes" / "No") for a resolved
+    market, or "" if it can't be determined.
 
-    Returns (was_correct, yes_price, winner_str). Caller decides what to do
-    on missing winner (typically: skip / count as pending).
+    Polymarket's gamma-api `/markets?closed=true` no longer populates the
+    `winner` field — it's empty on every resolved market we see. The
+    resolution is still encoded in `outcomePrices`: the outcome whose
+    settled price is "1" (or closest to 1) is the winner.
+
+    Both `outcomes` and `outcomePrices` come back as JSON-encoded strings
+    inside the JSON response (e.g. '["Yes", "No"]'), so we parse them.
+    Falls back to the legacy `winner` field if it ever comes back populated.
     """
+    legacy = (market.get("winner") or "").strip()
+    if legacy:
+        return legacy
+
+    import json as _json
+    outcomes_raw = market.get("outcomes")
+    prices_raw = market.get("outcomePrices")
     try:
-        yes_price = float(market.get("outcomePrices", ["0.5"])[0] or 0.5)
-    except (ValueError, TypeError, IndexError):
-        yes_price = 0.5
-    winner = (market.get("winner") or "").lower()
-    our_rec = "yes" if yes_price > 0.5 else "no"
-    correct = (
-        (our_rec == "yes" and "yes" in winner) or
-        (our_rec == "no" and "no" in winner)
-    )
-    return correct, yes_price, winner
+        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(outcomes, list) or not isinstance(prices, list):
+        return ""
+    if len(outcomes) != len(prices) or not outcomes:
+        return ""
+    try:
+        float_prices = [float(p or 0) for p in prices]
+    except (ValueError, TypeError):
+        return ""
+    # Resolved markets settle to 0/1. Pick the index closest to 1.
+    top_idx = max(range(len(float_prices)), key=lambda i: float_prices[i])
+    # Sanity check: if no price is anywhere near 1, the market may not be
+    # actually resolved yet despite `closed=true`. Don't claim a winner.
+    if float_prices[top_idx] < 0.9:
+        return ""
+    return str(outcomes[top_idx])
+
+
+def _model_call_was_correct(market: dict[str, Any]) -> tuple[bool | None, float | None, str]:
+    """Heuristic: would our model's pre-resolution recommendation match the
+    actual winner? Returns (was_correct, yes_price_at_call, winner_str).
+
+    For resolved markets, gamma-api's `outcomePrices` is the SETTLED price
+    (0 or 1), not a pre-resolution mid-market — so we can't actually know
+    what our model would have recommended. Returns (None, None, winner)
+    in that case. Callers that need a real signal here would have to log
+    pre-resolution prices when the bot first sees the market.
+    """
+    winner = _derive_winner(market)
+    return None, None, winner
 
 
 def _aggregate_win_loss_since(cutoff: datetime) -> dict[str, Any]:
-    """Count wins/losses among markets that resolved since `cutoff`.
+    """Count resolved markets since `cutoff`.
 
-    PnL percentages are approximations — Polymarket's public markets endpoint
-    doesn't expose the bot's actual entry price for each trade, so we use
-    distance-from-0.5 (the edge our model would have bet on) as a proxy.
+    We use `closedTime` (when the market actually resolved), not `endDate`
+    (the scheduled deadline — gamma-api sometimes returns endDates years
+    in the future for already-closed markets).
+
+    NOTE: gamma-api's `outcomePrices` for resolved markets is the SETTLED
+    price (0/1), not a pre-resolution mid-market — so we can't compute
+    "did our model call it right" from this endpoint alone. We report
+    wins/losses as 0 and put every resolved market under `pending` to
+    signal "decided by Polymarket, undecided by our scoring." If the bot
+    starts logging pre-resolution prices to a shared store, this is the
+    spot to plug them in.
     """
-    markets = _get_resolved_markets(limit=100, order="volume24hr")
+    markets = _get_resolved_markets(limit=100, order="closedTime")
     wins = 0
     losses = 0
     pending = 0
-    pnl_pcts: list[float] = []
 
     for m in markets:
-        end_date_str = m.get("endDate", "")
-        if not end_date_str:
+        closed_str = m.get("closedTime") or m.get("endDate") or ""
+        if not closed_str:
             continue
         try:
-            resolved_at = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            # closedTime comes back as "2026-04-14 22:08:00+00" — both
+            # space- and T-separated forms parse via fromisoformat.
+            resolved_at = datetime.fromisoformat(closed_str.replace("Z", "+00:00"))
         except ValueError:
             continue
+        if resolved_at.tzinfo is None:
+            resolved_at = resolved_at.replace(tzinfo=timezone.utc)
         if resolved_at < cutoff:
             continue
 
-        winner = m.get("winner") or ""
-        if not winner:
-            pending += 1
-            continue
+        if not _derive_winner(m):
+            continue   # not actually resolved yet
+        pending += 1   # decided by Polymarket, we have no pre-call price to score
 
-        correct, yes_price, _ = _model_call_was_correct(m)
-        edge = abs(yes_price - 0.5)
-        if correct:
-            wins += 1
-            pnl_pcts.append(round(edge, 4))
-        else:
-            losses += 1
-            pnl_pcts.append(round(-edge, 4))
-
-    positive = [p for p in pnl_pcts if p > 0]
-    negative = [p for p in pnl_pcts if p < 0]
     return {
         "wins": wins,
         "losses": losses,
         "pending": pending,
-        "biggest_win_pct": max(positive) if positive else None,
-        "biggest_loss_pct": min(negative) if negative else None,
+        "biggest_win_pct": None,
+        "biggest_loss_pct": None,
     }
 
 
@@ -461,15 +496,24 @@ def _fetch_biggest_whale_move_since(cutoff: datetime) -> dict[str, Any] | None:
 
 def _fetch_notable_resolution() -> dict[str, Any] | None:
     """Most recent resolved market with at least `_MIN_NOTABLE_MARKET_VOLUME`
-    volume that has a `winner` set. Notability heuristic matches what makes
-    sense for the TikTok content surface: large enough to be recognizable,
-    resolved cleanly, ideally one our heuristic called correctly.
+    volume. Notability heuristic matches what makes sense for the TikTok
+    content surface: large enough to be recognizable, actually resolved
+    (winner derivable from `outcomePrices`), recent.
+
+    Sort key is `closedTime` (when the market actually resolved), NOT
+    `endDate` — gamma-api sometimes returns endDates years in the future
+    for markets that closed early.
+
+    `system_called_it_correctly` / `system_confidence_at_call` are left
+    None: gamma-api's `outcomePrices` for resolved markets is the SETTLED
+    price (0/1), not a pre-resolution mid-market, so the "did our model
+    call it" heuristic can't be honestly computed from this endpoint.
     """
-    markets = _get_resolved_markets(limit=50, order="endDate")
+    markets = _get_resolved_markets(limit=50, order="closedTime")
     best: dict[str, Any] | None = None
 
     for m in markets:
-        winner = m.get("winner") or ""
+        winner = _derive_winner(m)
         if not winner:
             continue
         try:
@@ -478,30 +522,26 @@ def _fetch_notable_resolution() -> dict[str, Any] | None:
             volume = 0.0
         if volume < _MIN_NOTABLE_MARKET_VOLUME:
             continue
-        end_date_str = m.get("endDate", "")
+        closed_str = m.get("closedTime") or m.get("endDate") or ""
+        if not closed_str:
+            continue
         try:
-            resolved_at = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            resolved_at = datetime.fromisoformat(closed_str.replace("Z", "+00:00"))
         except ValueError:
             continue
-        correct, yes_price, _ = _model_call_was_correct(m)
-        confidence_at_call = round(abs(yes_price - 0.5) + 0.5, 4)
+        if resolved_at.tzinfo is None:
+            resolved_at = resolved_at.replace(tzinfo=timezone.utc)
 
         candidate = {
             "market": m.get("question", "Unknown"),
             "market_id": m.get("id"),
             "resolved_at": resolved_at,
             "outcome": winner,
-            "system_called_it_correctly": correct,
-            "system_confidence_at_call": confidence_at_call,
+            "system_called_it_correctly": None,
+            "system_confidence_at_call": None,
             "_volume": volume,   # internal sort hint; stripped before return
         }
-        # Prefer the most recent. Among same-day ties, prefer one we called
-        # correctly (more shareable on the TikTok content side).
         if best is None or candidate["resolved_at"] > best["resolved_at"]:
-            best = candidate
-        elif (candidate["resolved_at"].date() == best["resolved_at"].date()
-              and candidate["system_called_it_correctly"]
-              and not best["system_called_it_correctly"]):
             best = candidate
 
     if best is None:
