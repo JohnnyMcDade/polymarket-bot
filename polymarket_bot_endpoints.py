@@ -170,15 +170,18 @@ def healthz() -> dict[str, str]:
 
 @app.get("/api/alerts/today", response_model=list[WhaleAlert], dependencies=[Depends(_require_token)])
 def alerts_today() -> list[WhaleAlert]:
-    """All whale-tracker alerts fired since 00:00 UTC today."""
-    cutoff = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Top 7 whale-tracker alerts from the trailing 7 days, one per distinct
+    market, ranked by that market's aggregated whale volume across the window.
 
-    # TODO(data layer): replace with the real read from your alerts store.
-    # Examples:
-    #   - SQLAlchemy:    return [WhaleAlert.model_validate(row) for row in session.scalars(select(Alert).where(Alert.timestamp >= cutoff)).all()]
-    #   - Postgres+psycopg: cur.execute("SELECT ... WHERE timestamp >= %s", (cutoff,))
-    #   - JSON files:    glob data/alerts/*.json filtered by timestamp
-    rows = _fetch_alerts_since(cutoff)
+    Path is unchanged for backward compat with the ugc-pipeline, but the
+    semantics widened from "everything since 00:00 UTC today" to "trailing
+    7 days, top 7 markets, single representative trade per market" so the
+    @passivepoly TikTok --week mode can feature a distinct market per day
+    without re-querying.
+    """
+    window_start = datetime.now(tz=timezone.utc) - timedelta(days=7)
+    rows = _fetch_alerts_since(window_start)
+    rows = _top_n_distinct_markets(rows, n=7)
     return [WhaleAlert(**row) for row in rows]
 
 
@@ -345,6 +348,31 @@ def _fetch_alerts_since(cutoff: datetime) -> list[dict[str, Any]]:
 
     out.sort(key=lambda a: a["timestamp"], reverse=True)
     return out
+
+
+def _top_n_distinct_markets(rows: list[dict[str, Any]],
+                             n: int) -> list[dict[str, Any]]:
+    """Group rows by market_id, sum amount_usd per group, return the top-N
+    groups' single largest trade as the representative — ranked by the
+    group's aggregated whale volume."""
+    from collections import defaultdict
+
+    by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        mid = r.get("market_id") or r.get("market")
+        if mid is None:
+            continue
+        by_market[mid].append(r)
+
+    def _volume(group: list[dict[str, Any]]) -> float:
+        return sum(float(a.get("amount_usd") or 0.0) for a in group)
+
+    ranked_groups = sorted(by_market.values(), key=_volume, reverse=True)[:n]
+    representatives: list[dict[str, Any]] = []
+    for group in ranked_groups:
+        rep = max(group, key=lambda a: float(a.get("amount_usd") or 0.0))
+        representatives.append(rep)
+    return representatives
 
 
 def _get_resolved_markets(limit: int, order: str = "endDate") -> list[dict[str, Any]]:
