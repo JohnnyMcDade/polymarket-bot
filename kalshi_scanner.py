@@ -130,6 +130,15 @@ def is_parlay(title):
         return True
     if title.count(",") >= 3:
         return True
+    # Case-sensitive on AND: lowercase "and" appears in too many legitimate
+    # single-outcome titles ("England and Wales", "win and advance"), but
+    # uppercase " AND " is the conjunction Kalshi parlays use.
+    if " AND " in title:
+        return True
+    if " + " in title:
+        return True
+    if t.count("wins by over") >= 2:
+        return True
     return False
 
 def format_usd(amount):
