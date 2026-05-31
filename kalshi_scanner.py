@@ -9,11 +9,12 @@ import kalshi_queue
 
 WEBHOOK_KALSHI_SCANNER = os.getenv("WEBHOOK_KALSHI_SCANNER", "")
 CHECK_INTERVAL         = int(os.getenv("KALSHI_SCANNER_INTERVAL", 600))
-# Activity floor — now an open_interest_fp (contract count) threshold,
-# since /markets returns volume_24h_fp='0.00' for every market.
-# liquidity_dollars would have been ideal but is deprecated and always
-# returns '0.0000'. Default 100 contracts ~= a market with real interest.
-KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 100))
+# Activity floor — now interpreted as minimum yes_ask in cents (0-100).
+# open_interest_fp, volume_24h_fp, and liquidity_dollars all return 0 for
+# almost every market, so a non-zero yes_ask is the most reliable signal
+# that the book has any liquidity at all. Default 1¢ ~= any active book.
+# Env-var name kept for Railway continuity, semantics changed.
+KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 1))
 KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 # Minimum distance from 0.5 expressed as a fraction (0..0.5).
 # Example: 0.03 means yes_ask must be <= 0.47 or >= 0.53.
@@ -206,8 +207,17 @@ def send_discord(embed):
 
 def run():
     print("Kalshi Scanner starting...")
-    print(f"  config: MIN_VOLUME={KALSHI_MIN_VOLUME} MAX_DAYS={KALSHI_MAX_DAYS} "
+    print(f"  config: MIN_VOLUME={KALSHI_MIN_VOLUME}¢ (yes_ask floor) "
+          f"MAX_DAYS={KALSHI_MAX_DAYS} "
           f"MIN_EDGE={KALSHI_SCANNER_MIN_EDGE} DEBUG={KALSHI_DEBUG}")
+    if KALSHI_MIN_VOLUME > 100:
+        print(
+            f"[WARN] KALSHI_MIN_VOLUME={KALSHI_MIN_VOLUME} is greater than 100¢ — "
+            f"semantics changed from OI-contracts to yes_ask cents. "
+            f"At this value, every market will be dropped as below threshold. "
+            f"Update Railway env (try 1 for any active book).",
+            flush=True,
+        )
     while True:
         cycle_start = time.time()
         print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning Kalshi markets...")
@@ -242,7 +252,11 @@ def run():
             if ya >= 0.99 or ya <= 0.0:
                 d_dead += 1
                 continue
-            if volume < KALSHI_MIN_VOLUME:
+            # KALSHI_MIN_VOLUME is now a yes_ask price floor in cents, not an
+            # OI count. The dead filter above already drops yes_ask <= 0, so at
+            # default (1¢) this check is a no-op; it bites only when explicitly
+            # raised to skip deeper out-of-money markets.
+            if yes_price < KALSHI_MIN_VOLUME:
                 d_vol += 1
                 continue
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
