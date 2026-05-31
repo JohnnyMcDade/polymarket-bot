@@ -120,6 +120,16 @@ def get_signal_strength(volume, days_left, edge):
     if score >= 3: return "MODERATE"
     return "WEAK"
 
+def is_parlay(title):
+    if not title:
+        return False
+    t = title.lower()
+    if "parlay" in t or "multi" in t:
+        return True
+    if title.count(",") >= 3:
+        return True
+    return False
+
 def format_usd(amount):
     if amount >= 1_000_000:
         return f"${amount/1_000_000:.2f}M"
@@ -193,7 +203,7 @@ def run():
 
         markets = get_markets()
         flagged = 0
-        d_seen = d_vol = d_days = d_edge = d_weak = 0
+        d_seen = d_vol = d_days = d_edge = d_parlay = d_weak = 0
         max_vol_seen = 0
         sample_logged = 0
 
@@ -222,6 +232,9 @@ def run():
                 continue
             if edge_fraction(yes_price) < KALSHI_MIN_EDGE:
                 d_edge += 1
+                continue
+            if is_parlay(market.get("title", "")):
+                d_parlay += 1
                 continue
 
             edge   = calculate_edge(yes_price)
@@ -254,7 +267,7 @@ def run():
         elapsed = time.time() - cycle_start
         print(f"  Done in {elapsed:.1f}s — {flagged}/{len(markets)} flagged. "
               f"max_volume_seen={max_vol_seen}  "
-              f"drops: seen={d_seen} vol={d_vol} days={d_days} edge={d_edge} weak={d_weak}")
+              f"drops: seen={d_seen} vol={d_vol} days={d_days} edge={d_edge} parlay={d_parlay} weak={d_weak}")
         time.sleep(max(0, CHECK_INTERVAL - elapsed))
 
 if __name__ == "__main__":

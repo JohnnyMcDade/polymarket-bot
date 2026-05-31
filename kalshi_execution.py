@@ -55,10 +55,8 @@ def place_order(ticker: str, side: str, contracts: int, price_cents: int) -> dic
 
     path = "/trade-api/v2/portfolio/orders"
     try:
-        # When buying YES, the price you pay is yes_ask (cents).
-        # When buying NO, you're submitting a YES sell at 100-no_ask which
-        # Kalshi's `yes_price` field represents — see API docs.
-        yes_price = price_cents if side == "yes" else 100 - price_cents
+        # Kalshi requires exactly one of yes_price/no_price, matching `side`.
+        # price_cents is what we pay for the chosen side (cents).
         payload = {
             "action": "buy",
             "client_order_id": f"pp_{ticker}_{int(time.time())}",
@@ -66,8 +64,11 @@ def place_order(ticker: str, side: str, contracts: int, price_cents: int) -> dic
             "side": side,
             "ticker": ticker,
             "type": "limit",
-            "yes_price": yes_price,
         }
+        if side == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
         r = requests.post(
             f"{KALSHI_BASE_URL}/portfolio/orders",
             headers=get_auth_headers("POST", path),
