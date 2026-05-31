@@ -214,7 +214,7 @@ def run():
 
         markets = get_markets()
         flagged = 0
-        d_seen = d_vol = d_days = d_edge = d_parlay = d_weak = 0
+        d_seen = d_dead = d_vol = d_days = d_parlay = d_edge = d_weak = 0
         max_vol_seen = 0
         sample_logged = 0
         edge_samples_logged = 0
@@ -236,11 +236,23 @@ def run():
                       f"edge_frac={edge_fraction(yes_price):.3f}")
                 sample_logged += 1
 
+            # Dead markets (settled or no YES bid): use <= 0.0 instead of == 0
+            # to dodge float-equality fragility on JSON-parsed values.
+            ya = float(market.get("yes_ask_dollars", 0) or 0)
+            if ya >= 0.99 or ya <= 0.0:
+                d_dead += 1
+                continue
             if volume < KALSHI_MIN_VOLUME:
                 d_vol += 1
                 continue
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
                 d_days += 1
+                continue
+            # Parlay check runs BEFORE edge — parlays at extreme prices were
+            # being miscounted as edge drops, masking the parlay signal.
+            if is_parlay(market.get("title", "")):
+                d_parlay += 1
+                print(f"[PARLAY-DROP] {ticker}: {market.get('title', '')!r}", flush=True)
                 continue
             ef = edge_fraction(yes_price)
             if ef < KALSHI_SCANNER_MIN_EDGE:
@@ -253,10 +265,6 @@ def run():
                         flush=True,
                     )
                     edge_samples_logged += 1
-                continue
-            if is_parlay(market.get("title", "")):
-                d_parlay += 1
-                print(f"[PARLAY-DROP] {ticker}: {market.get('title', '')!r}", flush=True)
                 continue
 
             edge   = calculate_edge(yes_price)
@@ -289,7 +297,7 @@ def run():
         elapsed = time.time() - cycle_start
         print(f"  Done in {elapsed:.1f}s — {flagged}/{len(markets)} flagged. "
               f"max_volume_seen={max_vol_seen}  "
-              f"drops: seen={d_seen} vol={d_vol} days={d_days} edge={d_edge} parlay={d_parlay} weak={d_weak}")
+              f"drops: seen={d_seen} dead={d_dead} vol={d_vol} days={d_days} parlay={d_parlay} edge={d_edge} weak={d_weak}")
         time.sleep(max(0, CHECK_INTERVAL - elapsed))
 
 if __name__ == "__main__":
