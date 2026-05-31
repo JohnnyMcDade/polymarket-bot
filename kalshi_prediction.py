@@ -26,8 +26,7 @@ CHECK_INTERVAL = int(os.getenv("KALSHI_PREDICTION_INTERVAL", "60"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_PREDICTION", "claude-sonnet-4-6")
 KALSHI_PREDICTION_MIN_EDGE = float(os.getenv("KALSHI_PREDICTION_MIN_EDGE", "0.05"))
-# Note: keep in sync with the noise-floor value in _SYSTEM_PROMPT — if you
-# raise this above 0.05, also update the prompt so Claude's SKIP threshold
+# Interpolated into _SYSTEM_PROMPT below so Claude's SKIP threshold always
 # matches the agent's keep threshold.
 KALSHI_PREDICTION_BATCH_SIZE = int(os.getenv("KALSHI_PREDICTION_BATCH_SIZE", "5"))
 # 200 output tokens per market is enough for the structured response
@@ -39,8 +38,10 @@ MAX_TOKENS_PER_MARKET = 200
 # System prompt is intentionally substantive — it carries the full
 # methodology so per-call user messages can stay lean. Marked cacheable
 # below; Anthropic's prompt cache requires ~1024 tokens of cached
-# content to activate on Sonnet, so keep this from shrinking.
-_SYSTEM_PROMPT = """You are a prediction-market analyst specializing in Kalshi binary outcome markets. Your task is to estimate the TRUE probability of YES for each market in the request and compute the edge versus the current market price.
+# content to activate on Sonnet, so keep this from shrinking. The
+# threshold value is interpolated from KALSHI_PREDICTION_MIN_EDGE — it's
+# constant within a process, so caching still hits.
+_SYSTEM_PROMPT = f"""You are a prediction-market analyst specializing in Kalshi binary outcome markets. Your task is to estimate the TRUE probability of YES for each market in the request and compute the edge versus the current market price.
 
 INPUT FORMAT
 Each request contains one or more markets, each introduced by a line of the form "=== MARKET N ===". For every market the input gives you:
@@ -55,7 +56,7 @@ EDGE INTERPRETATION
 - edge = true_probability - market_implied_probability
 - Positive edge means YES is undervalued by the market (consider BUY_YES)
 - Negative edge means YES is overvalued by the market (consider BUY_NO)
-- Small edges (|edge| < 0.05) are noise — recommend SKIP regardless of direction
+- Small edges (|edge| < {KALSHI_PREDICTION_MIN_EDGE:.2f}) are noise — recommend SKIP regardless of direction
 
 CONFIDENCE GUIDANCE
 - HIGH: clear news catalyst, strong sentiment alignment with the underlying facts, short resolution window, well-known event
@@ -63,8 +64,8 @@ CONFIDENCE GUIDANCE
 - LOW: weak/no headlines, long resolution window with little visibility, conflicting signals, or unfamiliar topic where you cannot reason from first principles
 
 RECOMMENDATION RULES
-- BUY_YES only if edge >= +0.05 AND confidence is MEDIUM or HIGH
-- BUY_NO only if edge <= -0.05 AND confidence is MEDIUM or HIGH
+- BUY_YES only if edge >= +{KALSHI_PREDICTION_MIN_EDGE:.2f} AND confidence is MEDIUM or HIGH
+- BUY_NO only if edge <= -{KALSHI_PREDICTION_MIN_EDGE:.2f} AND confidence is MEDIUM or HIGH
 - SKIP in all other cases — including any LOW-confidence call regardless of edge size, and any market where the headlines do not actually bear on the resolution criterion
 
 CAUTION ON SENTIMENT SCORES
