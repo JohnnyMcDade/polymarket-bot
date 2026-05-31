@@ -17,7 +17,9 @@ KALSHI_MIN_VOLUME      = float(os.getenv("KALSHI_MIN_VOLUME", 100))
 KALSHI_MAX_DAYS        = int(os.getenv("KALSHI_MAX_DAYS", 30))
 # Minimum distance from 0.5 expressed as a fraction (0..0.5).
 # Example: 0.03 means yes_ask must be <= 0.47 or >= 0.53.
-KALSHI_MIN_EDGE        = float(os.getenv("KALSHI_MIN_EDGE", 0))
+KALSHI_SCANNER_MIN_EDGE        = float(os.getenv("KALSHI_SCANNER_MIN_EDGE", 0))
+# Note: scanner edge is distance of yes_price/100 from 0.5 (price-based),
+# distinct from KALSHI_PREDICTION_MIN_EDGE which gates |true_prob - market|.
 KALSHI_DEBUG           = os.getenv("KALSHI_DEBUG", "0") == "1"
 
 seen_market_ids = set()
@@ -196,7 +198,7 @@ def send_discord(embed):
 def run():
     print("Kalshi Scanner starting...")
     print(f"  config: MIN_VOLUME={KALSHI_MIN_VOLUME} MAX_DAYS={KALSHI_MAX_DAYS} "
-          f"MIN_EDGE={KALSHI_MIN_EDGE} DEBUG={KALSHI_DEBUG}")
+          f"MIN_EDGE={KALSHI_SCANNER_MIN_EDGE} DEBUG={KALSHI_DEBUG}")
     while True:
         cycle_start = time.time()
         print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning Kalshi markets...")
@@ -230,7 +232,7 @@ def run():
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
                 d_days += 1
                 continue
-            if edge_fraction(yes_price) < KALSHI_MIN_EDGE:
+            if edge_fraction(yes_price) < KALSHI_SCANNER_MIN_EDGE:
                 d_edge += 1
                 continue
             if is_parlay(market.get("title", "")):

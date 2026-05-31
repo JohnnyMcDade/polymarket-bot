@@ -25,7 +25,10 @@ WEBHOOK_KALSHI_PREDICTIONS = os.getenv("WEBHOOK_KALSHI_PREDICTIONS", "")
 CHECK_INTERVAL = int(os.getenv("KALSHI_PREDICTION_INTERVAL", "60"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_PREDICTION", "claude-sonnet-4-6")
-KALSHI_MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.05"))
+KALSHI_PREDICTION_MIN_EDGE = float(os.getenv("KALSHI_PREDICTION_MIN_EDGE", "0.05"))
+# Note: keep in sync with the noise-floor value in _SYSTEM_PROMPT — if you
+# raise this above 0.05, also update the prompt so Claude's SKIP threshold
+# matches the agent's keep threshold.
 KALSHI_PREDICTION_BATCH_SIZE = int(os.getenv("KALSHI_PREDICTION_BATCH_SIZE", "5"))
 # 200 output tokens per market is enough for the structured response
 # (TICKER + 5 short fields + a 1-sentence REASONING). Scaled by batch
@@ -353,7 +356,7 @@ def _diagnose_api_key() -> None:
 
 def run() -> None:
     print("Kalshi Prediction Agent starting...")
-    print(f"  model={ANTHROPIC_MODEL}  min_edge={KALSHI_MIN_EDGE:.0%}")
+    print(f"  model={ANTHROPIC_MODEL}  min_edge={KALSHI_PREDICTION_MIN_EDGE:.0%}")
     _diagnose_api_key()
     while True:
         cycle_start = time.time()
@@ -380,7 +383,7 @@ def run() -> None:
                     if prediction["recommendation"] == "SKIP":
                         dropped += 1
                         continue
-                    if abs(prediction["edge"]) < KALSHI_MIN_EDGE:
+                    if abs(prediction["edge"]) < KALSHI_PREDICTION_MIN_EDGE:
                         dropped += 1
                         continue
 
