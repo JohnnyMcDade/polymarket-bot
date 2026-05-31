@@ -214,7 +214,7 @@ def run():
 
         markets = get_markets()
         flagged = 0
-        d_seen = d_dead = d_vol = d_days = d_parlay = d_edge = d_weak = 0
+        d_seen = d_mve = d_dead = d_vol = d_days = d_parlay = d_edge = d_weak = 0
         max_vol_seen = 0
         sample_logged = 0
         edge_samples_logged = 0
@@ -223,6 +223,13 @@ def run():
             ticker    = market.get("ticker", "")
             if ticker in seen_market_ids:
                 d_seen += 1
+                continue
+
+            # KXMVE = multi-variable event markets; almost always parlay-style.
+            # Skip wholesale rather than relying on title heuristics.
+            event_ticker = market.get("event_ticker", "") or ""
+            if event_ticker.startswith("KXMVE"):
+                d_mve += 1
                 continue
 
             volume     = float(market.get("open_interest_fp", 0) or 0)
@@ -297,7 +304,7 @@ def run():
         elapsed = time.time() - cycle_start
         print(f"  Done in {elapsed:.1f}s — {flagged}/{len(markets)} flagged. "
               f"max_volume_seen={max_vol_seen}  "
-              f"drops: seen={d_seen} dead={d_dead} vol={d_vol} days={d_days} parlay={d_parlay} edge={d_edge} weak={d_weak}")
+              f"drops: seen={d_seen} mve={d_mve} dead={d_dead} vol={d_vol} days={d_days} parlay={d_parlay} edge={d_edge} weak={d_weak}")
         time.sleep(max(0, CHECK_INTERVAL - elapsed))
 
 if __name__ == "__main__":
