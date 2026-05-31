@@ -291,6 +291,7 @@ def run():
             embed = build_embed(market, days_left, edge, signal)
             send_discord(embed)
 
+            print(f"[FLAGGED] {market.get('ticker','')} | {market.get('title','')}", flush=True)
             kalshi_queue.enqueue("scanner", ticker, {
                 "ticker": ticker,
                 "title": market.get("title", ""),
