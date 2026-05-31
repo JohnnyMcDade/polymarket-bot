@@ -246,18 +246,17 @@ def run():
                       f"edge_frac={edge_fraction(yes_price):.3f}")
                 sample_logged += 1
 
+            # No active order book — open_interest_fp / volume_24h_fp return
+            # 0 for almost every market, so yes_ask_dollars > 0 is the most
+            # reliable proxy for "this market has live quotes."
+            ya = float(market.get("yes_ask_dollars", 0) or 0)
+            if ya <= 0.0:
+                d_vol += 1
+                continue
             # Dead markets (settled or no YES bid): use <= 0.0 instead of == 0
             # to dodge float-equality fragility on JSON-parsed values.
-            ya = float(market.get("yes_ask_dollars", 0) or 0)
             if ya >= 0.99 or ya <= 0.0:
                 d_dead += 1
-                continue
-            # KALSHI_MIN_VOLUME is now a yes_ask price floor in cents, not an
-            # OI count. The dead filter above already drops yes_ask <= 0, so at
-            # default (1¢) this check is a no-op; it bites only when explicitly
-            # raised to skip deeper out-of-money markets.
-            if yes_price < KALSHI_MIN_VOLUME:
-                d_vol += 1
                 continue
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
                 d_days += 1
