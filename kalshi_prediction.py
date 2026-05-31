@@ -245,6 +245,16 @@ def _ask_claude_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         r.raise_for_status()
         body = r.json()
         text = body["content"][0]["text"]
+        # DIAGNOSTIC: dump the raw Claude response so we can see why
+        # markets are being SKIP'd. Tag with the first ticker in the
+        # batch for orientation. Remove once the SKIP-on-everything
+        # issue is understood.
+        first_ticker = items[0].get("ticker", "?") if items else "?"
+        print(
+            f"[CLAUDE-RAW] batch_size={len(items)} first_ticker={first_ticker} "
+            f"response:\n{text}",
+            flush=True,
+        )
         # Log cache stats so we can confirm caching is actually firing;
         # if the system prompt slips back under the model's minimum
         # cacheable size, cache_read will stay at 0 and we'll know.

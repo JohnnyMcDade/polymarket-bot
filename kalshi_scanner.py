@@ -235,6 +235,7 @@ def run():
                 continue
             if is_parlay(market.get("title", "")):
                 d_parlay += 1
+                print(f"[PARLAY-DROP] {ticker}: {market.get('title', '')!r}", flush=True)
                 continue
 
             edge   = calculate_edge(yes_price)
