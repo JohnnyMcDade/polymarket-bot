@@ -41,8 +41,17 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-sonnet-4-6")
 CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
-MAX_DAYS = int(os.getenv("KALSHI_MAX_DAYS", "30"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
+
+# Timing window. Pre-game stats only have an edge before the game starts,
+# and odds move fast in the last few minutes — so we want close_time to be
+# at least MIN_SECS_TO_CLOSE in the future but no more than MAX_SECS_TO_CLOSE.
+# OPEN_AGE_IN_PROGRESS + CLOSE_SOON_FOR_IN_PROGRESS together flag "market
+# opened hours ago and closes soon" as likely-in-progress and skip it.
+MIN_SECS_TO_CLOSE = int(os.getenv("KALSHI_MIN_SECS_TO_CLOSE", "1800"))      # 30 min
+MAX_SECS_TO_CLOSE = int(os.getenv("KALSHI_MAX_SECS_TO_CLOSE", "86400"))     # 24 h
+OPEN_AGE_IN_PROGRESS = int(os.getenv("KALSHI_OPEN_AGE_IN_PROGRESS", "10800"))   # 3 h
+CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "7200"))  # 2 h
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
 SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "edge_seen.json"))
 
@@ -154,14 +163,40 @@ def fetch_markets() -> list[dict[str, Any]]:
     return out
 
 
-def _days_until_expiry(close_time_str: str) -> int:
+def _parse_iso(s: str) -> datetime | None:
+    if not s:
+        return None
     try:
-        if not close_time_str:
-            return 999
-        close = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
-        return max(0, (close - datetime.now(timezone.utc)).days)
-    except Exception:
-        return 999
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _check_timing(close_time_str: str, open_time_str: str,
+                  now: datetime) -> tuple[bool, str, float]:
+    """Return (ok, drop_reason, seconds_to_close).
+
+    drop_reason is "" when ok=True, otherwise one of:
+      no_close, ended, starting_soon, too_far, in_progress
+    seconds_to_close is informational only — caller uses it to
+    populate hours_left on kept markets.
+    """
+    close_dt = _parse_iso(close_time_str)
+    if close_dt is None:
+        return False, "no_close", 0.0
+    secs = (close_dt - now).total_seconds()
+    if secs <= 0:
+        return False, "ended", secs
+    if secs < MIN_SECS_TO_CLOSE:
+        return False, "starting_soon", secs
+    if secs > MAX_SECS_TO_CLOSE:
+        return False, "too_far", secs
+    open_dt = _parse_iso(open_time_str)
+    if open_dt is not None:
+        opened_ago = (now - open_dt).total_seconds()
+        if opened_ago > OPEN_AGE_IN_PROGRESS and secs < CLOSE_SOON_FOR_IN_PROGRESS:
+            return False, "in_progress", secs
+    return True, "", secs
 
 
 # Player / team name extraction. The stats cache JSON already names every
@@ -220,7 +255,10 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
                     seen: set[str]) -> list[dict[str, Any]]:
-    drops = {"seen": 0, "dead": 0, "illiquid": 0, "days": 0, "nonsport": 0}
+    drops = {"seen": 0, "dead": 0, "illiquid": 0, "nonsport": 0}
+    timing_drops = {"no_close": 0, "ended": 0, "starting_soon": 0,
+                    "too_far": 0, "in_progress": 0}
+    now = datetime.now(timezone.utc)
     kept: list[dict[str, Any]] = []
     for m in markets:
         ticker = m.get("ticker") or ""
@@ -236,9 +274,11 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         if ya >= 0.99:
             drops["dead"] += 1
             continue
-        days_left = _days_until_expiry(m.get("close_time", ""))
-        if days_left <= 0 or days_left > MAX_DAYS:
-            drops["days"] += 1
+        ok, reason, secs_to_close = _check_timing(
+            m.get("close_time", ""), m.get("open_time", ""), now
+        )
+        if not ok:
+            timing_drops[reason] += 1
             continue
         title = m.get("title", "") or ""
         if not _is_sports(title, ticker):
@@ -249,8 +289,9 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             "ticker": ticker,
             "title": title,
             "yes_ask_cents": int(round(ya * 100)),
-            "days_left": days_left,
+            "hours_left": round(secs_to_close / 3600, 1),
             "close_time": m.get("close_time", ""),
+            "open_time": m.get("open_time", ""),
             "entities": entities,
         })
         if len(kept) >= MAX_MARKETS_PER_CYCLE:
@@ -259,7 +300,17 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
     print(
         f"[edge] filter: kept={len(kept)} "
         f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']} "
-        f"days={drops['days']} nonsport={drops['nonsport']}",
+        f"nonsport={drops['nonsport']}",
+        flush=True,
+    )
+    print(
+        f"[TIMING] dropped={sum(timing_drops.values())} "
+        f"ended={timing_drops['ended']} "
+        f"starting_soon={timing_drops['starting_soon']} "
+        f"in_progress={timing_drops['in_progress']} "
+        f"too_far={timing_drops['too_far']} "
+        f"no_close={timing_drops['no_close']} "
+        f"(window: {MIN_SECS_TO_CLOSE//60}min–{MAX_SECS_TO_CLOSE//3600}h)",
         flush=True,
     )
     return kept
@@ -277,7 +328,7 @@ RECOMMENDATION RULES
 - SKIP if the market's resolution depends on something not covered by the stats block (politics, weather, crypto, awards, etc.).
 
 CONFIDENCE GUIDANCE
-- HIGH: stats directly answer the question (e.g. market asks "Will Judge hit 50 HR?" and stats show his current HR count and pace), market resolves within MAX_DAYS, no obvious lurking-variable risk
+- HIGH: stats directly answer the question (e.g. market asks "Will Judge hit 50 HR?" and stats show his current HR count and pace), market resolves within the next 24 hours, no obvious lurking-variable risk
 - MEDIUM: stats are relevant but partial (e.g. team standings inform a "win division" market but a lot can change)
 - LOW: stats are tangential or stale relative to the market
 
@@ -319,7 +370,7 @@ def _build_user_message(items: list[dict[str, Any]]) -> str:
             f"=== MARKET {i} ===\n"
             f"TICKER: {it['ticker']}\n"
             f"TITLE: {it['title']}\n"
-            f"DAYS UNTIL RESOLUTION: {it['days_left']}\n"
+            f"HOURS UNTIL RESOLUTION: {it['hours_left']}\n"
             f"MARKET YES PRICE: {ya}¢ (implies {ya/100:.2%} YES)\n"
             f"STATS ENTITIES MATCHED: {entities}"
         )
@@ -427,7 +478,7 @@ def _build_embed(item: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
             {"name": "Edge", "value": f"{edge_pct:+.1f}%", "inline": True},
             {"name": "Confidence", "value": pred["confidence"], "inline": True},
             {"name": "Recommendation", "value": pred["recommendation"], "inline": True},
-            {"name": "Days Left", "value": str(item.get("days_left", "?")), "inline": True},
+            {"name": "Hours Left", "value": str(item.get("hours_left", "?")), "inline": True},
             {"name": "Reasoning", "value": pred.get("reasoning", "")[:500] or "—", "inline": False},
             {"name": "Market", "value": f"[View on Kalshi]({market_url})", "inline": False},
         ],
@@ -501,7 +552,7 @@ def run() -> None:
                                 "ticker": ticker,
                                 "title": it["title"],
                                 "yes_ask": it["yes_ask_cents"],
-                                "days_left": it["days_left"],
+                                "hours_left": it["hours_left"],
                                 "close_time": it["close_time"],
                                 "true_probability": pred["true_probability"],
                                 "edge": pred["edge"],
