@@ -87,7 +87,7 @@ Be precise and analytical. Only recommend BUY if edge is above 5%."""
         }
         payload = {
             "model": "claude-sonnet-4-6",
-            "max_tokens": 500,
+            "max_tokens": 200,
             "messages": [{"role": "user", "content": prompt}]
         }
         r = requests.post(
@@ -282,6 +282,8 @@ def run():
             embed = build_prediction_embed(market, parsed, yes_price, days_left, len(articles))
             send_discord(embed)
             predicted += 1
+            if predicted >= 5:
+                break
             time.sleep(2)
 
         if len(seen_prediction_ids) > 10_000:
