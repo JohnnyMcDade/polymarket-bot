@@ -175,8 +175,17 @@ def run() -> None:
                 contracts = int(bet_size / (price_for_order / 100)) if price_for_order > 0 else 0
 
                 # Block conditions
+                edge = float(item.get("edge", 0))
+                if (rec == "BUY_YES" and edge <= 0) or (rec == "BUY_NO" and edge >= 0):
+                    reason = f"Edge sign contradicts {rec}: edge={edge:+.3f}"
+                    print(f"[RISK-REJECT] {item.get('ticker', '?')}: {reason}", flush=True)
+                    send_discord(_build_embed(item, False, contracts=contracts,
+                                              price_for_order=price_for_order,
+                                              bet_size=0, kelly_pct=0, reason=reason))
+                    continue
                 if kelly_pct <= 0:
-                    reason = f"Kelly returned ≤ 0 (edge {item.get('edge', 0)*100:+.1f}%)"
+                    reason = f"Kelly returned ≤ 0 (edge {edge*100:+.1f}%)"
+                    print(f"[RISK-REJECT] {item.get('ticker', '?')}: {reason}", flush=True)
                     send_discord(_build_embed(item, False, contracts=0,
                                               price_for_order=price_for_order,
                                               bet_size=0, kelly_pct=0, reason=reason))
@@ -184,6 +193,7 @@ def run() -> None:
                 if contracts < MIN_CONTRACTS or bet_size < MIN_BET_USD:
                     reason = (f"Below minimums: {contracts}c @ {_format_usd(bet_size)} "
                               f"(min {MIN_CONTRACTS}c / {_format_usd(MIN_BET_USD)})")
+                    print(f"[RISK-REJECT] {item.get('ticker', '?')}: {reason}", flush=True)
                     send_discord(_build_embed(item, False, contracts=contracts,
                                               price_for_order=price_for_order,
                                               bet_size=bet_size, kelly_pct=kelly_pct,
@@ -193,6 +203,7 @@ def run() -> None:
                     reason = (f"Would exceed daily loss cap "
                               f"({_format_usd(_daily_spent)} + {_format_usd(bet_size)} "
                               f"> {MAX_DAILY_LOSS:.0%} of bankroll)")
+                    print(f"[RISK-REJECT] {item.get('ticker', '?')}: {reason}", flush=True)
                     send_discord(_build_embed(item, False, contracts=contracts,
                                               price_for_order=price_for_order,
                                               bet_size=bet_size, kelly_pct=kelly_pct,

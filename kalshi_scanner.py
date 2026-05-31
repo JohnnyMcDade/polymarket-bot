@@ -128,7 +128,7 @@ def is_parlay(title):
     t = title.lower()
     if "parlay" in t or "multi" in t:
         return True
-    if title.count(",") >= 3:
+    if title.count(",") >= 2:
         return True
     # Case-sensitive on AND: lowercase "and" appears in too many legitimate
     # single-outcome titles ("England and Wales", "win and advance"), but
