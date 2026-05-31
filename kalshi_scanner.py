@@ -128,7 +128,7 @@ def is_parlay(title):
     t = title.lower()
     if "parlay" in t or "multi" in t:
         return True
-    if title.count(",") >= 2:
+    if title.count(",") >= 3:
         return True
     # Case-sensitive on AND: lowercase "and" appears in too many legitimate
     # single-outcome titles ("England and Wales", "win and advance"), but
@@ -217,6 +217,7 @@ def run():
         d_seen = d_vol = d_days = d_edge = d_parlay = d_weak = 0
         max_vol_seen = 0
         sample_logged = 0
+        edge_samples_logged = 0
 
         for market in markets:
             ticker    = market.get("ticker", "")
@@ -241,8 +242,17 @@ def run():
             if days_left > KALSHI_MAX_DAYS or days_left == 0:
                 d_days += 1
                 continue
-            if edge_fraction(yes_price) < KALSHI_SCANNER_MIN_EDGE:
+            ef = edge_fraction(yes_price)
+            if ef < KALSHI_SCANNER_MIN_EDGE:
                 d_edge += 1
+                if edge_samples_logged < 5:
+                    print(
+                        f"[EDGE-DROP] {ticker} yes={yes_price:.0f}¢ "
+                        f"edge_frac={ef:.3f} (threshold={KALSHI_SCANNER_MIN_EDGE}) "
+                        f"title={market.get('title', '')!r}",
+                        flush=True,
+                    )
+                    edge_samples_logged += 1
                 continue
             if is_parlay(market.get("title", "")):
                 d_parlay += 1
