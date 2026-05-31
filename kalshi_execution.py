@@ -54,32 +54,63 @@ def place_order(ticker: str, side: str, contracts: int, price_cents: int) -> dic
         }
 
     path = "/trade-api/v2/portfolio/orders"
+    # Kalshi requires exactly one of yes_price/no_price, matching `side`.
+    # price_cents is what we pay for the chosen side (cents).
+    payload = {
+        "action": "buy",
+        "client_order_id": f"pp_{ticker}_{int(time.time())}",
+        "count": contracts,
+        "side": side,
+        "ticker": ticker,
+        "type": "limit",
+    }
+    if side == "yes":
+        payload["yes_price"] = price_cents
+    else:
+        payload["no_price"] = price_cents
+
     try:
-        # Kalshi requires exactly one of yes_price/no_price, matching `side`.
-        # price_cents is what we pay for the chosen side (cents).
-        payload = {
-            "action": "buy",
-            "client_order_id": f"pp_{ticker}_{int(time.time())}",
-            "count": contracts,
-            "side": side,
-            "ticker": ticker,
-            "type": "limit",
-        }
-        if side == "yes":
-            payload["yes_price"] = price_cents
-        else:
-            payload["no_price"] = price_cents
         r = requests.post(
             f"{KALSHI_BASE_URL}/portfolio/orders",
             headers=get_auth_headers("POST", path),
             json=payload,
             timeout=15,
         )
-        r.raise_for_status()
-        return r.json().get("order", {})
-    except Exception as e:
-        print(f"[WARN] Order failed for {ticker}: {e}")
+    except requests.exceptions.RequestException as e:
+        print(
+            f"[ORDER-FAIL] {ticker} network error: {e} payload={payload}",
+            flush=True,
+        )
         return None
+
+    if r.status_code >= 400:
+        # Surface Kalshi's actual rejection reason — r.text holds the JSON
+        # error body, which raise_for_status() would have thrown away.
+        print(
+            f"[ORDER-FAIL] {ticker} HTTP {r.status_code} "
+            f"payload={payload} body={r.text[:1000]}",
+            flush=True,
+        )
+        return None
+
+    try:
+        body = r.json()
+    except ValueError as e:
+        print(
+            f"[ORDER-FAIL] {ticker} non-JSON response: {e} body={r.text[:500]}",
+            flush=True,
+        )
+        return None
+
+    order = body.get("order")
+    if not order:
+        print(
+            f"[ORDER-FAIL] {ticker} HTTP {r.status_code} but no order in body: "
+            f"keys={list(body.keys())} body={r.text[:500]}",
+            flush=True,
+        )
+        return None
+    return order
 
 
 def _build_embed(item: dict[str, Any], order: dict[str, Any] | None, *,
