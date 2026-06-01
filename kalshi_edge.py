@@ -26,7 +26,8 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -126,8 +127,13 @@ def _load_stats_cache() -> dict[str, Any] | None:
     try:
         dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
     except ValueError:
-        print(f"[edge] stats_cache.json fetched_at unparseable: {fetched_at}", flush=True)
+        print(f"[edge] stats_cache.json fetched_at unparseable: {fetched_at!r}", flush=True)
         return None
+    # Claude sometimes returns a date-only string ("2026-05-31"), which
+    # fromisoformat parses to a NAIVE datetime. Subtracting that from an
+    # aware datetime raises TypeError and crashes the whole cycle.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     if age_h > 24:
         print(f"[edge] stats_cache is {age_h:.1f}h old (>24h) — skipping cycle", flush=True)
@@ -512,20 +518,35 @@ def run() -> None:
     )
     seen = _load_seen()
     print(f"[edge] loaded {len(seen)} previously-seen tickers", flush=True)
+    cycle = 0
 
     while True:
+        cycle += 1
         cycle_start = time.time()
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        print(
+            f"[edge-heartbeat] cycle={cycle} ts={ts} seen={len(seen)} "
+            f"interval={CHECK_INTERVAL}s",
+            flush=True,
+        )
         try:
             stats = _load_stats_cache()
             if stats is None:
-                pass  # already logged in _load_stats_cache
+                print(f"[edge] cycle={cycle} no-op: stats unavailable", flush=True)
             else:
                 markets = fetch_markets()
-                print(f"[edge] fetched {len(markets)} open markets", flush=True)
+                print(
+                    f"[edge] cycle={cycle} fetched {len(markets)} open markets",
+                    flush=True,
+                )
                 candidates = _filter_markets(markets, stats, seen)
 
                 if not candidates:
-                    print("[edge] no new sport markets this cycle — skipping Claude call", flush=True)
+                    print(
+                        f"[edge] cycle={cycle} no candidates after filter — "
+                        "skipping Claude call",
+                        flush=True,
+                    )
                 else:
                     system_prompt = _build_system_prompt(stats)
                     approved = 0
@@ -565,12 +586,31 @@ def run() -> None:
                             kalshi_queue.enqueue("risk", ticker, payload)
                             send_discord(_build_embed(it, pred))
                     _save_seen(seen)
-                    print(f"[edge] cycle done: approved={approved} skipped={skipped}", flush=True)
+                    print(
+                        f"[edge] cycle={cycle} done: approved={approved} "
+                        f"skipped={skipped}",
+                        flush=True,
+                    )
         except Exception as e:
-            print(f"[WARN] edge cycle crashed: {e}", flush=True)
+            # Print the full traceback so we can pinpoint where the cycle
+            # died — bare str(e) was hiding the real cause (e.g. naive vs
+            # aware datetime mismatch from a date-only fetched_at).
+            print(
+                f"[WARN] edge cycle={cycle} crashed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
 
         elapsed = time.time() - cycle_start
-        time.sleep(max(0, CHECK_INTERVAL - elapsed))
+        sleep_s = max(0.0, CHECK_INTERVAL - elapsed)
+        next_wake = (datetime.now(timezone.utc)
+                     + timedelta(seconds=sleep_s)).strftime("%H:%M:%S")
+        print(
+            f"[edge-sleep] cycle={cycle} elapsed={elapsed:.1f}s "
+            f"sleeping={sleep_s:.0f}s next_wake={next_wake} UTC",
+            flush=True,
+        )
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
