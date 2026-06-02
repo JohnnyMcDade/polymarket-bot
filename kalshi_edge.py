@@ -43,6 +43,7 @@ CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
+DEBUG_LOG = os.getenv("KALSHI_EDGE_DEBUG_LOG", "").lower() in ("1", "true", "yes")
 
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
@@ -440,7 +441,8 @@ def _parse_response(text: str) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _ask_claude(system_prompt: str, batch: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _ask_claude(system_prompt: str, batch: list[dict[str, Any]],
+                log_raw: bool = False) -> dict[str, dict[str, Any]]:
     if not ANTHROPIC_API_KEY or not batch:
         return {}
     try:
@@ -488,7 +490,10 @@ def _ask_claude(system_prompt: str, batch: list[dict[str, Any]]) -> dict[str, di
             flush=True,
         )
     text_parts = [b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"]
-    return _parse_response("\n".join(text_parts))
+    raw_text = "\n".join(text_parts)
+    if log_raw and DEBUG_LOG:
+        print(f"[edge-debug] raw Claude response (batch_size={len(batch)}):\n{raw_text}\n[edge-debug] end raw response", flush=True)
+    return _parse_response(raw_text)
 
 
 # ─── Discord ────────────────────────────────────────────────────────────
@@ -539,7 +544,8 @@ def send_discord(embed: dict[str, Any]) -> None:
 def run() -> None:
     print(
         f"Kalshi Edge Agent starting — model={ANTHROPIC_MODEL}, "
-        f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, min_edge={MIN_EDGE:.0%}"
+        f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, min_edge={MIN_EDGE:.0%}, "
+        f"debug_log={DEBUG_LOG}"
     )
     print(
         f"[edge] timing env: MIN_SECS_TO_CLOSE={MIN_SECS_TO_CLOSE} "
@@ -585,14 +591,25 @@ def run() -> None:
                     skipped = 0
                     for start in range(0, len(candidates), BATCH_SIZE):
                         batch = candidates[start : start + BATCH_SIZE]
-                        preds = _ask_claude(system_prompt, batch)
+                        preds = _ask_claude(system_prompt, batch, log_raw=(start == 0))
                         for it in batch:
                             ticker = it["ticker"]
                             seen.add(ticker)
                             pred = preds.get(ticker)
                             if not pred:
                                 skipped += 1
+                                if DEBUG_LOG:
+                                    print(f"[edge-debug] {ticker} no prediction parsed", flush=True)
                                 continue
+                            if DEBUG_LOG:
+                                print(
+                                    f"[edge-debug] {ticker} rec={pred['recommendation']} "
+                                    f"edge={pred['edge']:+.3f} conf={pred['confidence']} "
+                                    f"true_p={pred['true_probability']:.3f} "
+                                    f"ask={it['yes_ask_cents']}c hrs={it['hours_left']} "
+                                    f"why={pred.get('reasoning', '')[:200]!r}",
+                                    flush=True,
+                                )
                             if (
                                 pred["recommendation"] != "BUY"
                                 or pred["confidence"] != "HIGH"
