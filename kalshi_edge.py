@@ -56,6 +56,16 @@ CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "720
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
 SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "edge_seen.json"))
 
+# Sports series we actually evaluate. Pulling /markets per series with a
+# close-time window cuts the fetch from 5000 mostly-irrelevant rows to
+# only in-window contracts the stats cache can actually score.
+SERIES_TICKERS = [
+    s.strip() for s in os.getenv(
+        "KALSHI_EDGE_SERIES",
+        "KXMLBGAME,KXMLBTOTAL,KXMLBSPREAD,KXNHLGAME,KXATPMATCH,KXNBAGAME",
+    ).split(",") if s.strip()
+]
+
 # Sports market keywords — used to skip markets the stats cache can't help
 # with (politics, weather, crypto, etc.). Cheap pre-filter — Claude would
 # correctly say SKIP on them anyway, but we'd rather not pay for that.
@@ -146,26 +156,41 @@ def _load_stats_cache() -> dict[str, Any] | None:
 def fetch_markets() -> list[dict[str, Any]]:
     path = "/trade-api/v2/markets"
     out: list[dict[str, Any]] = []
-    cursor = None
-    try:
-        for _ in range(5):
-            params = {"limit": 1000, "status": "open"}
-            if cursor:
-                params["cursor"] = cursor
-            r = requests.get(
-                f"{KALSHI_BASE_URL}/markets",
-                headers=get_auth_headers("GET", path),
-                params=params,
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json()
-            out.extend(data.get("markets", []))
-            cursor = data.get("cursor")
-            if not cursor:
-                break
-    except Exception as e:
-        print(f"[WARN] Kalshi market fetch failed: {e}", flush=True)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    min_close_ts = now_ts + MIN_SECS_TO_CLOSE
+    max_close_ts = now_ts + MAX_SECS_TO_CLOSE
+    for series in SERIES_TICKERS:
+        cursor = None
+        fetched = 0
+        try:
+            for _ in range(5):
+                params: dict[str, Any] = {
+                    "limit": 1000,
+                    "status": "open",
+                    "series_ticker": series,
+                    "min_close_ts": min_close_ts,
+                    "max_close_ts": max_close_ts,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                r = requests.get(
+                    f"{KALSHI_BASE_URL}/markets",
+                    headers=get_auth_headers("GET", path),
+                    params=params,
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+                markets = data.get("markets", []) or []
+                out.extend(markets)
+                fetched += len(markets)
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+        except Exception as e:
+            print(f"[WARN] Kalshi fetch failed series={series}: {e}", flush=True)
+            continue
+        print(f"[edge] fetched series={series} count={fetched}", flush=True)
     return out
 
 
