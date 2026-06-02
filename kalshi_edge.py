@@ -516,6 +516,13 @@ def run() -> None:
         f"Kalshi Edge Agent starting — model={ANTHROPIC_MODEL}, "
         f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, min_edge={MIN_EDGE:.0%}"
     )
+    print(
+        f"[edge] timing env: MIN_SECS_TO_CLOSE={MIN_SECS_TO_CLOSE} "
+        f"MAX_SECS_TO_CLOSE={MAX_SECS_TO_CLOSE} "
+        f"OPEN_AGE_IN_PROGRESS={OPEN_AGE_IN_PROGRESS} "
+        f"CLOSE_SOON_FOR_IN_PROGRESS={CLOSE_SOON_FOR_IN_PROGRESS}",
+        flush=True,
+    )
     seen = _load_seen()
     print(f"[edge] loaded {len(seen)} previously-seen tickers", flush=True)
     cycle = 0

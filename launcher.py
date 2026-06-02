@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from polymarket_bot_endpoints import start_api_server
 
@@ -82,12 +83,21 @@ def run_kalshi_stats():
         traceback.print_exc()
 
 def run_kalshi_edge():
-    try:
-        print("Kalshi Edge thread starting...")
-        kalshi_edge.run()
-    except Exception as e:
-        print(f"Kalshi Edge error: {e}")
-        traceback.print_exc()
+    # Watchdog: restart the edge loop if run() ever returns or raises
+    # anything other than KeyboardInterrupt. Catches BaseException so
+    # SystemExit / MemoryError also trigger a restart instead of silently
+    # killing the thread.
+    while True:
+        try:
+            print("Kalshi Edge thread starting...")
+            kalshi_edge.run()
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            print(f"Kalshi Edge error: {type(e).__name__}: {e}")
+            traceback.print_exc()
+        print("[edge] THREAD DIED — restarting", flush=True)
+        time.sleep(5)
 
 def run_kalshi_trader():
     try:
