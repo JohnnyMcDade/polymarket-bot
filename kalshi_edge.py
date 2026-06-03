@@ -62,7 +62,7 @@ MIN_SECS_TO_CLOSE = int(os.getenv("KALSHI_MIN_SECS_TO_CLOSE", "1800"))      # 30
 MAX_SECS_TO_CLOSE = int(os.getenv("KALSHI_MAX_SECS_TO_CLOSE", "86400"))     # 24 h
 OPEN_AGE_IN_PROGRESS = int(os.getenv("KALSHI_OPEN_AGE_IN_PROGRESS", "10800"))   # 3 h
 CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "7200"))  # 2 h
-STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
+STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "/app/data/edge_seen.json"))
 
 # Sports series we actually evaluate. Pulling /markets per series with a
