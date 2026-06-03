@@ -29,7 +29,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS", "claude-sonnet-4-6")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
-MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "10"))
+MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "15"))
 
 # Cached for the lifetime of the process — the agent rebuilds it every
 # 24h and the system prompt never changes within a day. Keeping it
@@ -45,6 +45,8 @@ REQUIRED COVERAGE
    - Hitting leaders (top 10 each): home runs, RBIs, batting average, OPS, stolen bases
    - Pitching leaders (top 10 each): wins, ERA, strikeouts, WHIP, saves
    - For any clearly active superstar (Judge, Ohtani, Soto, Betts, Acuña, Witt Jr., Skenes, Skubal, Cole) include their current line.
+   - Team scoring (EVERY MLB team, all 30): season runs scored per game, season runs allowed per game, last-7-days runs scored per game and runs allowed per game, home runs-scored-per-game and runs-allowed-per-game splits, away runs-scored-per-game and runs-allowed-per-game splits. Source: baseball-reference team batting/pitching pages or ESPN team stats.
+   - Today's scheduled MLB games: for every game on today's slate, the away team, home team, scheduled start time in UTC, and the announced starting pitcher for each side with their current-season ERA and WHIP. Source: MLB.com probable pitchers or ESPN MLB schedule.
 2. NBA (post-season)
    - Round-by-round playoff results so far: which teams advanced, which were eliminated, series scores
    - Conference finals + Finals matchups if reached
@@ -64,7 +66,9 @@ Return ONE JSON object and nothing else — no prose before or after, no markdow
     "standings": {"<team abbr>": {"w": <int>, "l": <int>, "pct": <float>, "gb": <float|null>, "division": "<string>"}},
     "hitting_leaders": {"hr": [{"player": "<name>", "team": "<abbr>", "value": <int>}, ...], "rbi": [...], "avg": [...], "ops": [...], "sb": [...]},
     "pitching_leaders": {"w": [...], "era": [{"player": "<name>", "team": "<abbr>", "value": <float>}, ...], "k": [...], "whip": [...], "sv": [...]},
-    "notable_players": [{"player": "<name>", "team": "<abbr>", "line": "<HR/RBI/AVG/OPS line as string>"}]
+    "notable_players": [{"player": "<name>", "team": "<abbr>", "line": "<HR/RBI/AVG/OPS line as string>"}],
+    "team_scoring": {"<team abbr>": {"rs_per_game": <float>, "ra_per_game": <float>, "rs_per_game_last7": <float>, "ra_per_game_last7": <float>, "rs_per_game_home": <float>, "ra_per_game_home": <float>, "rs_per_game_away": <float>, "ra_per_game_away": <float>}},
+    "todays_games": [{"away": "<abbr>", "home": "<abbr>", "start_time_utc": "<HH:MM>", "away_pitcher": {"player": "<name>", "era": <float>, "whip": <float>}, "home_pitcher": {"player": "<name>", "era": <float>, "whip": <float>}}]
   },
   "nba": {
     "playoff_results": [{"round": "<R1|R2|CF|F>", "series": "<TEAM1 vs TEAM2>", "winner": "<TEAM>", "score": "<4-2>", "status": "<final|in_progress>"}],
@@ -148,7 +152,7 @@ def fetch_stats() -> dict[str, Any] | None:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 8000,
+                "max_tokens": 12000,
                 "system": [
                     {
                         "type": "text",
@@ -211,6 +215,8 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     nba = stats.get("nba", {}) or {}
     nhl = stats.get("nhl", {}) or {}
     n_teams = len(mlb.get("standings", {}) or {})
+    n_team_scoring = len(mlb.get("team_scoring", {}) or {})
+    n_todays_games = len(mlb.get("todays_games", []) or [])
     n_nba_results = len(nba.get("playoff_results", []) or [])
     n_nhl_results = len(nhl.get("playoff_results", []) or [])
     n_hitters = len((mlb.get("hitting_leaders", {}) or {}).get("hr", []) or [])
@@ -221,6 +227,8 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
         "fields": [
             {"name": "MLB teams", "value": str(n_teams), "inline": True},
             {"name": "MLB HR leaders", "value": str(n_hitters), "inline": True},
+            {"name": "Team scoring", "value": str(n_team_scoring), "inline": True},
+            {"name": "Today's games", "value": str(n_todays_games), "inline": True},
             {"name": "NBA playoff results", "value": str(n_nba_results), "inline": True},
             {"name": "NHL playoff results", "value": str(n_nhl_results), "inline": True},
             {"name": "NBA round", "value": nba.get("current_round", "?"), "inline": True},

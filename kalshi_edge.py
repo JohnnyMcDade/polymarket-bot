@@ -60,12 +60,10 @@ SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "edge_seen.json"))
 # Sports series we actually evaluate. Pulling /markets per series with a
 # close-time window cuts the fetch from 5000 mostly-irrelevant rows to
 # only in-window contracts the stats cache can actually score.
-# MLBTOTAL/MLBSPREAD need team-level run-scoring data the cache doesn't
-# carry yet — re-add once kalshi_stats.py exposes runs scored/allowed.
 SERIES_TICKERS = [
     s.strip() for s in os.getenv(
         "KALSHI_EDGE_SERIES",
-        "KXMLBGAME,KXNHLGAME,KXATPMATCH,KXNBAGAME",
+        "KXMLBGAME,KXMLBTOTAL,KXMLBSPREAD,KXNHLGAME,KXATPMATCH,KXNBAGAME",
     ).split(",") if s.strip()
 ]
 
