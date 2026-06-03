@@ -82,6 +82,14 @@ def run_kalshi_stats():
         print(f"Kalshi Stats error: {e}")
         traceback.print_exc()
 
+def run_kalshi_macro():
+    try:
+        print("Kalshi Macro thread starting...")
+        kalshi_stats.run_macro()
+    except Exception as e:
+        print(f"Kalshi Macro error: {e}")
+        traceback.print_exc()
+
 def run_kalshi_edge():
     # Watchdog: restart the edge loop if run() ever returns or raises
     # anything other than KeyboardInterrupt. Catches BaseException so
@@ -143,7 +151,11 @@ t10 = threading.Thread(target=run_kalshi_winrate)
 # Kalshi whale tracker — parallel, not part of the trading pipeline
 t11 = threading.Thread(target=run_kalshi_tracker)
 
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11):
+# Hourly macro refresh — shares the stats cache lock with the daily stats
+# thread above so concurrent writes never clobber each other.
+t12 = threading.Thread(target=run_kalshi_macro)
+
+for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12):
     t.start()
 
 # FastAPI server for the TikTok UGC ads pipeline (unchanged)
@@ -154,5 +166,5 @@ threading.Thread(
 ).start()
 print("API server thread started on port", os.environ.get("PORT", 8000))
 
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11):
+for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12):
     t.join()

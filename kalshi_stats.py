@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,18 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS", "claude-sonnet-4-6")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
 MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "16"))
+
+# Hourly macro refresher — Haiku call that touches only the economic
+# block so BTC and gas don't go stale between daily Sonnet fetches.
+# Budget target: < $0.02/call, <= ~$0.48/day.
+MACRO_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS_MACRO", "claude-haiku-4-5-20251001")
+MACRO_INTERVAL_SECS = int(os.getenv("KALSHI_STATS_MACRO_INTERVAL", "3600"))
+MACRO_MAX_SEARCHES = int(os.getenv("KALSHI_STATS_MACRO_MAX_SEARCHES", "3"))
+MACRO_ENABLED = os.getenv("KALSHI_STATS_MACRO_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Serializes read-modify-write between the daily Sonnet fetch and the
+# hourly macro Haiku fetch so one doesn't clobber the other.
+_cache_lock = threading.Lock()
 
 # Cached for the lifetime of the process — the agent rebuilds it every
 # 24h and the system prompt never changes within a day. Keeping it
@@ -102,6 +116,33 @@ RULES
 - ERAs and similar floats: 2 decimals.
 - Keep the JSON valid — no trailing commas, no comments, no NaN/Infinity.
 - Today's date for fetched_at is the actual UTC date at fetch time."""
+
+
+_MACRO_SYSTEM_PROMPT = """You are a macro data updater feeding a Kalshi prediction-market bot. Refresh ONLY the economic indicators below. Use web_search sparingly — ONE consolidated search is ideal; never more than 3.
+
+REQUIRED COVERAGE
+- US national average regular-grade gasoline price right now ($/gal, AAA)
+- Most recently released CPI: month covered, headline YoY %, core YoY %, release date
+- Federal funds target range (low %, high %) right now, next FOMC meeting date, market-implied probabilities (CME FedWatch) of hold / hike / cut at that next meeting
+- Bitcoin spot price right now (USD) with the source timestamp
+- breaking_news: one short string describing any Fed / CPI / macro news from the past 24 hours, or empty string if nothing material
+
+OUTPUT FORMAT
+Return ONE JSON object and nothing else — no prose before or after, no markdown fences. Schema:
+
+{
+  "gas_national_avg_usd_per_gal": <float>,
+  "gas_source_date": "<YYYY-MM-DD>",
+  "cpi": {"month": "<YYYY-MM>", "headline_yoy_pct": <float>, "core_yoy_pct": <float>, "release_date": "<YYYY-MM-DD>"},
+  "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>},
+  "btc_spot_usd": <float>,
+  "btc_source_time_utc": "<HH:MM>",
+  "breaking_news": "<string or empty>"
+}
+
+RULES
+- If a stat is genuinely unknown after searching, use null — never invent.
+- Keep the JSON valid — no trailing commas, no comments, no NaN/Infinity."""
 
 
 def _is_cache_fresh() -> bool:
@@ -305,8 +346,120 @@ def _do_fetch_and_save() -> None:
     if not stats:
         print("[stats] fetch returned nothing — keeping previous cache", flush=True)
         return
-    save_cache(stats)
+    with _cache_lock:
+        save_cache(stats)
     send_discord(_build_embed(stats))
+
+
+def fetch_economic_only() -> dict[str, Any] | None:
+    """Cheap Haiku + web_search call that returns just the economic
+    block. Caller is responsible for merging into stats_cache.json.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("[WARN] ANTHROPIC_API_KEY not set — skipping macro fetch", flush=True)
+        return None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    user_msg = (
+        f"It is {today}. Refresh the macro/economic block per the schema in "
+        "your system prompt and return the JSON object."
+    )
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": MACRO_MODEL,
+                "max_tokens": 2500,
+                "system": [{"type": "text", "text": _MACRO_SYSTEM_PROMPT}],
+                "tools": [
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": MACRO_MAX_SEARCHES,
+                    }
+                ],
+                "messages": [{"role": "user", "content": user_msg}],
+            },
+            timeout=180,
+        )
+    except Exception as e:
+        print(f"[WARN] macro Claude call failed: {e}", flush=True)
+        return None
+
+    if r.status_code != 200:
+        print(f"[ERROR] macro Anthropic status={r.status_code} body: {r.text[:300]}", flush=True)
+        return None
+
+    body = r.json()
+    usage = body.get("usage", {})
+    if usage:
+        print(
+            f"[USAGE] in={usage.get('input_tokens', 0)} "
+            f"out={usage.get('output_tokens', 0)} "
+            f"cache_create={usage.get('cache_creation_input_tokens', 0)} "
+            f"cache_read={usage.get('cache_read_input_tokens', 0)} "
+            f"agent=macro model={MACRO_MODEL}",
+            flush=True,
+        )
+
+    text_parts = [b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"]
+    if not text_parts:
+        print(f"[WARN] No text blocks in macro response. Blocks={[b.get('type') for b in body.get('content', [])]}", flush=True)
+        return None
+    return _extract_json("\n".join(text_parts).strip())
+
+
+def _refresh_macro() -> None:
+    """Read current cache, merge a fresh economic block in, save atomically.
+    Lock-protected so it can't race with the daily Sonnet fetch.
+    """
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Refreshing macro block...", flush=True)
+    econ = fetch_economic_only()
+    if not econ:
+        print("[macro] fetch returned nothing — keeping previous econ block", flush=True)
+        return
+    with _cache_lock:
+        cache: dict[str, Any] = {}
+        if STATS_CACHE_PATH.exists():
+            try:
+                with STATS_CACHE_PATH.open() as f:
+                    cache = json.load(f)
+            except Exception as e:
+                print(f"[WARN] macro read cache failed, starting from empty: {e}", flush=True)
+        cache["economic"] = {**(cache.get("economic", {}) or {}), **econ}
+        cache["economic_fetched_at"] = datetime.now(timezone.utc).isoformat()
+        save_cache(cache)
+    gas = econ.get("gas_national_avg_usd_per_gal")
+    btc = econ.get("btc_spot_usd")
+    bn = (econ.get("breaking_news") or "").strip()
+    print(f"[macro] refreshed: gas=${gas} btc=${btc} breaking={bn!r}", flush=True)
+
+
+def run_macro() -> None:
+    if not MACRO_ENABLED:
+        print("Kalshi Macro Refresh disabled via KALSHI_STATS_MACRO_ENABLED", flush=True)
+        return
+    print(
+        f"Kalshi Macro Refresh starting — every {MACRO_INTERVAL_SECS}s, "
+        f"model={MACRO_MODEL}, web_search_max={MACRO_MAX_SEARCHES}",
+        flush=True,
+    )
+    # Skip startup prime — the daily Sonnet fetch covers initial state.
+    # First macro refresh fires one interval after startup.
+    while True:
+        time.sleep(MACRO_INTERVAL_SECS)
+        try:
+            _refresh_macro()
+        except Exception as e:
+            print(f"[WARN] macro cycle crashed: {e}", flush=True)
+            traceback.print_exc()
+            time.sleep(60)
 
 
 def run() -> None:
