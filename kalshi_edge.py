@@ -158,8 +158,11 @@ def fetch_markets() -> list[dict[str, Any]]:
     path = "/trade-api/v2/markets"
     out: list[dict[str, Any]] = []
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    min_close_ts = now_ts + MIN_SECS_TO_CLOSE
-    max_close_ts = now_ts + MAX_SECS_TO_CLOSE
+    # Kalshi sports markets close 1-3 weeks AFTER the game itself
+    # (settlement window) — close_time is NOT the game time. The
+    # in-process timing check uses expected_expiration_time instead;
+    # this 30-day bound is just a sanity ceiling for the API fetch.
+    max_close_ts = now_ts + 30 * 86400
     for series in SERIES_TICKERS:
         cursor = None
         fetched = 0
@@ -169,7 +172,6 @@ def fetch_markets() -> list[dict[str, Any]]:
                     "limit": 1000,
                     "status": "open",
                     "series_ticker": series,
-                    "min_close_ts": min_close_ts,
                     "max_close_ts": max_close_ts,
                 }
                 if cursor:
@@ -204,16 +206,18 @@ def _parse_iso(s: str) -> datetime | None:
         return None
 
 
-def _check_timing(close_time_str: str, open_time_str: str,
+def _check_timing(game_time_str: str, open_time_str: str,
                   now: datetime) -> tuple[bool, str, float]:
-    """Return (ok, drop_reason, seconds_to_close).
+    """Return (ok, drop_reason, seconds_to_game).
+
+    game_time_str should be the market's expected_expiration_time /
+    occurrence_datetime (the game itself), NOT close_time (which is the
+    post-game settlement window — often 1-3 weeks later for NHL/NBA).
 
     drop_reason is "" when ok=True, otherwise one of:
       no_close, ended, starting_soon, too_far, in_progress
-    seconds_to_close is informational only — caller uses it to
-    populate hours_left on kept markets.
     """
-    close_dt = _parse_iso(close_time_str)
+    close_dt = _parse_iso(game_time_str)
     if close_dt is None:
         return False, "no_close", 0.0
     secs = (close_dt - now).total_seconds()
@@ -306,8 +310,13 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         if ya >= 0.99:
             drops["dead"] += 1
             continue
+        game_time = (
+            m.get("expected_expiration_time")
+            or m.get("occurrence_datetime")
+            or m.get("close_time", "")
+        )
         ok, reason, secs_to_close = _check_timing(
-            m.get("close_time", ""), m.get("open_time", ""), now
+            game_time, m.get("open_time", ""), now
         )
         if not ok:
             timing_drops[reason] += 1

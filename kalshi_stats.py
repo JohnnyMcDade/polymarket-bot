@@ -92,12 +92,20 @@ RULES
 
 
 def _is_cache_fresh() -> bool:
-    """True if stats_cache.json was written less than 24h ago."""
+    """True if stats_cache.json was written less than 24h ago AND has
+    the current schema. Treat caches written before the schema added
+    mlb.team_scoring / mlb.todays_games as stale so the edge agent
+    doesn't keep SKIP'ing every MLBTOTAL/MLBSPREAD market.
+    """
     if not STATS_CACHE_PATH.exists():
         return False
     try:
         with STATS_CACHE_PATH.open() as f:
             cache = json.load(f)
+        mlb = cache.get("mlb", {}) or {}
+        if not mlb.get("team_scoring"):
+            print("[stats] cache missing mlb.team_scoring — treating as stale (schema upgrade)", flush=True)
+            return False
         fetched_at = cache.get("fetched_at", "")
         if not fetched_at:
             return False
