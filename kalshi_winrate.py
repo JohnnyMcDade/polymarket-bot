@@ -26,7 +26,7 @@ import requests
 
 WEBHOOK_KALSHI_WINRATE = os.getenv("WEBHOOK_KALSHI_WINRATE", "")
 WINRATE_HOUR = int(os.getenv("KALSHI_WINRATE_HOUR", "7"))
-TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "trades_log.json"))
+TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 
 
 def _format_usd(amount: float) -> str:

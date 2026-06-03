@@ -63,7 +63,7 @@ MAX_SECS_TO_CLOSE = int(os.getenv("KALSHI_MAX_SECS_TO_CLOSE", "86400"))     # 24
 OPEN_AGE_IN_PROGRESS = int(os.getenv("KALSHI_OPEN_AGE_IN_PROGRESS", "10800"))   # 3 h
 CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "7200"))  # 2 h
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
-SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "edge_seen.json"))
+SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "/app/data/edge_seen.json"))
 
 # Sports series we actually evaluate. Pulling /markets per series with a
 # close-time window cuts the fetch from 5000 mostly-irrelevant rows to
@@ -95,6 +95,7 @@ def _save_seen(seen: set[str]) -> None:
         # Cap memory + disk. Drop oldest by simple slicing; we have no
         # ordering signal in a set, so this is a coarse trim.
         seen = set(list(seen)[-10_000:])
+    SEEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEEN_CACHE_PATH.with_suffix(".tmp")
     with tmp.open("w") as f:
         json.dump({"tickers": sorted(seen)}, f)

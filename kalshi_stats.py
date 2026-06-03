@@ -30,7 +30,7 @@ WEBHOOK_KALSHI_STATS = os.getenv("WEBHOOK_KALSHI_STATS", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS", "claude-sonnet-4-6")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
-STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
+STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "16"))
 
 # Hourly macro refresher — Haiku call that touches only the economic
@@ -266,6 +266,7 @@ def fetch_stats() -> dict[str, Any] | None:
 
 def save_cache(stats: dict[str, Any]) -> None:
     stats.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
+    STATS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATS_CACHE_PATH.with_suffix(".tmp")
     with tmp.open("w") as f:
         json.dump(stats, f, indent=2)

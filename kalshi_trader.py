@@ -38,7 +38,7 @@ MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.05"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.10"))
 MIN_BET_USD = float(os.getenv("KALSHI_MIN_BET_USD", "5"))
 MIN_CONTRACTS = int(os.getenv("KALSHI_MIN_CONTRACTS", "1"))
-TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "trades_log.json"))
+TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 
 # Daily-spend tracking. Resets at UTC midnight.
 _daily_spent = 0.0
@@ -82,6 +82,7 @@ def _load_log() -> list[dict[str, Any]]:
 
 
 def _save_log(entries: list[dict[str, Any]]) -> None:
+    TRADES_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = TRADES_LOG_PATH.with_suffix(".tmp")
     with tmp.open("w") as f:
         json.dump(entries, f, indent=2)
