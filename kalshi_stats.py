@@ -28,95 +28,26 @@ import requests
 
 WEBHOOK_KALSHI_STATS = os.getenv("WEBHOOK_KALSHI_STATS", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS", "claude-sonnet-4-6")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
-MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "16"))
 
-# Hourly macro refresher — Haiku call that touches only the economic
-# block so BTC and gas don't go stale between daily Sonnet fetches.
-# Budget target: < $0.02/call, <= ~$0.48/day.
+# Macro refresher — Haiku call for gas/CPI/Fed (the only LLM use left in
+# this module). Sports stats now come from direct statsapi.mlb.com and
+# ESPN endpoints; BTC from Coinbase. Budget: < $0.02/macro call.
 MACRO_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS_MACRO", "claude-haiku-4-5-20251001")
 MACRO_INTERVAL_SECS = int(os.getenv("KALSHI_STATS_MACRO_INTERVAL", "3600"))
 MACRO_MAX_SEARCHES = int(os.getenv("KALSHI_STATS_MACRO_MAX_SEARCHES", "3"))
 MACRO_ENABLED = os.getenv("KALSHI_STATS_MACRO_ENABLED", "true").lower() in ("1", "true", "yes")
 
-# Serializes read-modify-write between the daily Sonnet fetch and the
-# hourly macro Haiku fetch so one doesn't clobber the other.
+# Serializes read-modify-write between the daily fetch and the hourly
+# macro Haiku fetch so one doesn't clobber the other.
 _cache_lock = threading.Lock()
 
-# Cached for the lifetime of the process — the agent rebuilds it every
-# 24h and the system prompt never changes within a day. Keeping it
-# above 1024 tokens so cache_control still activates even on a one-shot
-# call (useful if the agent fires twice on the same day).
-_SYSTEM_PROMPT = """You are a sports-data researcher feeding a Kalshi prediction-market trader. Your single job: fetch the current 2026-season stats it needs to evaluate today's player- and team-prop markets, and return them as one structured JSON object.
-
-USE THE web_search TOOL to gather current data — do NOT rely on training data alone for season stats. Search ESPN, MLB.com, NBA.com, NHL.com, baseball-reference, basketball-reference. Use as few searches as possible to cover the categories below.
-
-REQUIRED COVERAGE
-1. MLB (regular season in progress)
-   - Standings: W-L record, win%, games back, division for every team (AL East/Central/West, NL East/Central/West)
-   - Hitting leaders (top 10 each): home runs, RBIs, batting average, OPS, stolen bases
-   - Pitching leaders (top 10 each): wins, ERA, strikeouts, WHIP, saves
-   - For any clearly active superstar (Judge, Ohtani, Soto, Betts, Acuña, Witt Jr., Skenes, Skubal, Cole) include their current line.
-   - Team scoring (EVERY MLB team, all 30): season runs scored per game, season runs allowed per game, last-7-days runs scored per game and runs allowed per game, home runs-scored-per-game and runs-allowed-per-game splits, away runs-scored-per-game and runs-allowed-per-game splits. Source: baseball-reference team batting/pitching pages or ESPN team stats.
-   - Today's scheduled MLB games: for every game on today's slate, the away team, home team, scheduled start time in UTC, and the announced starting pitcher for each side with their current-season ERA and WHIP. Source: MLB.com probable pitchers or ESPN MLB schedule.
-2. NBA (post-season)
-   - Round-by-round playoff results so far: which teams advanced, which were eliminated, series scores
-   - Conference finals + Finals matchups if reached
-   - Per-game averages for any player still active in the playoffs averaging > 20 PPG, or any obvious household name (Jokic, Luka, SGA, Tatum, Giannis, Brunson, Edwards)
-3. NHL (post-season)
-   - Round-by-round playoff results
-   - Conference finals + Stanley Cup Final matchups if reached
-   - Top playoff scorers (goals + assists)
-4. Economic indicators — ONE consolidated web search is ideal. These MUST come from live sources for the current date in the user message, NOT from training data. If the search comes back without a fresh value for any field, return null for that field rather than guessing.
-   - US national average regular-grade gasoline price as of today ($/gal). Source: AAA Daily National Average.
-   - Most recently released CPI report: month covered (YYYY-MM), headline YoY %, core YoY %, exact release date. Source: BLS or FRED. Confirm this is the latest release available right now.
-   - Federal funds target range right now (low %, high %), the date of the NEXT scheduled FOMC meeting, and the CME FedWatch market-implied probabilities of hold / hike / cut at that next meeting (numbers should sum to ~1.0).
-
-OUTPUT FORMAT
-Return ONE JSON object and nothing else — no prose before or after, no markdown fences. Schema:
-
-{
-  "fetched_at": "<ISO timestamp UTC>",
-  "season": "2026",
-  "mlb": {
-    "standings": {"<team abbr>": {"w": <int>, "l": <int>, "pct": <float>, "gb": <float|null>, "division": "<string>"}},
-    "hitting_leaders": {"hr": [{"player": "<name>", "team": "<abbr>", "value": <int>}, ...], "rbi": [...], "avg": [...], "ops": [...], "sb": [...]},
-    "pitching_leaders": {"w": [...], "era": [{"player": "<name>", "team": "<abbr>", "value": <float>}, ...], "k": [...], "whip": [...], "sv": [...]},
-    "notable_players": [{"player": "<name>", "team": "<abbr>", "line": "<HR/RBI/AVG/OPS line as string>"}],
-    "team_scoring": {"<team abbr>": {"rs_per_game": <float>, "ra_per_game": <float>, "rs_per_game_last7": <float>, "ra_per_game_last7": <float>, "rs_per_game_home": <float>, "ra_per_game_home": <float>, "rs_per_game_away": <float>, "ra_per_game_away": <float>}},
-    "todays_games": [{"away": "<abbr>", "home": "<abbr>", "start_time_utc": "<HH:MM>", "away_pitcher": {"player": "<name>", "era": <float>, "whip": <float>}, "home_pitcher": {"player": "<name>", "era": <float>, "whip": <float>}}]
-  },
-  "nba": {
-    "playoff_results": [{"round": "<R1|R2|CF|F>", "series": "<TEAM1 vs TEAM2>", "winner": "<TEAM>", "score": "<4-2>", "status": "<final|in_progress>"}],
-    "current_round": "<R1|R2|CF|F|complete>",
-    "active_players": [{"player": "<name>", "team": "<abbr>", "ppg": <float>, "rpg": <float>, "apg": <float>}]
-  },
-  "nhl": {
-    "playoff_results": [{"round": "<R1|R2|CF|F>", "series": "<TEAM1 vs TEAM2>", "winner": "<TEAM>", "score": "<4-2>", "status": "<final|in_progress>"}],
-    "current_round": "<R1|R2|CF|F|complete>",
-    "top_scorers": [{"player": "<name>", "team": "<abbr>", "g": <int>, "a": <int>, "pts": <int>}]
-  },
-  "economic": {
-    "gas_national_avg_usd_per_gal": <float>,
-    "gas_source_date": "<YYYY-MM-DD>",
-    "cpi": {"month": "<YYYY-MM>", "headline_yoy_pct": <float>, "core_yoy_pct": <float>, "release_date": "<YYYY-MM-DD>"},
-    "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>}
-  }
-}
-
-(btc_spot_usd and btc_source_time_utc are filled in by the bot post-fetch from a direct Coinbase API call — do not include them.)
-
-RULES
-- If a stat is genuinely unknown after searching, use null — never invent.
-- Player names: full first + last as they normally appear ("Aaron Judge", not "A. Judge").
-- Team abbreviations: standard 2–3 letter ("NYY", "LAD", "BOS", "DAL", "EDM").
-- ERAs and similar floats: 2 decimals.
-- Keep the JSON valid — no trailing commas, no comments, no NaN/Infinity.
-- Today's date for fetched_at is the actual UTC date at fetch time."""
-
-
+# (Removed: the old Sonnet+web_search system prompt for sports data.
+# Sports stats now come from direct statsapi.mlb.com and ESPN endpoints
+# below — web_search was returning structurally-correct JSON with every
+# numeric field set to null, which made the edge agent SKIP every market
+# for lack of an anchor stat.)
 _MACRO_SYSTEM_PROMPT = """You are a macro data updater feeding a Kalshi prediction-market bot. Refresh ONLY the economic indicators below. Use web_search sparingly — ONE consolidated search is ideal; never more than 3.
 
 REQUIRED COVERAGE
@@ -194,74 +125,284 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-def fetch_stats() -> dict[str, Any] | None:
-    if not ANTHROPIC_API_KEY:
-        print("[WARN] ANTHROPIC_API_KEY not set — skipping stats fetch")
-        return None
+# ─── Direct sports-stat fetchers ────────────────────────────────────────
+# Replaces a Sonnet+web_search call that was returning structurally-correct
+# JSON with every numeric field set to null. MLB via statsapi.mlb.com,
+# NBA/NHL via ESPN's site.api. Both APIs are unauthenticated.
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    user_msg = (
-        f"Today is {today}. Fetch the latest 2026-season stats per the schema "
-        "in your system prompt and return the JSON object."
-    )
+_MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
+_ESPN_NBA_STANDINGS = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+_ESPN_NHL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/hockey/nhl/standings"
+_HTTP_TIMEOUT = 15
 
+# Stable division ID → name map (statsapi /divisions). Hardcoded because
+# we'd otherwise need an extra request per fetch to resolve them.
+_MLB_DIVISIONS = {
+    200: "AL West", 201: "AL East", 202: "AL Central",
+    203: "NL West", 204: "NL East", 205: "NL Central",
+}
+
+
+def _http_get_json(url: str) -> dict[str, Any] | None:
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 12000,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": _SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "tools": [
-                    {
-                        "type": "web_search_20250305",
-                        "name": "web_search",
-                        "max_uses": MAX_WEB_SEARCHES,
-                    }
-                ],
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-            timeout=300,
-        )
+        r = requests.get(url, timeout=_HTTP_TIMEOUT)
+        if r.status_code != 200:
+            print(f"[WARN] GET {url[:90]} status={r.status_code}", flush=True)
+            return None
+        return r.json()
     except Exception as e:
-        print(f"[WARN] Stats Claude call failed: {e}", flush=True)
+        print(f"[WARN] GET {url[:90]} failed: {e}", flush=True)
         return None
 
-    if r.status_code != 200:
-        print(f"[ERROR] Stats Anthropic status={r.status_code} body: {r.text[:500]}", flush=True)
+
+def _to_float(v: Any) -> float | None:
+    if v is None or v in ("-", ".---", "", "--"):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
         return None
 
-    body = r.json()
-    usage = body.get("usage", {})
-    if usage:
-        print(
-            f"[USAGE] in={usage.get('input_tokens', 0)} "
-            f"out={usage.get('output_tokens', 0)} "
-            f"cache_create={usage.get('cache_creation_input_tokens', 0)} "
-            f"cache_read={usage.get('cache_read_input_tokens', 0)} "
-            f"agent=stats",
-            flush=True,
+
+def _fetch_mlb_teams_meta() -> dict[int, dict[str, str]]:
+    """team_id → {abbr, name, division} for all active MLB teams."""
+    data = _http_get_json(f"{_MLB_STATSAPI}/teams?sportId=1&season=2026&activeStatus=Y")
+    out: dict[int, dict[str, str]] = {}
+    for t in (data or {}).get("teams", []):
+        tid = t.get("id")
+        abbr = t.get("abbreviation", "")
+        if not tid or not abbr:
+            continue
+        out[tid] = {
+            "abbr": abbr,
+            "name": t.get("name", ""),
+            "division": (t.get("division") or {}).get("name", ""),
+        }
+    return out
+
+
+def _fetch_mlb_standings(meta: dict[int, dict]) -> dict[str, dict]:
+    """{team_abbr: {w, l, pct, gb, division}}."""
+    data = _http_get_json(f"{_MLB_STATSAPI}/standings?leagueId=103,104&season=2026")
+    out: dict[str, dict] = {}
+    for rec in (data or {}).get("records", []):
+        div_id = (rec.get("division") or {}).get("id")
+        for tr in rec.get("teamRecords", []):
+            tid = (tr.get("team") or {}).get("id")
+            m = meta.get(tid)
+            if not m:
+                continue
+            out[m["abbr"]] = {
+                "w": tr.get("wins"),
+                "l": tr.get("losses"),
+                "pct": _to_float(tr.get("winningPercentage")),
+                "gb": _to_float(tr.get("gamesBack")),
+                "division": _MLB_DIVISIONS.get(div_id, m.get("division", "")),
+            }
+    return out
+
+
+def _fetch_mlb_team_scoring(meta: dict[int, dict]) -> dict[str, dict]:
+    """{team_abbr: {rs_per_game, ra_per_game, ...split nulls...}}. Season
+    totals only; last7/home/away splits are left null (statsapi splits
+    require per-team calls — not worth the extra latency for now)."""
+    hit = _http_get_json(
+        f"{_MLB_STATSAPI}/teams/stats?season=2026&stats=season&group=hitting&sportIds=1"
+    )
+    pit = _http_get_json(
+        f"{_MLB_STATSAPI}/teams/stats?season=2026&stats=season&group=pitching&sportIds=1"
+    )
+    out: dict[str, dict] = {}
+
+    def _populate(payload: dict | None, field: str) -> None:
+        if not payload:
+            return
+        try:
+            splits = payload["stats"][0]["splits"]
+        except (KeyError, IndexError):
+            return
+        for sp in splits:
+            tid = (sp.get("team") or {}).get("id")
+            m = meta.get(tid)
+            if not m:
+                continue
+            gp = sp.get("stat", {}).get("gamesPlayed") or 0
+            runs = sp.get("stat", {}).get("runs") or 0
+            out.setdefault(m["abbr"], {})[field] = round(runs / gp, 2) if gp else None
+
+    _populate(hit, "rs_per_game")
+    _populate(pit, "ra_per_game")
+    for v in out.values():
+        for k in ("rs_per_game_last7", "ra_per_game_last7",
+                  "rs_per_game_home", "ra_per_game_home",
+                  "rs_per_game_away", "ra_per_game_away"):
+            v.setdefault(k, None)
+    return out
+
+
+def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
+    """Today's MLB schedule with probable pitchers and their season ERA/WHIP."""
+    sched = _http_get_json(
+        f"{_MLB_STATSAPI}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,team"
+    )
+    games_raw: list[dict] = []
+    for d in (sched or {}).get("dates", []):
+        games_raw.extend(d.get("games", []))
+    if not games_raw:
+        return []
+
+    # Batch-fetch probable pitcher stats — one call instead of N round-trips.
+    pitcher_ids: set[int] = set()
+    for g in games_raw:
+        for side in ("away", "home"):
+            pp = (g.get("teams", {}).get(side, {}) or {}).get("probablePitcher") or {}
+            if pp.get("id"):
+                pitcher_ids.add(pp["id"])
+    pitcher_stats: dict[int, dict] = {}
+    if pitcher_ids:
+        ids_csv = ",".join(str(i) for i in pitcher_ids)
+        p_data = _http_get_json(
+            f"{_MLB_STATSAPI}/people?personIds={ids_csv}"
+            f"&hydrate=stats(type=season,season=2026,group=pitching)"
         )
+        for p in (p_data or {}).get("people", []):
+            pid = p.get("id")
+            for sg in p.get("stats", []) or []:
+                if (sg.get("group") or {}).get("displayName") != "pitching":
+                    continue
+                splits = sg.get("splits") or []
+                if not splits:
+                    continue
+                st = splits[0].get("stat", {})
+                pitcher_stats[pid] = {
+                    "era": _to_float(st.get("era")),
+                    "whip": _to_float(st.get("whip")),
+                }
+                break
 
-    # Find the text block in the content list — web_search adds tool_use /
-    # tool_result blocks that we need to skip past.
-    text_parts = [b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"]
-    if not text_parts:
-        print(f"[WARN] No text blocks in stats response. Blocks={[b.get('type') for b in body.get('content', [])]}", flush=True)
-        return None
-    text = "\n".join(text_parts).strip()
-    return _extract_json(text)
+    out: list[dict] = []
+    for g in games_raw:
+        teams = g.get("teams", {})
+        away_team = (teams.get("away", {}) or {}).get("team", {}) or {}
+        home_team = (teams.get("home", {}) or {}).get("team", {}) or {}
+        away_abbr = away_team.get("abbreviation") or meta.get(away_team.get("id"), {}).get("abbr", "")
+        home_abbr = home_team.get("abbreviation") or meta.get(home_team.get("id"), {}).get("abbr", "")
+        try:
+            start_t = datetime.fromisoformat(g.get("gameDate", "").replace("Z", "+00:00")).strftime("%H:%M")
+        except (TypeError, ValueError):
+            start_t = "?"
+        ap = (teams.get("away", {}) or {}).get("probablePitcher") or {}
+        hp = (teams.get("home", {}) or {}).get("probablePitcher") or {}
+        out.append({
+            "away": away_abbr,
+            "home": home_abbr,
+            "start_time_utc": start_t,
+            "away_pitcher": {
+                "player": ap.get("fullName", ""),
+                **(pitcher_stats.get(ap.get("id")) or {"era": None, "whip": None}),
+            },
+            "home_pitcher": {
+                "player": hp.get("fullName", ""),
+                **(pitcher_stats.get(hp.get("id")) or {"era": None, "whip": None}),
+            },
+        })
+    return out
+
+
+def _fetch_mlb_leaders() -> dict[str, dict[str, list[dict]]]:
+    """Top-10 leaderboards for hitting and pitching."""
+    def one(cat: str, group: str) -> list[dict]:
+        data = _http_get_json(
+            f"{_MLB_STATSAPI}/stats/leaders?leaderCategories={cat}"
+            f"&season=2026&sportId=1&statGroup={group}&limit=10"
+        )
+        result: list[dict] = []
+        for ll in (data or {}).get("leagueLeaders", []):
+            for ldr in ll.get("leaders", [])[:10]:
+                val = ldr.get("value")
+                result.append({
+                    "player": (ldr.get("person") or {}).get("fullName", ""),
+                    "team": (ldr.get("team") or {}).get("abbreviation", ""),
+                    "value": _to_float(val) if val is not None else None,
+                })
+            break  # first category (filter by name already)
+        return result
+
+    return {
+        "hitting_leaders": {
+            "hr": one("homeRuns", "hitting"),
+            "rbi": one("runsBattedIn", "hitting"),
+            "avg": one("battingAverage", "hitting"),
+            "ops": one("onBasePlusSlugging", "hitting"),
+            "sb": one("stolenBases", "hitting"),
+        },
+        "pitching_leaders": {
+            "w": one("wins", "pitching"),
+            "era": one("earnedRunAverage", "pitching"),
+            "k": one("strikeouts", "pitching"),
+            "whip": one("walksAndHitsPerInningPitched", "pitching"),
+            "sv": one("saves", "pitching"),
+        },
+    }
+
+
+def _fetch_mlb_block() -> dict[str, Any]:
+    meta = _fetch_mlb_teams_meta()
+    leaders = _fetch_mlb_leaders()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "standings": _fetch_mlb_standings(meta),
+        "hitting_leaders": leaders["hitting_leaders"],
+        "pitching_leaders": leaders["pitching_leaders"],
+        "notable_players": [],
+        "team_scoring": _fetch_mlb_team_scoring(meta),
+        "todays_games": _fetch_mlb_todays_games(today, meta),
+    }
+
+
+def _fetch_espn_standings(url: str) -> list[dict]:
+    """Flatten ESPN's conference → standings.entries structure into a list
+    of {team, w, l, pct, conference}. Returns [] on any failure so the
+    caller can keep the cache shape intact."""
+    data = _http_get_json(url)
+    out: list[dict] = []
+    for conf in (data or {}).get("children", []):
+        entries = ((conf.get("standings") or {}).get("entries") or [])
+        for e in entries:
+            team = e.get("team") or {}
+            abbr = team.get("abbreviation", "")
+            if not abbr:
+                continue
+            stat_map = {st.get("name"): st.get("value") for st in (e.get("stats") or [])}
+            wins = stat_map.get("wins")
+            losses = stat_map.get("losses")
+            out.append({
+                "team": abbr,
+                "name": team.get("displayName", ""),
+                "w": int(wins) if wins is not None else None,
+                "l": int(losses) if losses is not None else None,
+                "pct": _to_float(stat_map.get("winPercent")),
+                "conference": conf.get("name", ""),
+            })
+    return out
+
+
+def _fetch_nba_block() -> dict[str, Any]:
+    return {
+        "standings": _fetch_espn_standings(_ESPN_NBA_STANDINGS),
+        "playoff_results": [],
+        "current_round": "?",
+        "active_players": [],
+    }
+
+
+def _fetch_nhl_block() -> dict[str, Any]:
+    return {
+        "standings": _fetch_espn_standings(_ESPN_NHL_STANDINGS),
+        "playoff_results": [],
+        "current_round": "?",
+        "top_scorers": [],
+    }
 
 
 def save_cache(stats: dict[str, Any]) -> None:
@@ -340,15 +481,29 @@ def _seconds_until_next_hour(target_hour: int) -> float:
 
 
 def _do_fetch_and_save() -> None:
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Fetching daily sports stats...", flush=True)
-    stats = fetch_stats()
-    if not stats:
-        print("[stats] fetch returned nothing — keeping previous cache", flush=True)
-        return
+    """Daily stats refresh. Sports blocks come from direct APIs
+    (statsapi.mlb.com, ESPN); economic block from Haiku web_search; BTC
+    from Coinbase. If any block fails its corresponding helper returns an
+    empty shape so the cache is still written with whatever did succeed."""
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Fetching daily stats via direct APIs...", flush=True)
+    t0 = time.time()
+    stats: dict[str, Any] = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "season": "2026",
+        "mlb": _fetch_mlb_block(),
+        "nba": _fetch_nba_block(),
+        "nhl": _fetch_nhl_block(),
+    }
+    econ = fetch_economic_only() or {}
     btc = _fetch_btc_spot_coinbase()
     if btc:
-        econ = stats.setdefault("economic", {})
         econ["btc_spot_usd"], econ["btc_source_time_utc"] = btc
+    stats["economic"] = econ
+    elapsed = time.time() - t0
+    mlb_n = len(stats["mlb"].get("standings", {}))
+    nba_n = len(stats["nba"].get("standings", []))
+    nhl_n = len(stats["nhl"].get("standings", []))
+    print(f"[stats] direct fetch done in {elapsed:.1f}s — mlb={mlb_n} nba={nba_n} nhl={nhl_n} btc={econ.get('btc_spot_usd')}", flush=True)
     with _cache_lock:
         save_cache(stats)
     send_discord(_build_embed(stats))
@@ -493,7 +648,7 @@ def run_macro() -> None:
 
 
 def run() -> None:
-    print(f"Kalshi Stats Agent starting — model={ANTHROPIC_MODEL}, hour={STATS_HOUR:02d}:00 UTC")
+    print(f"Kalshi Stats Agent starting — direct APIs (statsapi+ESPN) + Haiku for econ, hour={STATS_HOUR:02d}:00 UTC")
     # If the cache is missing or stale at startup, prime it immediately so
     # kalshi_edge can run before the next 06:00 wakeup.
     if not _is_cache_fresh():
