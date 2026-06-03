@@ -63,34 +63,10 @@ SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "edge_seen.json"))
 SERIES_TICKERS = [
     s.strip() for s in os.getenv(
         "KALSHI_EDGE_SERIES",
-        "KXMLBGAME,KXMLBTOTAL,KXMLBSPREAD,KXNHLGAME,KXATPMATCH,KXNBAGAME",
+        "KXMLBGAME,KXMLBTOTAL,KXMLBSPREAD,KXNHLGAME,KXATPMATCH,KXWTAMATCH,"
+        "KXNBAGAME,KXAAAGASD,KXCPI,KXFED,KXBTC",
     ).split(",") if s.strip()
 ]
-
-# Sports market keywords — used to skip markets the stats cache can't help
-# with (politics, weather, crypto, etc.). Cheap pre-filter — Claude would
-# correctly say SKIP on them anyway, but we'd rather not pay for that.
-_SPORTS_HINTS = {
-    "mlb", "nba", "nhl", "nfl", "ufc", "wnba", "ncaa", "pga", "soccer",
-    "baseball", "basketball", "hockey", "football",
-    "yankees", "dodgers", "red sox", "mets", "braves", "phillies", "astros",
-    "rangers", "giants", "cubs", "cardinals", "padres", "guardians",
-    "lakers", "celtics", "warriors", "knicks", "nuggets", "mavericks",
-    "thunder", "timberwolves", "pacers", "bucks", "heat", "76ers",
-    "oilers", "panthers", "rangers", "stars", "avalanche", "kings",
-    "judge", "ohtani", "soto", "betts", "acuna", "witt", "skenes", "skubal",
-    "jokic", "luka", "sga", "tatum", "giannis", "brunson", "edwards",
-    "world series", "stanley cup", "finals", "playoffs", "championship",
-    "home run", "homerun", "rbi", "era", "strikeouts", "saves",
-    "points", "rebounds", "assists", "goals", "shutout",
-    "vs.", " vs ",
-}
-
-
-def _is_sports(title: str, ticker: str) -> bool:
-    blob = f"{title} {ticker}".lower()
-    return any(kw in blob for kw in _SPORTS_HINTS)
-
 
 # ─── Seen-cache: skip markets we've already evaluated ───────────────────
 
@@ -291,7 +267,7 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
                     seen: set[str]) -> list[dict[str, Any]]:
-    drops = {"seen": 0, "dead": 0, "illiquid": 0, "nonsport": 0}
+    drops = {"seen": 0, "dead": 0, "illiquid": 0}
     timing_drops = {"no_close": 0, "ended": 0, "starting_soon": 0,
                     "too_far": 0, "in_progress": 0}
     now = datetime.now(timezone.utc)
@@ -322,9 +298,6 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             timing_drops[reason] += 1
             continue
         title = m.get("title", "") or ""
-        if not _is_sports(title, ticker):
-            drops["nonsport"] += 1
-            continue
         entities = _extract_entities(title, stats)
         kept.append({
             "ticker": ticker,
@@ -340,8 +313,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 
     print(
         f"[edge] filter: kept={len(kept)} "
-        f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']} "
-        f"nonsport={drops['nonsport']}",
+        f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']}",
         flush=True,
     )
     print(
@@ -359,19 +331,25 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 
 # ─── Claude call ────────────────────────────────────────────────────────
 
-_METHODOLOGY = f"""You are a Kalshi prediction-market edge finder. For each market in the user message, estimate the TRUE probability of YES using the SPORTS STATS context block in this system prompt.
+_METHODOLOGY = f"""You are a Kalshi prediction-market edge finder. For each market in the user message, estimate the TRUE probability of YES using the STATS CONTEXT block in this system prompt.
+
+The STATS CONTEXT block has two halves:
+- SPORTS STATS — team scoring, pitcher ERA/WHIP, standings, leaders, today's pitching matchups. Use these for MLB / NHL / NBA / ATP / WTA markets.
+- ECONOMIC DATA — current national gas price, latest CPI, Fed funds target + next FOMC meeting expectations, BTC spot. Use these for KXAAAGASD / KXCPI / KXFED / KXBTC markets, combined with your own knowledge of macro trends, central-bank reaction functions, and recent price action.
 
 EDGE = true_probability - market_implied_probability  (market price in cents / 100)
 
 RECOMMENDATION RULES
-- BUY only if edge >= +{MIN_EDGE:.2f} AND confidence is HIGH and the stats cache contains directly relevant data (the player or team in the title is named in SPORTS STATS).
+- BUY only if edge >= +{MIN_EDGE:.2f} AND confidence is HIGH AND you have specific, directly relevant data:
+    - for sports: the named team or player appears in SPORTS STATS
+    - for economic: the current value of the macro variable is in ECONOMIC DATA and resolution is close enough that the variable is unlikely to swing materially
 - SKIP in every other case — including BUY_NO opportunities. We only act on positive-edge BUY_YES bets in this build.
-- SKIP if the market's resolution depends on something not covered by the stats block (politics, weather, crypto, awards, etc.).
+- SKIP if the market's resolution depends on something not covered by either block (politics, weather, awards, esports, etc.).
 
 CONFIDENCE GUIDANCE
-- HIGH: stats directly answer the question (e.g. market asks "Will Judge hit 50 HR?" and stats show his current HR count and pace), market resolves within the next 24 hours, no obvious lurking-variable risk
-- MEDIUM: stats are relevant but partial (e.g. team standings inform a "win division" market but a lot can change)
-- LOW: stats are tangential or stale relative to the market
+- HIGH: data directly answers the question (e.g. "Will Judge hit 50 HR?" with HR count + pace in stats; "Will gas avg be < $3.50 on Jun 5?" with current gas at $3.42 and stable trend), market resolves within the next 24 hours, no obvious lurking-variable risk
+- MEDIUM: data is relevant but partial (team standings inform a division winner but a lot can change; a CPI print is a week away and you have last month but not consensus)
+- LOW: data is tangential or stale relative to the market
 
 RESPONSE FORMAT
 For each input market emit exactly one block in this format, separated by a line containing only three dashes:
@@ -397,7 +375,7 @@ def _build_system_prompt(stats: dict[str, Any]) -> str:
     stats_json = json.dumps(stats, separators=(",", ":"))
     return (
         _METHODOLOGY
-        + "\n\nSPORTS STATS (refresh date in fetched_at):\n"
+        + "\n\nSTATS CONTEXT (refresh date in fetched_at, includes both sports and economic blocks):\n"
         + stats_json
     )
 

@@ -29,7 +29,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_STATS", "claude-sonnet-4-6")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "stats_cache.json"))
-MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "15"))
+MAX_WEB_SEARCHES = int(os.getenv("KALSHI_STATS_MAX_SEARCHES", "16"))
 
 # Cached for the lifetime of the process — the agent rebuilds it every
 # 24h and the system prompt never changes within a day. Keeping it
@@ -55,6 +55,11 @@ REQUIRED COVERAGE
    - Round-by-round playoff results
    - Conference finals + Stanley Cup Final matchups if reached
    - Top playoff scorers (goals + assists)
+4. Economic indicators — ONE consolidated web search if possible (e.g. a macro summary page). Use FRED, AAA, BLS, CME FedWatch, CoinGecko/major exchange.
+   - US national average regular-grade gasoline price right now ($/gal, AAA)
+   - Most recently released CPI: month covered, headline YoY %, core YoY %, release date
+   - Federal funds target range (low %, high %) right now, next FOMC meeting date, market-implied probabilities (CME FedWatch) of hold / hike / cut at that next meeting
+   - Bitcoin spot price right now (USD) and the source timestamp
 
 OUTPUT FORMAT
 Return ONE JSON object and nothing else — no prose before or after, no markdown fences. Schema:
@@ -79,6 +84,14 @@ Return ONE JSON object and nothing else — no prose before or after, no markdow
     "playoff_results": [{"round": "<R1|R2|CF|F>", "series": "<TEAM1 vs TEAM2>", "winner": "<TEAM>", "score": "<4-2>", "status": "<final|in_progress>"}],
     "current_round": "<R1|R2|CF|F|complete>",
     "top_scorers": [{"player": "<name>", "team": "<abbr>", "g": <int>, "a": <int>, "pts": <int>}]
+  },
+  "economic": {
+    "gas_national_avg_usd_per_gal": <float>,
+    "gas_source_date": "<YYYY-MM-DD>",
+    "cpi": {"month": "<YYYY-MM>", "headline_yoy_pct": <float>, "core_yoy_pct": <float>, "release_date": "<YYYY-MM-DD>"},
+    "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>},
+    "btc_spot_usd": <float>,
+    "btc_source_time_utc": "<HH:MM>"
   }
 }
 
@@ -105,6 +118,9 @@ def _is_cache_fresh() -> bool:
         mlb = cache.get("mlb", {}) or {}
         if not mlb.get("team_scoring"):
             print("[stats] cache missing mlb.team_scoring — treating as stale (schema upgrade)", flush=True)
+            return False
+        if not cache.get("economic"):
+            print("[stats] cache missing economic block — treating as stale (schema upgrade)", flush=True)
             return False
         fetched_at = cache.get("fetched_at", "")
         if not fetched_at:
@@ -222,12 +238,20 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     mlb = stats.get("mlb", {}) or {}
     nba = stats.get("nba", {}) or {}
     nhl = stats.get("nhl", {}) or {}
+    econ = stats.get("economic", {}) or {}
     n_teams = len(mlb.get("standings", {}) or {})
     n_team_scoring = len(mlb.get("team_scoring", {}) or {})
     n_todays_games = len(mlb.get("todays_games", []) or [])
     n_nba_results = len(nba.get("playoff_results", []) or [])
     n_nhl_results = len(nhl.get("playoff_results", []) or [])
     n_hitters = len((mlb.get("hitting_leaders", {}) or {}).get("hr", []) or [])
+    gas = econ.get("gas_national_avg_usd_per_gal")
+    btc = econ.get("btc_spot_usd")
+    fed_range = econ.get("fed", {}) or {}
+    fed_str = (
+        f"{fed_range.get('target_range_low_pct','?')}-{fed_range.get('target_range_high_pct','?')}%"
+        if fed_range else "?"
+    )
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return {
         "title": "📊 KALSHI STATS — daily cache refreshed",
@@ -241,6 +265,9 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
             {"name": "NHL playoff results", "value": str(n_nhl_results), "inline": True},
             {"name": "NBA round", "value": nba.get("current_round", "?"), "inline": True},
             {"name": "NHL round", "value": nhl.get("current_round", "?"), "inline": True},
+            {"name": "Gas $/gal", "value": str(gas) if gas is not None else "?", "inline": True},
+            {"name": "BTC $", "value": f"{btc:,.0f}" if isinstance(btc, (int, float)) else "?", "inline": True},
+            {"name": "Fed range", "value": fed_str, "inline": True},
         ],
         "footer": {"text": f"PassivePoly Kalshi Stats  •  {now_str}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
