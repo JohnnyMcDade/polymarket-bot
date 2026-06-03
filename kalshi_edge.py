@@ -34,6 +34,7 @@ from typing import Any
 import requests
 
 import kalshi_queue
+import whale_signals
 from kalshi_auth import KALSHI_BASE_URL, get_auth_headers
 
 WEBHOOK_KALSHI_EDGE = os.getenv("WEBHOOK_KALSHI_EDGE", "")
@@ -44,6 +45,13 @@ MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
 DEBUG_LOG = os.getenv("KALSHI_EDGE_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+
+# Whale-signal boost: bump confidence one level when a recent same-side
+# whale trade backs our recommendation. Turn off with WHALE_BOOST_ENABLED=false.
+WHALE_BOOST_ENABLED = os.getenv("WHALE_BOOST_ENABLED", "true").lower() in ("1", "true", "yes")
+WHALE_BOOST_MIN_USD = float(os.getenv("WHALE_BOOST_MIN_USD", "1000"))
+WHALE_BOOST_MAX_AGE_SECS = float(os.getenv("WHALE_BOOST_MAX_AGE_SECS", "3600"))
+_CONFIDENCE_LADDER = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
 
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
@@ -597,6 +605,35 @@ def run() -> None:
                                     f"why={pred.get('reasoning', '')[:200]!r}",
                                     flush=True,
                                 )
+                            # Whale boost: if we're about to BUY YES and a
+                            # >= WHALE_BOOST_MIN_USD whale hit YES on the
+                            # same ticker recently, bump conf one notch
+                            # (LOW->MEDIUM, MEDIUM->HIGH). Direction must
+                            # match — we don't BUY NO, and a NO whale is a
+                            # countersignal, not a boost.
+                            if (
+                                WHALE_BOOST_ENABLED
+                                and pred["recommendation"] == "BUY"
+                                and pred["confidence"] in _CONFIDENCE_LADDER
+                            ):
+                                sig = whale_signals.get_signal(
+                                    ticker, side="yes",
+                                    min_value_usd=WHALE_BOOST_MIN_USD,
+                                    max_age_secs=WHALE_BOOST_MAX_AGE_SECS,
+                                )
+                                if sig:
+                                    old_conf = pred["confidence"]
+                                    pred["confidence"] = _CONFIDENCE_LADDER[old_conf]
+                                    age = time.time() - sig["ts"]
+                                    pred["reasoning"] = (
+                                        f"[whale-boost {old_conf}->{pred['confidence']}] "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[WHALE-BOOST] {ticker} {old_conf}->{pred['confidence']} "
+                                        f"whale=${sig['value_usd']:,.0f} YES age={age:.0f}s",
+                                        flush=True,
+                                    )
                             if (
                                 pred["recommendation"] != "BUY"
                                 or pred["confidence"] != "HIGH"

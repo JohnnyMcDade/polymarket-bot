@@ -3,6 +3,7 @@ import time
 import requests
 from datetime import datetime, timezone
 from kalshi_auth import get_auth_headers, KALSHI_BASE_URL
+import whale_signals
 
 WEBHOOK_KALSHI_ALERTS = os.getenv("WEBHOOK_KALSHI_ALERTS", "")
 CHECK_INTERVAL        = int(os.getenv("KALSHI_TRACKER_INTERVAL", 60))
@@ -138,6 +139,7 @@ def run():
             market = get_market_details(ticker)
 
             seen_trade_ids.add(trade_id)
+            whale_signals.record_trade(ticker, trade.get("taker_side", "yes"), trade_value)
             embed = build_embed(trade, market)
             send_discord(embed)
             alerted += 1

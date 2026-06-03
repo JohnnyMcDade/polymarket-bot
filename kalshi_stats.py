@@ -69,11 +69,11 @@ REQUIRED COVERAGE
    - Round-by-round playoff results
    - Conference finals + Stanley Cup Final matchups if reached
    - Top playoff scorers (goals + assists)
-4. Economic indicators — ONE consolidated web search if possible (e.g. a macro summary page). Use FRED, AAA, BLS, CME FedWatch, CoinGecko/major exchange.
-   - US national average regular-grade gasoline price right now ($/gal, AAA)
-   - Most recently released CPI: month covered, headline YoY %, core YoY %, release date
-   - Federal funds target range (low %, high %) right now, next FOMC meeting date, market-implied probabilities (CME FedWatch) of hold / hike / cut at that next meeting
-   - Bitcoin spot price right now (USD) and the source timestamp
+4. Economic indicators — ONE consolidated web search is ideal. These MUST come from live sources for the current date in the user message, NOT from training data. If the search comes back without a fresh value for any field, return null for that field rather than guessing.
+   - US national average regular-grade gasoline price as of today ($/gal). Source: AAA Daily National Average.
+   - Most recently released CPI report: month covered (YYYY-MM), headline YoY %, core YoY %, exact release date. Source: BLS or FRED. Confirm this is the latest release available right now.
+   - Federal funds target range right now (low %, high %), the date of the NEXT scheduled FOMC meeting, and the CME FedWatch market-implied probabilities of hold / hike / cut at that next meeting (numbers should sum to ~1.0).
+   - Bitcoin spot price RIGHT NOW (USD) from a live source (CoinGecko, Coinbase, Binance, Kraken — any major exchange), with the timestamp of the quote in UTC.
 
 OUTPUT FORMAT
 Return ONE JSON object and nothing else — no prose before or after, no markdown fences. Schema:
