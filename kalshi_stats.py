@@ -73,7 +73,6 @@ REQUIRED COVERAGE
    - US national average regular-grade gasoline price as of today ($/gal). Source: AAA Daily National Average.
    - Most recently released CPI report: month covered (YYYY-MM), headline YoY %, core YoY %, exact release date. Source: BLS or FRED. Confirm this is the latest release available right now.
    - Federal funds target range right now (low %, high %), the date of the NEXT scheduled FOMC meeting, and the CME FedWatch market-implied probabilities of hold / hike / cut at that next meeting (numbers should sum to ~1.0).
-   - Bitcoin spot price RIGHT NOW (USD) from a live source (CoinGecko, Coinbase, Binance, Kraken — any major exchange), with the timestamp of the quote in UTC.
 
 OUTPUT FORMAT
 Return ONE JSON object and nothing else — no prose before or after, no markdown fences. Schema:
@@ -103,11 +102,11 @@ Return ONE JSON object and nothing else — no prose before or after, no markdow
     "gas_national_avg_usd_per_gal": <float>,
     "gas_source_date": "<YYYY-MM-DD>",
     "cpi": {"month": "<YYYY-MM>", "headline_yoy_pct": <float>, "core_yoy_pct": <float>, "release_date": "<YYYY-MM-DD>"},
-    "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>},
-    "btc_spot_usd": <float>,
-    "btc_source_time_utc": "<HH:MM>"
+    "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>}
   }
 }
+
+(btc_spot_usd and btc_source_time_utc are filled in by the bot post-fetch from a direct Coinbase API call — do not include them.)
 
 RULES
 - If a stat is genuinely unknown after searching, use null — never invent.
@@ -124,7 +123,6 @@ REQUIRED COVERAGE
 - US national average regular-grade gasoline price right now ($/gal, AAA)
 - Most recently released CPI: month covered, headline YoY %, core YoY %, release date
 - Federal funds target range (low %, high %) right now, next FOMC meeting date, market-implied probabilities (CME FedWatch) of hold / hike / cut at that next meeting
-- Bitcoin spot price right now (USD) with the source timestamp
 - breaking_news: one short string describing any Fed / CPI / macro news from the past 24 hours, or empty string if nothing material
 
 OUTPUT FORMAT
@@ -135,10 +133,10 @@ Return ONE JSON object and nothing else — no prose before or after, no markdow
   "gas_source_date": "<YYYY-MM-DD>",
   "cpi": {"month": "<YYYY-MM>", "headline_yoy_pct": <float>, "core_yoy_pct": <float>, "release_date": "<YYYY-MM-DD>"},
   "fed": {"target_range_low_pct": <float>, "target_range_high_pct": <float>, "next_meeting_date": "<YYYY-MM-DD>", "next_meeting_hold_prob": <float>, "next_meeting_cut_prob": <float>, "next_meeting_hike_prob": <float>},
-  "btc_spot_usd": <float>,
-  "btc_source_time_utc": "<HH:MM>",
   "breaking_news": "<string or empty>"
 }
+
+(btc_spot_usd and btc_source_time_utc are filled in by the bot post-fetch from a direct Coinbase API call — do not include them.)
 
 RULES
 - If a stat is genuinely unknown after searching, use null — never invent.
@@ -346,6 +344,10 @@ def _do_fetch_and_save() -> None:
     if not stats:
         print("[stats] fetch returned nothing — keeping previous cache", flush=True)
         return
+    btc = _fetch_btc_spot_coinbase()
+    if btc:
+        econ = stats.setdefault("economic", {})
+        econ["btc_spot_usd"], econ["btc_source_time_utc"] = btc
     with _cache_lock:
         save_cache(stats)
     send_discord(_build_embed(stats))
@@ -415,6 +417,30 @@ def fetch_economic_only() -> dict[str, Any] | None:
     return _extract_json("\n".join(text_parts).strip())
 
 
+def _fetch_btc_spot_coinbase() -> tuple[float, str] | None:
+    """Fetch BTC/USD spot directly from Coinbase. No auth needed.
+    Returns (price_usd, "HH:MM" UTC) or None on failure. Used in
+    preference to the LLM web_search path, which was returning null
+    almost every hour.
+    """
+    try:
+        r = requests.get(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(f"[WARN] Coinbase BTC status={r.status_code} body: {r.text[:200]}", flush=True)
+            return None
+        amount = r.json().get("data", {}).get("amount")
+        if amount is None:
+            print("[WARN] Coinbase BTC response missing data.amount", flush=True)
+            return None
+        return float(amount), datetime.now(timezone.utc).strftime("%H:%M")
+    except Exception as e:
+        print(f"[WARN] Coinbase BTC fetch failed: {e}", flush=True)
+        return None
+
+
 def _refresh_macro() -> None:
     """Read current cache, merge a fresh economic block in, save atomically.
     Lock-protected so it can't race with the daily Sonnet fetch.
@@ -424,6 +450,9 @@ def _refresh_macro() -> None:
     if not econ:
         print("[macro] fetch returned nothing — keeping previous econ block", flush=True)
         return
+    btc = _fetch_btc_spot_coinbase()
+    if btc:
+        econ["btc_spot_usd"], econ["btc_source_time_utc"] = btc
     with _cache_lock:
         cache: dict[str, Any] = {}
         if STATS_CACHE_PATH.exists():
