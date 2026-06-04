@@ -6,8 +6,10 @@ NBA playoff bracket + per-game averages, NHL playoff bracket. Result
 goes to stats_cache.json with a fetched_at timestamp.
 
 The edge agent reads stats_cache.json on every cycle (free, no Claude
-call) and refuses to run if the cache is older than 24h. So this agent
-firing once at 06:00 UTC is what keeps the rest of the pipeline alive.
+call) and refuses to run if the cache is older than 24h or doesn't
+cover today/tomorrow's MLB slate (ET). This agent fires twice daily
+(06:00 + 18:00 UTC by default) so afternoon/evening edge cycles see
+day-of probable-pitcher reshuffles instead of yesterday's snapshot.
 
 Cost target: ~$0.05–0.15 per day (one Sonnet call + up to ~10 web
 searches at $10/1000).
@@ -20,16 +22,19 @@ import os
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
 WEBHOOK_KALSHI_STATS = os.getenv("WEBHOOK_KALSHI_STATS", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 STATS_HOUR = int(os.getenv("KALSHI_STATS_HOUR", "6"))
+STATS_HOUR_PM = int(os.getenv("KALSHI_STATS_HOUR_PM", "18"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
+ET = ZoneInfo("America/New_York")
 
 # Macro refresher — Haiku call for gas/CPI/Fed (the only LLM use left in
 # this module). Sports stats now come from direct statsapi.mlb.com and
@@ -76,9 +81,11 @@ RULES
 
 def _is_cache_fresh() -> bool:
     """True if stats_cache.json was written less than 24h ago AND has
-    the current schema. Treat caches written before the schema added
-    mlb.team_scoring / mlb.todays_games as stale so the edge agent
-    doesn't keep SKIP'ing every MLBTOTAL/MLBSPREAD market.
+    the current schema AND covers today or tomorrow's MLB slate in ET.
+    Treat caches missing mlb.team_scoring / mlb.upcoming_games as stale
+    (schema migration) and caches whose upcoming_games window has rolled
+    past as stale so late-evening edge cycles don't reason over
+    yesterday's probable pitchers.
     """
     if not STATS_CACHE_PATH.exists():
         return False
@@ -89,6 +96,9 @@ def _is_cache_fresh() -> bool:
         if not mlb.get("team_scoring"):
             print("[stats] cache missing mlb.team_scoring — treating as stale (schema upgrade)", flush=True)
             return False
+        if "upcoming_games" not in mlb:
+            print("[stats] cache missing mlb.upcoming_games — treating as stale (schema upgrade)", flush=True)
+            return False
         if not cache.get("economic"):
             print("[stats] cache missing economic block — treating as stale (schema upgrade)", flush=True)
             return False
@@ -97,7 +107,18 @@ def _is_cache_fresh() -> bool:
             return False
         dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
         age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-        return age_hours < 24
+        if age_hours >= 24:
+            return False
+        et_today = datetime.now(ET).date()
+        expected = {et_today.isoformat(), (et_today + timedelta(days=1)).isoformat()}
+        covered = {g.get("game_date") for g in mlb["upcoming_games"] if g.get("game_date")}
+        if covered and not (expected & covered):
+            print(
+                f"[stats] upcoming_games covers {sorted(covered)}, need any of {sorted(expected)} — stale",
+                flush=True,
+            )
+            return False
+        return True
     except Exception as e:
         print(f"[WARN] stats_cache.json unreadable: {e}", flush=True)
         return False
@@ -349,14 +370,24 @@ def _fetch_mlb_leaders() -> dict[str, dict[str, list[dict]]]:
 def _fetch_mlb_block() -> dict[str, Any]:
     meta = _fetch_mlb_teams_meta()
     leaders = _fetch_mlb_leaders()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # ET-anchored date window: MLB schedules by US Eastern game date, and
+    # the 06:00 UTC refresh fires while ET is still "yesterday late". Pull
+    # today + tomorrow (ET) and tag each entry so the edge agent can match
+    # by game_date instead of guessing from team abbreviations alone.
+    et_today = datetime.now(ET).date()
+    dates = [et_today.isoformat(), (et_today + timedelta(days=1)).isoformat()]
+    upcoming: list[dict] = []
+    for d in dates:
+        for g in _fetch_mlb_todays_games(d, meta):
+            g["game_date"] = d
+            upcoming.append(g)
     return {
         "standings": _fetch_mlb_standings(meta),
         "hitting_leaders": leaders["hitting_leaders"],
         "pitching_leaders": leaders["pitching_leaders"],
         "notable_players": [],
         "team_scoring": _fetch_mlb_team_scoring(meta),
-        "todays_games": _fetch_mlb_todays_games(today, meta),
+        "upcoming_games": upcoming,
     }
 
 
@@ -422,7 +453,7 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     econ = stats.get("economic", {}) or {}
     n_teams = len(mlb.get("standings", {}) or {})
     n_team_scoring = len(mlb.get("team_scoring", {}) or {})
-    n_todays_games = len(mlb.get("todays_games", []) or [])
+    n_upcoming_games = len(mlb.get("upcoming_games", []) or [])
     n_nba_results = len(nba.get("playoff_results", []) or [])
     n_nhl_results = len(nhl.get("playoff_results", []) or [])
     n_hitters = len((mlb.get("hitting_leaders", {}) or {}).get("hr", []) or [])
@@ -441,7 +472,7 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
             {"name": "MLB teams", "value": str(n_teams), "inline": True},
             {"name": "MLB HR leaders", "value": str(n_hitters), "inline": True},
             {"name": "Team scoring", "value": str(n_team_scoring), "inline": True},
-            {"name": "Today's games", "value": str(n_todays_games), "inline": True},
+            {"name": "Upcoming games", "value": str(n_upcoming_games), "inline": True},
             {"name": "NBA playoff results", "value": str(n_nba_results), "inline": True},
             {"name": "NHL playoff results", "value": str(n_nhl_results), "inline": True},
             {"name": "NBA round", "value": nba.get("current_round", "?"), "inline": True},
@@ -471,13 +502,16 @@ def send_discord(embed: dict[str, Any]) -> None:
         print(f"[WARN] Discord send failed: {e}")
 
 
-def _seconds_until_next_hour(target_hour: int) -> float:
-    from datetime import timedelta
+def _seconds_until_next_hour(target_hours: list[int]) -> float:
+    """Seconds until the next occurrence of any hour in target_hours (UTC)."""
     now = datetime.now(timezone.utc)
-    target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+    candidates: list[datetime] = []
+    for h in target_hours:
+        t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t <= now:
+            t += timedelta(days=1)
+        candidates.append(t)
+    return (min(candidates) - now).total_seconds()
 
 
 def _do_fetch_and_save() -> None:
@@ -648,15 +682,19 @@ def run_macro() -> None:
 
 
 def run() -> None:
-    print(f"Kalshi Stats Agent starting — direct APIs (statsapi+ESPN) + Haiku for econ, hour={STATS_HOUR:02d}:00 UTC")
+    targets = sorted({STATS_HOUR, STATS_HOUR_PM})
+    print(
+        f"Kalshi Stats Agent starting — direct APIs (statsapi+ESPN) + Haiku for econ, "
+        f"refresh hours UTC={targets}"
+    )
     # If the cache is missing or stale at startup, prime it immediately so
-    # kalshi_edge can run before the next 06:00 wakeup.
+    # kalshi_edge can run before the next scheduled wakeup.
     if not _is_cache_fresh():
-        print("[stats] cache missing or >24h old — priming on startup", flush=True)
+        print("[stats] cache missing or stale — priming on startup", flush=True)
         _do_fetch_and_save()
 
     while True:
-        wait_s = _seconds_until_next_hour(STATS_HOUR)
+        wait_s = _seconds_until_next_hour(targets)
         print(f"[stats] next fetch in {wait_s/3600:.1f}h", flush=True)
         time.sleep(wait_s)
         try:
