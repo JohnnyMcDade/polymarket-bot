@@ -42,6 +42,11 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-sonnet-4-6")
 CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
+# Sanity ceiling on claimed edge. >25% edge on liquid Kalshi markets is
+# almost always Claude misreading the market (wrong bucket, in-progress
+# game it can't see, etc.) — clamp the recorded edge AND demote
+# confidence one rung so the existing HIGH-only gate blocks the trade.
+MAX_EDGE = float(os.getenv("KALSHI_MAX_EDGE", "0.25"))             # 25%
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
 DEBUG_LOG = os.getenv("KALSHI_EDGE_DEBUG_LOG", "").lower() in ("1", "true", "yes")
@@ -52,6 +57,7 @@ WHALE_BOOST_ENABLED = os.getenv("WHALE_BOOST_ENABLED", "true").lower() in ("1", 
 WHALE_BOOST_MIN_USD = float(os.getenv("WHALE_BOOST_MIN_USD", "1000"))
 WHALE_BOOST_MAX_AGE_SECS = float(os.getenv("WHALE_BOOST_MAX_AGE_SECS", "3600"))
 _CONFIDENCE_LADDER = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
+_CONFIDENCE_DEMOTE = {"HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "LOW"}
 
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
@@ -397,12 +403,25 @@ RECOMMENDATION: <BUY|SKIP>
 REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
 
+EDGE SANITY CAP (GLOBAL OVERRIDE — APPLIES TO EVERY MARKET)
+- Real edge on liquid Kalshi markets almost never exceeds 25%. If you computed an edge of +0.25 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
+- When this happens, reduce CONFIDENCE by one rung (HIGH→MEDIUM, MEDIUM→LOW) and set RECOMMENDATION: SKIP. Do not BUY at +25% claimed edge regardless of how obvious the reasoning feels.
+
 KXBTC RANGE-BUCKET MARKETS (READ BEFORE EVALUATING ANY KXBTC TICKER)
 - A KXBTC ticker shaped `KXBTC-<dateHour>-B<num>` or `-T<num>` (e.g. KXBTC-26JUN0501-B72750, KXBTC-26JUN0617-T57200) with title "Bitcoin price range on <date>?" is ONE bucket inside a contiguous set of narrow price buckets — NOT a "below <num>" or "above <num>" threshold.
 - The `B` / `T` prefix is a bucket identifier, not "below" / "above". Each bucket's true probability of resolving YES is small (often 1–5%) regardless of where the bucket number sits relative to BTC spot.
 - A market trading at 1–5¢ on a bucket far from spot is correctly priced, not mispriced. Buying YES on such a bucket because "BTC spot is far from <num>" is the systematic error pattern we are explicitly blocking — past trades of this shape lost 100% of the time.
 - For any KXBTC ticker matching this shape, RECOMMENDATION must be SKIP regardless of computed edge. Set CONFIDENCE: LOW and REASONING: "KXBTC range-bucket ticker — narrow bucket, not a cumulative threshold; skipping per rule."
 - Binary BTC markets in other series (e.g. KXBTC15M "BTC price up in next 15 mins?") are not affected by this rule.
+
+GAS / THRESHOLD MARKETS (KXAAAGASD AND SIMILAR DAILY-AVERAGE TICKERS)
+- These markets resolve on the AAA daily national-average gas price for a specific date. The threshold is in the ticker tail (e.g. KXAAAGASD-26JUN04-4.260 → threshold $4.260).
+- If the current value of the underlying is within 0.5% of the threshold, treat the market as a coin flip. RECOMMENDATION: SKIP regardless of computed edge — daily settlement variance and rounding dominate any apparent edge from "we are already above/below by a tenth of a cent."
+- Only BUY when the current value is at least 0.5% on the favored side of the threshold AND no plausible 1-day move closes that gap.
+
+MLB GAME WINNER (KXMLBGAME) EDGE CEILING
+- Real edge on KXMLBGAME (game winner) markets rarely exceeds 15% even with an elite starter. Bullpen depth, lineup matchups, weather, and umpire variance all compress edge fast — Cy Young pitchers still go 20-10, not 30-0.
+- If you compute edge above +0.15 on a KXMLBGAME ticker, reduce CONFIDENCE to MEDIUM (which blocks the trade under our HIGH-only BUY rule). This ceiling does NOT apply to KXMLBSPREAD or KXMLBTOTAL — those have different variance profiles.
 
 MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - MLB market tickers encode the game date as YYMMMDD followed by HHMM and the away+home team abbreviations, e.g. KXMLBSPREAD-26JUN041335CLENYY → 2026-06-04 13:35 CLE@NYY.
@@ -578,7 +597,8 @@ def send_discord(embed: dict[str, Any]) -> None:
 def run() -> None:
     print(
         f"Kalshi Edge Agent starting — model={ANTHROPIC_MODEL}, "
-        f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, min_edge={MIN_EDGE:.0%}, "
+        f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, "
+        f"min_edge={MIN_EDGE:.0%}, max_edge={MAX_EDGE:.0%}, "
         f"debug_log={DEBUG_LOG}"
     )
     print(
@@ -673,6 +693,24 @@ def run() -> None:
                                         f"whale=${sig['value_usd']:,.0f} YES age={age:.0f}s",
                                         flush=True,
                                     )
+                            # Sanity cap: edges > MAX_EDGE are almost always
+                            # model error (wrong bucket, in-progress game,
+                            # misread resolution). Clamp the recorded edge so
+                            # downstream sizing isn't fed a fake number, and
+                            # demote confidence one rung so the HIGH-only gate
+                            # below blocks the trade.
+                            if pred["edge"] > MAX_EDGE:
+                                old_conf = pred["confidence"]
+                                pred["confidence"] = _CONFIDENCE_DEMOTE.get(
+                                    old_conf, "LOW"
+                                )
+                                print(
+                                    f"[edge-cap] {ticker} raw_edge={pred['edge']:+.3f} "
+                                    f"> {MAX_EDGE:.2f} cap — clamping edge and "
+                                    f"demoting conf {old_conf}->{pred['confidence']}",
+                                    flush=True,
+                                )
+                                pred["edge"] = MAX_EDGE
                             if (
                                 pred["recommendation"] != "BUY"
                                 or pred["confidence"] != "HIGH"
