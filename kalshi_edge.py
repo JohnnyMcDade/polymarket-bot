@@ -90,6 +90,27 @@ def _load_seen() -> set[str]:
         return set()
 
 
+# KXBTC (and KXBTCD) hourly/daily "price range on <date>?" markets are
+# contiguous narrow buckets — every ticker in the set is one bucket, and
+# the `B`/`T` prefix is the bucket id, NOT a below/above threshold. The
+# model has repeatedly read `B72750` as "below $72,750", taken YES at 1¢
+# expecting +0.98 edge, and lost every time because the bucket itself is
+# what resolves. Drop them before any Claude call. Binary BTC markets
+# (KXBTC15M "BTC up in next 15 mins?") live in a different series and are
+# unaffected. Suffix `[BT]<digits>` is the bucket signature; other
+# suffixes (YES/NO, plain digits, etc.) pass through.
+_BTC_BUCKET_SUFFIX_RE = re.compile(r"^[BT][\d.]+$")
+
+
+def _is_btc_bucket_ticker(ticker: str) -> bool:
+    if not ticker.startswith("KXBTC"):
+        return False
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return False
+    return bool(_BTC_BUCKET_SUFFIX_RE.match(parts[-1]))
+
+
 def _save_seen(seen: set[str]) -> None:
     if len(seen) > 20_000:
         # Cap memory + disk. Drop oldest by simple slicing; we have no
@@ -276,7 +297,7 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
                     seen: set[str]) -> list[dict[str, Any]]:
-    drops = {"seen": 0, "dead": 0, "illiquid": 0}
+    drops = {"seen": 0, "dead": 0, "illiquid": 0, "btc_bucket": 0}
     timing_drops = {"no_close": 0, "ended": 0, "starting_soon": 0,
                     "too_far": 0, "in_progress": 0}
     now = datetime.now(timezone.utc)
@@ -287,6 +308,10 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             continue
         if ticker in seen:
             drops["seen"] += 1
+            continue
+        if _is_btc_bucket_ticker(ticker):
+            drops["btc_bucket"] += 1
+            seen.add(ticker)
             continue
         ya = float(m.get("yes_ask_dollars", 0) or 0)
         if ya <= 0.0:
@@ -322,7 +347,8 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 
     print(
         f"[edge] filter: kept={len(kept)} "
-        f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']}",
+        f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']} "
+        f"btc_bucket={drops['btc_bucket']}",
         flush=True,
     )
     print(
@@ -370,6 +396,13 @@ CONFIDENCE: <LOW|MEDIUM|HIGH>
 RECOMMENDATION: <BUY|SKIP>
 REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
+
+KXBTC RANGE-BUCKET MARKETS (READ BEFORE EVALUATING ANY KXBTC TICKER)
+- A KXBTC ticker shaped `KXBTC-<dateHour>-B<num>` or `-T<num>` (e.g. KXBTC-26JUN0501-B72750, KXBTC-26JUN0617-T57200) with title "Bitcoin price range on <date>?" is ONE bucket inside a contiguous set of narrow price buckets — NOT a "below <num>" or "above <num>" threshold.
+- The `B` / `T` prefix is a bucket identifier, not "below" / "above". Each bucket's true probability of resolving YES is small (often 1–5%) regardless of where the bucket number sits relative to BTC spot.
+- A market trading at 1–5¢ on a bucket far from spot is correctly priced, not mispriced. Buying YES on such a bucket because "BTC spot is far from <num>" is the systematic error pattern we are explicitly blocking — past trades of this shape lost 100% of the time.
+- For any KXBTC ticker matching this shape, RECOMMENDATION must be SKIP regardless of computed edge. Set CONFIDENCE: LOW and REASONING: "KXBTC range-bucket ticker — narrow bucket, not a cumulative threshold; skipping per rule."
+- Binary BTC markets in other series (e.g. KXBTC15M "BTC price up in next 15 mins?") are not affected by this rule.
 
 MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - MLB market tickers encode the game date as YYMMMDD followed by HHMM and the away+home team abbreviations, e.g. KXMLBSPREAD-26JUN041335CLENYY → 2026-06-04 13:35 CLE@NYY.
