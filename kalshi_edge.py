@@ -70,6 +70,15 @@ OPEN_AGE_IN_PROGRESS = int(os.getenv("KALSHI_OPEN_AGE_IN_PROGRESS", "10800"))   
 CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "7200"))  # 2 h
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "/app/data/edge_seen.json"))
+PRICE_HISTORY_PATH = Path(os.getenv("KALSHI_EDGE_PRICE_HISTORY", "/app/data/edge_price_history.json"))
+
+# Line-movement guard. If a market's YES price has shifted more than this
+# many cents since we last saw it, someone with information we don't have
+# has been trading — skip the cycle for this ticker and let it stabilize.
+MAX_LINE_MOVE_CENTS = int(os.getenv("KALSHI_MAX_LINE_MOVE_CENTS", "5"))
+# Ignore stored prices older than this — a 3-day-old price isn't a
+# "movement signal," it's just a different market state.
+PRICE_HISTORY_MAX_AGE_SECS = int(os.getenv("KALSHI_PRICE_HISTORY_MAX_AGE", "86400"))
 
 # Sports series we actually evaluate. Pulling /markets per series with a
 # close-time window cuts the fetch from 5000 mostly-irrelevant rows to
@@ -115,6 +124,29 @@ def _is_btc_bucket_ticker(ticker: str) -> bool:
     if len(parts) < 3:
         return False
     return bool(_BTC_BUCKET_SUFFIX_RE.match(parts[-1]))
+
+
+# ─── Price history: skip markets that moved sharply since last cycle ───
+# Persisted so the signal survives a restart. Stored as {ticker: {price_cents, ts}}.
+
+def _load_price_history() -> dict[str, dict[str, float]]:
+    if not PRICE_HISTORY_PATH.exists():
+        return {}
+    try:
+        with PRICE_HISTORY_PATH.open() as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[WARN] edge_price_history.json unreadable: {e}", flush=True)
+        return {}
+
+
+def _save_price_history(history: dict[str, dict[str, float]]) -> None:
+    PRICE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PRICE_HISTORY_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(history, f)
+    tmp.replace(PRICE_HISTORY_PATH)
 
 
 def _save_seen(seen: set[str]) -> None:
@@ -278,6 +310,20 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
     for row in (stats.get("nhl", {}) or {}).get("top_scorers", []) or []:
         if row.get("player"):
             candidates.add(row["player"])
+    # ATP / WTA ranked players (rankings) + names from recent matches.
+    # Including *_recent picks up qualifiers and lower-ranked players who
+    # only appear when they actually play, so title-match still finds them.
+    tennis = stats.get("tennis", {}) or {}
+    for board_key in ("atp_rankings", "wta_rankings"):
+        for row in tennis.get(board_key, []) or []:
+            if row.get("player"):
+                candidates.add(row["player"])
+    for results_key in ("atp_recent", "wta_recent"):
+        for row in tennis.get(results_key, []) or []:
+            for side in ("winner", "loser"):
+                name = row.get(side)
+                if name:
+                    candidates.add(name)
     # MLB team abbrevs from standings
     teams = set((mlb.get("standings", {}) or {}).keys())
 
@@ -302,11 +348,13 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
 
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
-                    seen: set[str]) -> list[dict[str, Any]]:
-    drops = {"seen": 0, "dead": 0, "illiquid": 0, "btc_bucket": 0}
+                    seen: set[str],
+                    price_history: dict[str, dict[str, float]]) -> list[dict[str, Any]]:
+    drops = {"seen": 0, "dead": 0, "illiquid": 0, "btc_bucket": 0, "line_moved": 0}
     timing_drops = {"no_close": 0, "ended": 0, "starting_soon": 0,
                     "too_far": 0, "in_progress": 0}
     now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     kept: list[dict[str, Any]] = []
     for m in markets:
         ticker = m.get("ticker") or ""
@@ -337,12 +385,35 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         if not ok:
             timing_drops[reason] += 1
             continue
+
+        yes_cents = int(round(ya * 100))
+
+        # Line-movement guard. Use the persisted price for this ticker; if
+        # the YES price has shifted more than MAX_LINE_MOVE_CENTS since we
+        # last looked, someone with private information has been trading —
+        # skip this cycle and update history so the next cycle can re-check
+        # against the new baseline. New tickers (no prior entry) pass through.
+        prior = price_history.get(ticker)
+        if prior and (now_ts - float(prior.get("ts", 0))) <= PRICE_HISTORY_MAX_AGE_SECS:
+            move = abs(yes_cents - float(prior.get("price_cents", yes_cents)))
+            if move > MAX_LINE_MOVE_CENTS:
+                drops["line_moved"] += 1
+                print(
+                    f"[edge] line-move skip {ticker}: "
+                    f"{prior.get('price_cents')}¢ → {yes_cents}¢ "
+                    f"(Δ{move:.0f}¢ > {MAX_LINE_MOVE_CENTS}¢)",
+                    flush=True,
+                )
+                price_history[ticker] = {"price_cents": yes_cents, "ts": now_ts}
+                continue
+        price_history[ticker] = {"price_cents": yes_cents, "ts": now_ts}
+
         title = m.get("title", "") or ""
         entities = _extract_entities(title, stats)
         kept.append({
             "ticker": ticker,
             "title": title,
-            "yes_ask_cents": int(round(ya * 100)),
+            "yes_ask_cents": yes_cents,
             "hours_left": round(secs_to_close / 3600, 1),
             "close_time": m.get("close_time", ""),
             "open_time": m.get("open_time", ""),
@@ -354,7 +425,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
     print(
         f"[edge] filter: kept={len(kept)} "
         f"seen={drops['seen']} dead={drops['dead']} illiquid={drops['illiquid']} "
-        f"btc_bucket={drops['btc_bucket']}",
+        f"btc_bucket={drops['btc_bucket']} line_moved={drops['line_moved']}",
         flush=True,
     )
     print(
@@ -375,7 +446,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 _METHODOLOGY = f"""You are a Kalshi prediction-market edge finder. For each market in the user message, estimate the TRUE probability of YES using the STATS CONTEXT block in this system prompt.
 
 The STATS CONTEXT block has two halves:
-- SPORTS STATS — team scoring, pitcher ERA/WHIP, standings, leaders, and an mlb.upcoming_games list of matchups tagged with `game_date` (YYYY-MM-DD, US Eastern) and probable pitchers. Use these for MLB / NHL / NBA / ATP / WTA markets.
+- SPORTS STATS — team scoring, pitcher ERA/WHIP, standings, leaders, and an mlb.upcoming_games list of matchups tagged with `game_date` (YYYY-MM-DD, US Eastern) and probable pitchers. For tennis, `tennis.atp_rankings` / `tennis.wta_rankings` carry the current top-ranked players, and `tennis.atp_recent` / `tennis.wta_recent` carry the last ~10 days of completed match results (winner, loser, score, event). Use these for MLB / NHL / NBA / ATP / WTA markets.
 - ECONOMIC DATA — current national gas price, latest CPI, Fed funds target + next FOMC meeting expectations, BTC spot. Use these for KXAAAGASD / KXCPI / KXFED / KXBTC markets, combined with your own knowledge of macro trends, central-bank reaction functions, and recent price action.
 
 EDGE = true_probability - market_implied_probability  (market price in cents / 100)
@@ -422,6 +493,12 @@ GAS / THRESHOLD MARKETS (KXAAAGASD AND SIMILAR DAILY-AVERAGE TICKERS)
 MLB GAME WINNER (KXMLBGAME) EDGE CEILING
 - Real edge on KXMLBGAME (game winner) markets rarely exceeds 15% even with an elite starter. Bullpen depth, lineup matchups, weather, and umpire variance all compress edge fast — Cy Young pitchers still go 20-10, not 30-0.
 - If you compute edge above +0.15 on a KXMLBGAME ticker, reduce CONFIDENCE to MEDIUM (which blocks the trade under our HIGH-only BUY rule). This ceiling does NOT apply to KXMLBSPREAD or KXMLBTOTAL — those have different variance profiles.
+
+TENNIS MATCH WINNER (KXATPMATCH / KXWTAMATCH) RULES
+- Both players named in the title must appear in `tennis.atp_rankings` (or `tennis.wta_rankings`) for confidence to be HIGH — match against the surname in `player`. If only one is ranked, drop CONFIDENCE to MEDIUM (which SKIPs the trade).
+- A 30+ rank gap between two top-100 players is roughly a 65/35 favorite. A 50+ gap is roughly 75/25. Use these as anchors; do not claim >85% favorite probability for any match without lopsided recent form to back it.
+- Recent form: weight the last ~10 days of `*_recent` matches for both players. Two recent wins by the underdog over comparably-ranked opponents should compress, not extend, the favorite edge.
+- If either player has no recent matches in the cache, treat the match as uncertain — CONFIDENCE: MEDIUM at most.
 
 MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - MLB market tickers encode the game date as YYMMMDD followed by HHMM and the away+home team abbreviations, e.g. KXMLBSPREAD-26JUN041335CLENYY → 2026-06-04 13:35 CLE@NYY.
@@ -609,7 +686,12 @@ def run() -> None:
         flush=True,
     )
     seen = _load_seen()
-    print(f"[edge] loaded {len(seen)} previously-seen tickers", flush=True)
+    price_history = _load_price_history()
+    print(
+        f"[edge] loaded {len(seen)} previously-seen tickers, "
+        f"{len(price_history)} price-history entries",
+        flush=True,
+    )
     cycle = 0
 
     while True:
@@ -631,7 +713,8 @@ def run() -> None:
                     f"[edge] cycle={cycle} fetched {len(markets)} open markets",
                     flush=True,
                 )
-                candidates = _filter_markets(markets, stats, seen)
+                candidates = _filter_markets(markets, stats, seen, price_history)
+                _save_price_history(price_history)
 
                 if not candidates:
                     print(
@@ -732,6 +815,10 @@ def run() -> None:
                                 "reasoning": pred["reasoning"],
                                 "side": "yes",
                                 "price_for_order_cents": it["yes_ask_cents"],
+                                # Forwarded so the trader can detect
+                                # correlated bets (same team / same event)
+                                # against today's existing trades.
+                                "entities": it.get("entities") or [],
                             }
                             kalshi_queue.enqueue("risk", ticker, payload)
                             send_discord(_build_embed(it, pred))

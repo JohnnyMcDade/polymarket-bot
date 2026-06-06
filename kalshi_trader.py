@@ -96,6 +96,65 @@ def _append_trade(entry: dict[str, Any]) -> None:
         _save_log(entries)
 
 
+# ─── Correlated-bet protection ─────────────────────────────────────────
+# We don't want to stack multiple bets on the same team / event in one
+# day — correlated outcomes turn one "I was wrong" into a clustered loss
+# that blows past MAX_DAILY_LOSS. Block if today's trades_log already has
+# an entry with the same ticker, same event (ticker suffix shared across
+# bet types — e.g., KXMLBGAME-... and KXMLBSPREAD-... for the same game),
+# or any overlapping team/player entity.
+
+
+def _event_key(ticker: str) -> str:
+    """Everything after the series prefix in the ticker — encodes the
+    underlying event (date+teams or date+players). Same event_key across
+    different series prefixes means "same game, different bet type"."""
+    parts = ticker.split("-", 1)
+    return parts[1] if len(parts) == 2 else ticker
+
+
+def _is_today_utc(timestamp_iso: str, today: datetime) -> bool:
+    if not timestamp_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(timestamp_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.date() == today.date()
+
+
+def _correlation_collision(ticker: str, entities: list[str]) -> str | None:
+    """Return a reject_reason if this trade collides with one we already
+    placed today (same ticker, same event, or any shared entity);
+    otherwise None. Reads the trades_log under the lock — placed trades
+    are written there before we ever consider sizing the next one."""
+    today = datetime.now(timezone.utc)
+    event_key = _event_key(ticker)
+    incoming_entities = {e.lower() for e in (entities or []) if e}
+    with _log_lock:
+        entries = _load_log()
+    for e in entries:
+        if e.get("outcome") in (None, "rejected"):
+            continue
+        if not _is_today_utc(e.get("timestamp", ""), today):
+            continue
+        existing_ticker = e.get("ticker", "")
+        if existing_ticker == ticker:
+            return f"already bet on {ticker} today"
+        if _event_key(existing_ticker) == event_key:
+            return f"same event as {existing_ticker} (already bet today)"
+        existing_entities = {x.lower() for x in (e.get("entities") or []) if x}
+        overlap = incoming_entities & existing_entities
+        if overlap:
+            return (
+                f"overlaps {existing_ticker} on {sorted(overlap)[0]} "
+                "(already bet today)"
+            )
+    return None
+
+
 # ─── Kelly sizing ──────────────────────────────────────────────────────
 
 def _half_kelly_pct(true_prob: float, yes_cents: float) -> float:
@@ -400,6 +459,18 @@ def run() -> None:
                         rejected += 1
                         continue
 
+                    correlation_reject = _correlation_collision(
+                        ticker, item.get("entities") or []
+                    )
+                    if correlation_reject:
+                        print(
+                            f"[trader] reject {ticker}: correlation — "
+                            f"{correlation_reject}",
+                            flush=True,
+                        )
+                        rejected += 1
+                        continue
+
                     placed, error, order = _place_order(ticker, side, contracts, yes_cents)
                     timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -422,6 +493,8 @@ def run() -> None:
                         "outcome": "pending" if placed else "rejected",
                         "pnl": 0.0,
                         "placement_error": error,
+                        # Persisted for next-cycle correlation checks.
+                        "entities": item.get("entities") or [],
                     }
                     _append_trade(entry)
                     send_discord(_placement_embed(entry, placed=placed, error=error))

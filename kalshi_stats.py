@@ -154,7 +154,13 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 _MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
 _ESPN_NBA_STANDINGS = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
 _ESPN_NHL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/hockey/nhl/standings"
+_ESPN_ATP_RANKINGS = "https://site.api.espn.com/apis/v2/sports/tennis/atp/rankings"
+_ESPN_WTA_RANKINGS = "https://site.api.espn.com/apis/v2/sports/tennis/wta/rankings"
+_ESPN_ATP_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
+_ESPN_WTA_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
 _HTTP_TIMEOUT = 15
+_TENNIS_RANK_DEPTH = int(os.getenv("KALSHI_STATS_TENNIS_RANK_DEPTH", "75"))
+_TENNIS_FORM_DAYS = int(os.getenv("KALSHI_STATS_TENNIS_FORM_DAYS", "10"))
 
 # Stable division ID → name map (statsapi /divisions). Hardcoded because
 # we'd otherwise need an extra request per fetch to resolve them.
@@ -436,6 +442,93 @@ def _fetch_nhl_block() -> dict[str, Any]:
     }
 
 
+# ─── Tennis (ATP / WTA) ────────────────────────────────────────────────
+# ESPN's tennis endpoints expose current rankings (top 100+) and a
+# scoreboard with completed matches. We pull top _TENNIS_RANK_DEPTH for
+# each tour plus the last _TENNIS_FORM_DAYS days of results so the edge
+# agent can ground its ATP/WTA match-winner picks in real ranking deltas
+# and recent W/L form instead of asking Claude to remember the tour.
+
+def _fetch_tennis_rankings(url: str) -> list[dict]:
+    """Flatten ESPN's tennis rankings into {rank, player, country}."""
+    data = _http_get_json(url)
+    out: list[dict] = []
+    for board in (data or {}).get("rankings", []):
+        for entry in (board.get("athletes") or []):
+            athlete = entry.get("athlete") or {}
+            name = athlete.get("displayName") or athlete.get("fullName") or ""
+            if not name:
+                continue
+            country = ""
+            flag = athlete.get("flag") or {}
+            if isinstance(flag, dict):
+                country = flag.get("alt", "") or flag.get("countryCode", "")
+            rank = entry.get("current") or entry.get("rank")
+            try:
+                rank_i = int(rank) if rank is not None else None
+            except (TypeError, ValueError):
+                rank_i = None
+            out.append({"rank": rank_i, "player": name, "country": country})
+            if len(out) >= _TENNIS_RANK_DEPTH:
+                return out
+        if out:  # first board is the primary tour ranking
+            return out
+    return out
+
+
+def _fetch_tennis_recent(url: str) -> list[dict]:
+    """Recent completed matches across the last _TENNIS_FORM_DAYS days.
+    One scoreboard call per day — ESPN's tennis scoreboard accepts a
+    YYYYMMDD date param. Result rows: {date, winner, loser, score, event}.
+    """
+    out: list[dict] = []
+    today = datetime.now(timezone.utc).date()
+    for offset in range(_TENNIS_FORM_DAYS):
+        d = today - timedelta(days=offset)
+        data = _http_get_json(f"{url}?dates={d.strftime('%Y%m%d')}")
+        for ev in (data or {}).get("events", []):
+            event_name = (ev.get("league") or {}).get("name", "") or ev.get("name", "")
+            for comp in ev.get("competitions", []) or []:
+                status_t = ((comp.get("status") or {}).get("type") or {})
+                if not status_t.get("completed"):
+                    continue
+                comps = comp.get("competitors") or []
+                if len(comps) < 2:
+                    continue
+                winner = loser = None
+                for c in comps:
+                    ath = c.get("athlete") or {}
+                    name = ath.get("displayName") or ath.get("fullName") or ""
+                    if c.get("winner"):
+                        winner = name
+                    else:
+                        loser = name
+                if not (winner and loser):
+                    continue
+                score = ""
+                for c in comps:
+                    if c.get("winner"):
+                        score = c.get("score") or ""
+                        break
+                out.append({
+                    "date": d.isoformat(),
+                    "winner": winner,
+                    "loser": loser,
+                    "score": score,
+                    "event": event_name,
+                })
+    return out
+
+
+def _fetch_tennis_block() -> dict[str, Any]:
+    return {
+        "atp_rankings": _fetch_tennis_rankings(_ESPN_ATP_RANKINGS),
+        "wta_rankings": _fetch_tennis_rankings(_ESPN_WTA_RANKINGS),
+        "atp_recent": _fetch_tennis_recent(_ESPN_ATP_SCOREBOARD),
+        "wta_recent": _fetch_tennis_recent(_ESPN_WTA_SCOREBOARD),
+    }
+
+
 def save_cache(stats: dict[str, Any]) -> None:
     stats.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
     STATS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -450,6 +543,7 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     mlb = stats.get("mlb", {}) or {}
     nba = stats.get("nba", {}) or {}
     nhl = stats.get("nhl", {}) or {}
+    tennis = stats.get("tennis", {}) or {}
     econ = stats.get("economic", {}) or {}
     n_teams = len(mlb.get("standings", {}) or {})
     n_team_scoring = len(mlb.get("team_scoring", {}) or {})
@@ -457,6 +551,10 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     n_nba_results = len(nba.get("playoff_results", []) or [])
     n_nhl_results = len(nhl.get("playoff_results", []) or [])
     n_hitters = len((mlb.get("hitting_leaders", {}) or {}).get("hr", []) or [])
+    n_atp = len(tennis.get("atp_rankings", []) or [])
+    n_wta = len(tennis.get("wta_rankings", []) or [])
+    n_atp_recent = len(tennis.get("atp_recent", []) or [])
+    n_wta_recent = len(tennis.get("wta_recent", []) or [])
     gas = econ.get("gas_national_avg_usd_per_gal")
     btc = econ.get("btc_spot_usd")
     fed_range = econ.get("fed", {}) or {}
@@ -477,6 +575,9 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
             {"name": "NHL playoff results", "value": str(n_nhl_results), "inline": True},
             {"name": "NBA round", "value": nba.get("current_round", "?"), "inline": True},
             {"name": "NHL round", "value": nhl.get("current_round", "?"), "inline": True},
+            {"name": "ATP ranked", "value": str(n_atp), "inline": True},
+            {"name": "WTA ranked", "value": str(n_wta), "inline": True},
+            {"name": "Tennis recent (ATP/WTA)", "value": f"{n_atp_recent}/{n_wta_recent}", "inline": True},
             {"name": "Gas $/gal", "value": str(gas) if gas is not None else "?", "inline": True},
             {"name": "BTC $", "value": f"{btc:,.0f}" if isinstance(btc, (int, float)) else "?", "inline": True},
             {"name": "Fed range", "value": fed_str, "inline": True},
@@ -527,6 +628,7 @@ def _do_fetch_and_save() -> None:
         "mlb": _fetch_mlb_block(),
         "nba": _fetch_nba_block(),
         "nhl": _fetch_nhl_block(),
+        "tennis": _fetch_tennis_block(),
     }
     econ = fetch_economic_only() or {}
     btc = _fetch_btc_spot_coinbase()
@@ -537,7 +639,13 @@ def _do_fetch_and_save() -> None:
     mlb_n = len(stats["mlb"].get("standings", {}))
     nba_n = len(stats["nba"].get("standings", []))
     nhl_n = len(stats["nhl"].get("standings", []))
-    print(f"[stats] direct fetch done in {elapsed:.1f}s — mlb={mlb_n} nba={nba_n} nhl={nhl_n} btc={econ.get('btc_spot_usd')}", flush=True)
+    atp_n = len(stats["tennis"].get("atp_rankings", []))
+    wta_n = len(stats["tennis"].get("wta_rankings", []))
+    print(
+        f"[stats] direct fetch done in {elapsed:.1f}s — mlb={mlb_n} nba={nba_n} "
+        f"nhl={nhl_n} atp={atp_n} wta={wta_n} btc={econ.get('btc_spot_usd')}",
+        flush=True,
+    )
     with _cache_lock:
         save_cache(stats)
     send_discord(_build_embed(stats))
