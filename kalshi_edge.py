@@ -12,8 +12,9 @@ Cost discipline (in priority order):
      prompt with cache_control=ephemeral so back-to-back batches hit
      the prompt cache (cross-cycle hits are unlikely at 30-min cadence —
      don't count on them).
-  4. Only BUY when |edge| >= KALSHI_MIN_EDGE AND confidence == HIGH.
-     Everything else gets dropped silently — no enqueue, no Discord.
+  4. Tiered BUY gate: HIGH at edge >= KALSHI_MIN_EDGE, or MEDIUM at the
+     higher KALSHI_MEDIUM_MIN_EDGE floor. LOW never trades. Everything
+     else gets dropped silently — no enqueue, no Discord.
 
 Approved trades go to kalshi_queue stage "risk", which kalshi_trader
 drains. Reuses the existing 4-stage queue rather than introducing a
@@ -44,9 +45,13 @@ CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
 # Sanity ceiling on claimed edge. >25% edge on liquid Kalshi markets is
 # almost always Claude misreading the market (wrong bucket, in-progress
-# game it can't see, etc.) — clamp the recorded edge AND demote
-# confidence one rung so the existing HIGH-only gate blocks the trade.
+# game it can't see, etc.) — clamp the recorded edge and force SKIP.
 MAX_EDGE = float(os.getenv("KALSHI_MAX_EDGE", "0.25"))             # 25%
+# Tiered BUY gate: HIGH confidence trades at MIN_EDGE, MEDIUM only at the
+# higher MEDIUM_MIN_EDGE. The extra edge buffer on MEDIUM compensates
+# for the model's admitted uncertainty — without it, every borderline
+# market the model isn't sure about would slip through.
+MEDIUM_MIN_EDGE = float(os.getenv("KALSHI_MEDIUM_MIN_EDGE", "0.08"))  # 8%
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
 DEBUG_LOG = os.getenv("KALSHI_EDGE_DEBUG_LOG", "").lower() in ("1", "true", "yes")
@@ -57,7 +62,6 @@ WHALE_BOOST_ENABLED = os.getenv("WHALE_BOOST_ENABLED", "true").lower() in ("1", 
 WHALE_BOOST_MIN_USD = float(os.getenv("WHALE_BOOST_MIN_USD", "1000"))
 WHALE_BOOST_MAX_AGE_SECS = float(os.getenv("WHALE_BOOST_MAX_AGE_SECS", "3600"))
 _CONFIDENCE_LADDER = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
-_CONFIDENCE_DEMOTE = {"HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "LOW"}
 
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
@@ -452,7 +456,10 @@ The STATS CONTEXT block has two halves:
 EDGE = true_probability - market_implied_probability  (market price in cents / 100)
 
 RECOMMENDATION RULES
-- BUY only if edge >= +{MIN_EDGE:.2f} AND confidence is HIGH AND you have specific, directly relevant data:
+- BUY only if you have specific, directly relevant data AND one of these tiers is met:
+    - HIGH confidence with edge >= +{MIN_EDGE:.2f}
+    - MEDIUM confidence with edge >= +{MEDIUM_MIN_EDGE:.2f}
+  The MEDIUM tier requires a larger edge because MEDIUM means you are admitting uncertainty — the extra margin compensates for that uncertainty. Required data:
     - for sports: the named team or player appears in SPORTS STATS
     - for economic: the current value of the macro variable is in ECONOMIC DATA and resolution is close enough that the variable is unlikely to swing materially
 - SKIP in every other case — including BUY_NO opportunities. We only act on positive-edge BUY_YES bets in this build.
@@ -476,7 +483,7 @@ REASONING: <one sentence pointing at the specific stat that drove the call>
 
 EDGE SANITY CAP (GLOBAL OVERRIDE — APPLIES TO EVERY MARKET)
 - Real edge on liquid Kalshi markets almost never exceeds 25%. If you computed an edge of +0.25 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
-- When this happens, reduce CONFIDENCE by one rung (HIGH→MEDIUM, MEDIUM→LOW) and set RECOMMENDATION: SKIP. Do not BUY at +25% claimed edge regardless of how obvious the reasoning feels.
+- When this happens, set RECOMMENDATION: SKIP and CONFIDENCE: LOW. Do not BUY at +25% claimed edge regardless of how obvious the reasoning feels.
 
 KXBTC RANGE-BUCKET MARKETS (READ BEFORE EVALUATING ANY KXBTC TICKER)
 - A KXBTC ticker shaped `KXBTC-<dateHour>-B<num>` or `-T<num>` (e.g. KXBTC-26JUN0501-B72750, KXBTC-26JUN0617-T57200) with title "Bitcoin price range on <date>?" is ONE bucket inside a contiguous set of narrow price buckets — NOT a "below <num>" or "above <num>" threshold.
@@ -492,13 +499,13 @@ GAS / THRESHOLD MARKETS (KXAAAGASD AND SIMILAR DAILY-AVERAGE TICKERS)
 
 MLB GAME WINNER (KXMLBGAME) EDGE CEILING
 - Real edge on KXMLBGAME (game winner) markets rarely exceeds 15% even with an elite starter. Bullpen depth, lineup matchups, weather, and umpire variance all compress edge fast — Cy Young pitchers still go 20-10, not 30-0.
-- If you compute edge above +0.15 on a KXMLBGAME ticker, reduce CONFIDENCE to MEDIUM (which blocks the trade under our HIGH-only BUY rule). This ceiling does NOT apply to KXMLBSPREAD or KXMLBTOTAL — those have different variance profiles.
+- If you compute edge above +0.15 on a KXMLBGAME ticker, set RECOMMENDATION: SKIP regardless of computed edge. This ceiling does NOT apply to KXMLBSPREAD or KXMLBTOTAL — those have different variance profiles.
 
 TENNIS MATCH WINNER (KXATPMATCH / KXWTAMATCH) RULES
-- Both players named in the title must appear in `tennis.atp_rankings` (or `tennis.wta_rankings`) for confidence to be HIGH — match against the surname in `player`. If only one is ranked, drop CONFIDENCE to MEDIUM (which SKIPs the trade).
+- Both players named in the title must appear in `tennis.atp_rankings` (or `tennis.wta_rankings`) — match against the surname in `player`. If only one is ranked, set RECOMMENDATION: SKIP.
 - A 30+ rank gap between two top-100 players is roughly a 65/35 favorite. A 50+ gap is roughly 75/25. Use these as anchors; do not claim >85% favorite probability for any match without lopsided recent form to back it.
 - Recent form: weight the last ~10 days of `*_recent` matches for both players. Two recent wins by the underdog over comparably-ranked opponents should compress, not extend, the favorite edge.
-- If either player has no recent matches in the cache, treat the match as uncertain — CONFIDENCE: MEDIUM at most.
+- If either player has no recent matches in the cache, set RECOMMENDATION: SKIP — without recent form we cannot anchor the call.
 
 MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - MLB market tickers encode the game date as YYMMMDD followed by HHMM and the away+home team abbreviations, e.g. KXMLBSPREAD-26JUN041335CLENYY → 2026-06-04 13:35 CLE@NYY.
@@ -675,7 +682,8 @@ def run() -> None:
     print(
         f"Kalshi Edge Agent starting — model={ANTHROPIC_MODEL}, "
         f"interval={CHECK_INTERVAL}s, batch={BATCH_SIZE}, "
-        f"min_edge={MIN_EDGE:.0%}, max_edge={MAX_EDGE:.0%}, "
+        f"min_edge_high={MIN_EDGE:.0%}, min_edge_medium={MEDIUM_MIN_EDGE:.0%}, "
+        f"max_edge={MAX_EDGE:.0%}, "
         f"debug_log={DEBUG_LOG}"
     )
     print(
@@ -778,26 +786,28 @@ def run() -> None:
                                     )
                             # Sanity cap: edges > MAX_EDGE are almost always
                             # model error (wrong bucket, in-progress game,
-                            # misread resolution). Clamp the recorded edge so
-                            # downstream sizing isn't fed a fake number, and
-                            # demote confidence one rung so the HIGH-only gate
-                            # below blocks the trade.
+                            # misread resolution). Clamp the recorded edge
+                            # AND force SKIP — under the tiered gate, just
+                            # demoting confidence is no longer enough since
+                            # MEDIUM also trades.
                             if pred["edge"] > MAX_EDGE:
-                                old_conf = pred["confidence"]
-                                pred["confidence"] = _CONFIDENCE_DEMOTE.get(
-                                    old_conf, "LOW"
-                                )
                                 print(
                                     f"[edge-cap] {ticker} raw_edge={pred['edge']:+.3f} "
-                                    f"> {MAX_EDGE:.2f} cap — clamping edge and "
-                                    f"demoting conf {old_conf}->{pred['confidence']}",
+                                    f"> {MAX_EDGE:.2f} cap — forcing SKIP",
                                     flush=True,
                                 )
                                 pred["edge"] = MAX_EDGE
-                            if (
-                                pred["recommendation"] != "BUY"
-                                or pred["confidence"] != "HIGH"
-                                or pred["edge"] < MIN_EDGE
+                                pred["recommendation"] = "SKIP"
+                            high_ok = (
+                                pred["confidence"] == "HIGH"
+                                and pred["edge"] >= MIN_EDGE
+                            )
+                            medium_ok = (
+                                pred["confidence"] == "MEDIUM"
+                                and pred["edge"] >= MEDIUM_MIN_EDGE
+                            )
+                            if pred["recommendation"] != "BUY" or not (
+                                high_ok or medium_ok
                             ):
                                 skipped += 1
                                 continue
