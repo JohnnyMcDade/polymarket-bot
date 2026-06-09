@@ -63,6 +63,17 @@ WHALE_BOOST_MIN_USD = float(os.getenv("WHALE_BOOST_MIN_USD", "1000"))
 WHALE_BOOST_MAX_AGE_SECS = float(os.getenv("WHALE_BOOST_MAX_AGE_SECS", "3600"))
 _CONFIDENCE_LADDER = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
 
+# Backtest-validated boost (MLB game-winner only): bump MEDIUM → HIGH
+# when the team we're betting has a rolling last-3-starts ERA <= X and
+# the two teams' wpct differ by >= Y. Thresholds come from a 180-day
+# v3 backtest in backtest_kalshi.py — the elite-rolling-ERA + meaningful-
+# record-gap cohorts cleared 55%+ directional accuracy with Wilson 95%
+# lower bound roughly around break-even. Lower confidence than the
+# whale-boost (real-money flow signal), so keep it MLB-only and tunable.
+BACKTEST_BOOST_ENABLED = os.getenv("KALSHI_BACKTEST_BOOST_ENABLED", "true").lower() in ("1", "true", "yes")
+BACKTEST_BOOST_ROLLING_ERA_MAX = float(os.getenv("KALSHI_BACKTEST_BOOST_ROLLING_ERA_MAX", "2.50"))
+BACKTEST_BOOST_WPCT_GAP_MIN = float(os.getenv("KALSHI_BACKTEST_BOOST_WPCT_GAP_MIN", "0.10"))
+
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
 # at least MIN_SECS_TO_CLOSE in the future but no more than MAX_SECS_TO_CLOSE.
@@ -349,6 +360,79 @@ def _extract_entities(title: str, stats: dict[str, Any]) -> list[str]:
             seen.add(e)
             out.append(e)
     return out
+
+
+_MLB_TICKER_MONTH = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+    "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def _mlb_game_meta_for(ticker: str, stats: dict[str, Any]) -> dict[str, Any] | None:
+    """Match a KXMLBGAME ticker to its mlb.upcoming_games entry. Ticker
+    body is YYMONDDhhmm<TEAMS>; we parse the date and find the upcoming
+    games entry whose game_date matches and whose home or away abbr
+    matches the contract team (the segment after the last hyphen).
+    Returns the matched entry merged with contract_team, or None.
+    """
+    if not ticker.startswith("KXMLBGAME"):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return None
+    body, contract_team = parts[1], parts[2]
+    if len(body) < 7:
+        return None
+    yy, mon, dd = body[:2], body[2:5], body[5:7]
+    mm = _MLB_TICKER_MONTH.get(mon.upper())
+    if not mm:
+        return None
+    game_date = f"20{yy}-{mm}-{dd}"
+    for g in (stats.get("mlb", {}) or {}).get("upcoming_games", []) or []:
+        if g.get("game_date") != game_date:
+            continue
+        if g.get("home") == contract_team or g.get("away") == contract_team:
+            return {**g, "contract_team": contract_team}
+    return None
+
+
+def _backtest_boost_applies(
+    item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
+) -> tuple[bool, str]:
+    """Return (True, reason) if the backtest-validated cohort matches:
+      (1) MLB game-winner ticker resolvable to an upcoming_games entry
+      (2) the starter for the team we're betting has rolling_era_last3
+          <= BACKTEST_BOOST_ROLLING_ERA_MAX
+      (3) |home_wpct - away_wpct| >= BACKTEST_BOOST_WPCT_GAP_MIN
+    The edge agent always trades BUY YES (see payload construction), so
+    the team we're betting = the contract team in the ticker.
+    """
+    meta = _mlb_game_meta_for(item.get("ticker", ""), stats)
+    if not meta:
+        return False, ""
+    bet_team = meta["contract_team"]
+    if bet_team == meta.get("home"):
+        starter = meta.get("home_pitcher") or {}
+    elif bet_team == meta.get("away"):
+        starter = meta.get("away_pitcher") or {}
+    else:
+        return False, ""
+    rolling = starter.get("rolling_era_last3")
+    if rolling is None or rolling > BACKTEST_BOOST_ROLLING_ERA_MAX:
+        return False, ""
+    standings = ((stats.get("mlb", {}) or {}).get("standings", {}) or {})
+    home_pct = (standings.get(meta.get("home")) or {}).get("pct")
+    away_pct = (standings.get(meta.get("away")) or {}).get("pct")
+    if home_pct is None or away_pct is None:
+        return False, ""
+    wpct_diff = abs(float(home_pct) - float(away_pct))
+    if wpct_diff < BACKTEST_BOOST_WPCT_GAP_MIN:
+        return False, ""
+    reason = (
+        f"bet={bet_team} starter={starter.get('player') or '?'} "
+        f"rolling_era={rolling:.2f} wpct_diff={wpct_diff:.3f}"
+    )
+    return True, reason
 
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
@@ -798,6 +882,30 @@ def run() -> None:
                                 )
                                 pred["edge"] = MAX_EDGE
                                 pred["recommendation"] = "SKIP"
+                            # Backtest-validated boost. Fires only on
+                            # BUY-MEDIUM (we don't override Claude's
+                            # SKIP / LOW) and runs AFTER the MAX_EDGE
+                            # cap (so sanity SKIPs survive). Upgrades
+                            # MEDIUM → HIGH on MLB game-winner markets
+                            # where the favored team's starter has been
+                            # elite over his last 3 starts AND the two
+                            # teams' records differ meaningfully.
+                            if (
+                                BACKTEST_BOOST_ENABLED
+                                and pred["recommendation"] == "BUY"
+                                and pred["confidence"] == "MEDIUM"
+                            ):
+                                applies, reason = _backtest_boost_applies(it, pred, stats)
+                                if applies:
+                                    pred["confidence"] = "HIGH"
+                                    pred["reasoning"] = (
+                                        "[backtest-boost MEDIUM->HIGH] "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[BACKTEST-BOOST] {ticker} MEDIUM->HIGH ({reason})",
+                                        flush=True,
+                                    )
                             high_ok = (
                                 pred["confidence"] == "HIGH"
                                 and pred["edge"] >= MIN_EDGE

@@ -507,14 +507,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=60)
     parser.add_argument("--season", type=int, default=datetime.now(timezone.utc).year)
+    parser.add_argument("--start", type=str, default=None, help="YYYY-MM-DD; overrides --days when paired with --end")
+    parser.add_argument("--end", type=str, default=None, help="YYYY-MM-DD; overrides --days when paired with --start")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
 
     if args.no_cache and CACHE_DIR.exists():
         shutil.rmtree(CACHE_DIR)
 
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=args.days)
+    if args.start and args.end:
+        start = datetime.strptime(args.start, "%Y-%m-%d").date()
+        end = datetime.strptime(args.end, "%Y-%m-%d").date()
+    elif args.start or args.end:
+        parser.error("--start and --end must be provided together")
+    else:
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=args.days)
 
     print(f"Fetching schedule {start} → {end}...", flush=True)
     games = fetch_schedule(start.isoformat(), end.isoformat())

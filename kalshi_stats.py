@@ -191,6 +191,59 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
+def _parse_ip(s: Any) -> float:
+    """MLB encodes innings pitched as a decimal where the tenths digit is
+    outs recorded (5.1 = 5⅓ IP, 5.2 = 5⅔). Convert to real innings."""
+    if s is None:
+        return 0.0
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        return 0.0
+    whole = int(f)
+    tenths = round((f - whole) * 10)
+    return whole + tenths / 3.0
+
+
+def _fetch_pitcher_rolling_era(pitcher_ids: set[int], window: int = 3) -> dict[int, float | None]:
+    """For each pitcher id, fetch gameLog and compute IP-weighted ERA over
+    the last `window` starts: (sum_ER * 9) / sum_IP. Returns None for
+    pitchers with fewer than `window` prior starts so callers can decide
+    whether to skip or fall back. ~one HTTP call per pitcher; called from
+    the daily stats refresh so cost is bounded."""
+    out: dict[int, float | None] = {}
+    for pid in pitcher_ids:
+        data = _http_get_json(
+            f"{_MLB_STATSAPI}/people/{pid}/stats"
+            f"?stats=gameLog&season=2026&group=pitching&sportId=1"
+        )
+        if not data:
+            out[pid] = None
+            continue
+        entries: list[tuple[str, float, int]] = []
+        for sb in data.get("stats", []):
+            for sp in sb.get("splits", []):
+                d = sp.get("date")
+                stat = sp.get("stat", {}) or {}
+                ip_str = stat.get("inningsPitched")
+                er = stat.get("earnedRuns")
+                if not d or ip_str is None or er is None:
+                    continue
+                try:
+                    entries.append((d, _parse_ip(ip_str), int(er)))
+                except (TypeError, ValueError):
+                    continue
+        entries.sort(key=lambda e: e[0])
+        if len(entries) < window:
+            out[pid] = None
+            continue
+        recent = entries[-window:]
+        total_ip = sum(e[1] for e in recent)
+        total_er = sum(e[2] for e in recent)
+        out[pid] = (total_er * 9.0) / total_ip if total_ip > 0 else None
+    return out
+
+
 def _fetch_mlb_teams_meta() -> dict[int, dict[str, str]]:
     """team_id → {abbr, name, division} for all active MLB teams."""
     data = _http_get_json(f"{_MLB_STATSAPI}/teams?sportId=1&season=2026&activeStatus=Y")
@@ -307,6 +360,11 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
                 }
                 break
 
+    # Rolling last-3-starts ERA per starter — backtest showed this is a
+    # materially sharper signal than season cumulative ERA. One gameLog
+    # call per pitcher; ~30 pitchers per refresh, ~9s added latency.
+    rolling_era = _fetch_pitcher_rolling_era(pitcher_ids)
+
     out: list[dict] = []
     for g in games_raw:
         teams = g.get("teams", {})
@@ -326,10 +384,12 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
             "start_time_utc": start_t,
             "away_pitcher": {
                 "player": ap.get("fullName", ""),
+                "rolling_era_last3": rolling_era.get(ap.get("id")),
                 **(pitcher_stats.get(ap.get("id")) or {"era": None, "whip": None}),
             },
             "home_pitcher": {
                 "player": hp.get("fullName", ""),
+                "rolling_era_last3": rolling_era.get(hp.get("id")),
                 **(pitcher_stats.get(hp.get("id")) or {"era": None, "whip": None}),
             },
         })
