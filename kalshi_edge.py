@@ -777,6 +777,12 @@ def run() -> None:
         f"CLOSE_SOON_FOR_IN_PROGRESS={CLOSE_SOON_FOR_IN_PROGRESS}",
         flush=True,
     )
+    print(
+        f"[edge] backtest-boost: enabled={BACKTEST_BOOST_ENABLED} "
+        f"rolling_era_max={BACKTEST_BOOST_ROLLING_ERA_MAX} "
+        f"wpct_gap_min={BACKTEST_BOOST_WPCT_GAP_MIN}",
+        flush=True,
+    )
     seen = _load_seen()
     price_history = _load_price_history()
     print(

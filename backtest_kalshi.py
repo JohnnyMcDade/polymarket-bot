@@ -135,6 +135,60 @@ def _wilson_lower(c: int, n: int, z: float = 1.96) -> float:
     return (centre - margin) / denom
 
 
+def _wilson_upper(c: int, n: int, z: float = 1.96) -> float:
+    """Wilson 95% upper bound — paired with _wilson_lower for the full CI."""
+    if n == 0:
+        return 1.0
+    p = c / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return (centre + margin) / denom
+
+
+# Kalshi YES-contract prices (cents) where we sample expected ROI in the
+# break-even table. Bracketed to cover typical MLB game-winner pricing for
+# moderate (~55¢) through strong (~80¢) favorites.
+BREAKEVEN_PRICES_CENTS = (40, 50, 55, 60, 65, 70, 75, 80)
+
+
+def _break_even_block(c: int, n: int, label: str, indent: str = "  ") -> list[str]:
+    """For a cohort of n bets with c wins, format a break-even & ROI table
+    answering 'at what Kalshi price does this cohort net positive ROI?'.
+
+    Pure arithmetic: for a Kalshi YES contract at price m (cents/100), one
+    dollar wagered pays (1-m)/m on a win and -1 on a loss. Expected ROI
+    per dollar bet = (p - m) / m where p is our directional accuracy.
+
+    Two columns: 'raw' uses point-estimate p, 'conservative' uses the
+    Wilson 95% lower bound (so positive ROI at the conservative number
+    means we're 95% confident the true ROI is positive at that price)."""
+    if n == 0:
+        return [f"{indent}{label}: empty"]
+    p_raw = c / n
+    p_wlo = _wilson_lower(c, n)
+    p_wup = _wilson_upper(c, n)
+    lines = [
+        f"{indent}{label}",
+        f"{indent}  sample: n={n}  wins={c}  win_rate={p_raw:.1%}  "
+        f"Wilson95%=[{p_wlo:.1%}, {p_wup:.1%}]",
+        f"{indent}  break-even Kalshi YES price:  "
+        f"{round(p_raw * 100)}¢ raw / {round(p_wlo * 100)}¢ conservative",
+    ]
+    # ROI rows: emit a compact two-line table.
+    raw_cells = []
+    cons_cells = []
+    for m_c in BREAKEVEN_PRICES_CENTS:
+        m = m_c / 100.0
+        raw = (p_raw - m) / m
+        cons = (p_wlo - m) / m
+        raw_cells.append(f"{m_c:>3d}¢:{raw:>+7.1%}")
+        cons_cells.append(f"{m_c:>3d}¢:{cons:>+7.1%}")
+    lines.append(f"{indent}  ROI per $1 (raw):          " + "  ".join(raw_cells))
+    lines.append(f"{indent}  ROI per $1 (conservative): " + "  ".join(cons_cells))
+    return lines
+
+
 @dataclass
 class Game:
     game_pk: int
@@ -481,7 +535,58 @@ def report(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
                 f"n={n:>4} win_rate={wr:.1%} ({c}/{n}) wilson_lo={wlo:.1%}{stable}"
             )
 
-    print("\n--- Current heuristic weights (edit constants at top of file to iterate) ---")
+    # ── Break-even analysis ────────────────────────────────────────────
+    # For each meaningful cohort, show the Kalshi YES price at which our
+    # directional accuracy stops beating the market. A 65% cohort breaks
+    # even at 65¢; below that we profit, above we lose. Conservative
+    # column uses Wilson 95% lower bound for a stricter "are we 95%
+    # confident this still pays" test.
+    print("\n--- BREAK-EVEN ANALYSIS (directional accuracy → expected ROI vs Kalshi YES price) ---")
+    print("    Profitable when Kalshi prices the YES contract below our win rate.")
+    print("    'conservative' uses Wilson 95% lower bound — positive there means we're")
+    print("    95% confident the live ROI is positive at that price.")
+    print()
+
+    c_all = sum(1 for r in rows if r["correct"])
+    for line in _break_even_block(c_all, len(rows), "OVERALL (all decided picks)"):
+        print(line)
+    print()
+    for conf in ("HIGH", "MEDIUM"):
+        subset = [r for r in rows if r["confidence"] == conf]
+        if not subset:
+            continue
+        c_s = sum(1 for r in subset if r["correct"])
+        for line in _break_even_block(c_s, len(subset), f"{conf}-confidence picks"):
+            print(line)
+        print()
+
+    # Stable combos only — same Wilson > 50% filter as the combo finder
+    print("    Per-cohort break-even (Wilson > 50% combos only):")
+    any_stable = False
+    for tier in ("elite", "good", "average", "below_avg", "bad"):
+        for side in ("home", "away"):
+            for lo, hi, label in WPCT_BUCKETS:
+                subset = [
+                    r for r in rows
+                    if era_tier(r["fav_era"]) == tier
+                    and r["favorite"] == side
+                    and lo <= r["wpct_diff"] < hi
+                ]
+                if len(subset) < 15:
+                    continue
+                c_s = sum(1 for r in subset if r["correct"])
+                if _wilson_lower(c_s, len(subset)) <= 0.50:
+                    continue
+                any_stable = True
+                cohort = f"fav-pitcher={tier}, side={side}, wpct_diff={label}"
+                for line in _break_even_block(c_s, len(subset), cohort, indent="    "):
+                    print(line)
+                print()
+    if not any_stable:
+        print("    (no Wilson-stable combo at this window — try wider date range)")
+        print()
+
+    print("--- Current heuristic weights (edit constants at top of file to iterate) ---")
     print(f"  HOME_BASE_WP            = {HOME_BASE_WP}")
     print(f"  PITCHER_ERA_WEIGHT      = {PITCHER_ERA_WEIGHT}  (WP per ERA-point diff)")
     print(f"  RECORD_WPCT_WEIGHT      = {RECORD_WPCT_WEIGHT}  (WP per wpct diff)")
