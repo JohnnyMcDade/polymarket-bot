@@ -73,6 +73,12 @@ _CONFIDENCE_LADDER = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
 BACKTEST_BOOST_ENABLED = os.getenv("KALSHI_BACKTEST_BOOST_ENABLED", "true").lower() in ("1", "true", "yes")
 BACKTEST_BOOST_ROLLING_ERA_MAX = float(os.getenv("KALSHI_BACKTEST_BOOST_ROLLING_ERA_MAX", "2.50"))
 BACKTEST_BOOST_WPCT_GAP_MIN = float(os.getenv("KALSHI_BACKTEST_BOOST_WPCT_GAP_MIN", "0.10"))
+# Price-aware filter: don't boost if Kalshi's YES ask is already above the
+# break-even price. The 2025 backtest showed HIGH-confidence picks (which
+# is what we'd be upgrading into) clear conservative Wilson break-even at
+# ~60c YES. Default 62c gives a thin profit margin without being so strict
+# that the boost almost never fires. Set to 100 to disable price filtering.
+BACKTEST_BOOST_MAX_ASK_CENTS = int(os.getenv("KALSHI_BACKTEST_BOOST_MAX_ASK_CENTS", "62"))
 
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
@@ -398,41 +404,45 @@ def _mlb_game_meta_for(ticker: str, stats: dict[str, Any]) -> dict[str, Any] | N
 
 def _backtest_boost_applies(
     item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
-) -> tuple[bool, str]:
-    """Return (True, reason) if the backtest-validated cohort matches:
+) -> tuple[bool, dict[str, Any]]:
+    """Return (True, info_dict) if the backtest-validated cohort matches:
       (1) MLB game-winner ticker resolvable to an upcoming_games entry
       (2) the starter for the team we're betting has rolling_era_last3
           <= BACKTEST_BOOST_ROLLING_ERA_MAX
       (3) |home_wpct - away_wpct| >= BACKTEST_BOOST_WPCT_GAP_MIN
     The edge agent always trades BUY YES (see payload construction), so
-    the team we're betting = the contract team in the ticker.
+    the team we're betting = the contract team in the ticker. info_dict
+    carries the values that feed the [BACKTEST-BOOST] / [BACKTEST-BOOST-SKIP]
+    log lines: bet_team, starter, rolling_era, wpct_diff.
     """
     meta = _mlb_game_meta_for(item.get("ticker", ""), stats)
     if not meta:
-        return False, ""
+        return False, {}
     bet_team = meta["contract_team"]
     if bet_team == meta.get("home"):
         starter = meta.get("home_pitcher") or {}
     elif bet_team == meta.get("away"):
         starter = meta.get("away_pitcher") or {}
     else:
-        return False, ""
+        return False, {}
     rolling = starter.get("rolling_era_last3")
     if rolling is None or rolling > BACKTEST_BOOST_ROLLING_ERA_MAX:
-        return False, ""
+        return False, {}
     standings = ((stats.get("mlb", {}) or {}).get("standings", {}) or {})
     home_pct = (standings.get(meta.get("home")) or {}).get("pct")
     away_pct = (standings.get(meta.get("away")) or {}).get("pct")
     if home_pct is None or away_pct is None:
-        return False, ""
+        return False, {}
     wpct_diff = abs(float(home_pct) - float(away_pct))
     if wpct_diff < BACKTEST_BOOST_WPCT_GAP_MIN:
-        return False, ""
-    reason = (
-        f"bet={bet_team} starter={starter.get('player') or '?'} "
-        f"rolling_era={rolling:.2f} wpct_diff={wpct_diff:.3f}"
-    )
-    return True, reason
+        return False, {}
+    info = {
+        "bet_team": bet_team,
+        "starter": starter.get("player") or "?",
+        "rolling_era": rolling,
+        "wpct_diff": wpct_diff,
+    }
+    return True, info
 
 
 def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
@@ -780,7 +790,8 @@ def run() -> None:
     print(
         f"[edge] backtest-boost: enabled={BACKTEST_BOOST_ENABLED} "
         f"rolling_era_max={BACKTEST_BOOST_ROLLING_ERA_MAX} "
-        f"wpct_gap_min={BACKTEST_BOOST_WPCT_GAP_MIN}",
+        f"wpct_gap_min={BACKTEST_BOOST_WPCT_GAP_MIN} "
+        f"max_ask_cents={BACKTEST_BOOST_MAX_ASK_CENTS}",
         flush=True,
     )
     seen = _load_seen()
@@ -895,23 +906,42 @@ def run() -> None:
                             # MEDIUM → HIGH on MLB game-winner markets
                             # where the favored team's starter has been
                             # elite over his last 3 starts AND the two
-                            # teams' records differ meaningfully.
+                            # teams' records differ meaningfully AND
+                            # Kalshi's YES ask is below the break-even
+                            # price (so the upgrade actually corresponds
+                            # to a profitable bet, not just a directionally-
+                            # correct one on an already-priced-in favorite).
                             if (
                                 BACKTEST_BOOST_ENABLED
                                 and pred["recommendation"] == "BUY"
                                 and pred["confidence"] == "MEDIUM"
                             ):
-                                applies, reason = _backtest_boost_applies(it, pred, stats)
+                                applies, info = _backtest_boost_applies(it, pred, stats)
                                 if applies:
-                                    pred["confidence"] = "HIGH"
-                                    pred["reasoning"] = (
-                                        "[backtest-boost MEDIUM->HIGH] "
-                                        + pred.get("reasoning", "")
+                                    ask = int(it.get("yes_ask_cents") or 100)
+                                    common = (
+                                        f"era={info['rolling_era']:.2f} "
+                                        f"gap={info['wpct_diff']:.3f} price={ask}c "
+                                        f"bet={info['bet_team']} starter={info['starter']}"
                                     )
-                                    print(
-                                        f"[BACKTEST-BOOST] {ticker} MEDIUM->HIGH ({reason})",
-                                        flush=True,
-                                    )
+                                    if ask > BACKTEST_BOOST_MAX_ASK_CENTS:
+                                        print(
+                                            f"[BACKTEST-BOOST-SKIP] {ticker} "
+                                            f"price={ask}c > {BACKTEST_BOOST_MAX_ASK_CENTS}c "
+                                            f"break-even ({common})",
+                                            flush=True,
+                                        )
+                                    else:
+                                        pred["confidence"] = "HIGH"
+                                        pred["reasoning"] = (
+                                            "[backtest-boost MEDIUM->HIGH] "
+                                            + pred.get("reasoning", "")
+                                        )
+                                        print(
+                                            f"[BACKTEST-BOOST] {ticker} MEDIUM->HIGH "
+                                            f"{common}",
+                                            flush=True,
+                                        )
                             high_ok = (
                                 pred["confidence"] == "HIGH"
                                 and pred["edge"] >= MIN_EDGE
