@@ -31,16 +31,28 @@ v2 CHANGES — future-knowledge bias removed:
     are skipped — no signal, no fake league-average fallback.
   - Games before standings exist (season opening day) are skipped.
 
-REMAINING v2 limitations (honest):
-  - Still a heuristic. Claude has access to context (injuries, recent
-    form, lineup news) that closed-form features can't capture.
+v3 CHANGES — rolling-window ERA replaces season cumulative:
+  - rolling_era_as_of() returns IP-weighted ERA over the pitcher's last
+    ROLLING_WINDOW (default 3) starts on-or-before the as-of date.
+    Captures hot/cold form: a pitcher shelled in his last 3 looks
+    materially worse than one steady, even if season cumulative is
+    similar.
+  - Games where the pitcher has fewer than ROLLING_WINDOW prior starts
+    are skipped (no fallback to season cumulative). Costs sample size,
+    especially early-season, but keeps the answer to "does rolling
+    form predict outcomes" uncontaminated.
+  - gameLog cache filename versioned to `_v2` (now stores per-game IP
+    and ER, not just cumulative ERA). Old caches are bypassed.
+
+REMAINING limitations (honest):
+  - Still a heuristic. Claude has access to context (injuries, lineup
+    news, weather, bullpen) that closed-form features can't capture.
   - No market-price data — we measure directional accuracy, not edge.
     A real strategy needs accuracy > implied market probability, not
     just > 50%.
-  - Pitcher gameLog `era` is cumulative season ERA, not rolling form.
-    A pitcher who got shelled in his last 3 starts looks the same as
-    one who was steady — both same season ERA. Rolling-window ERA
-    would be a v3 enhancement.
+  - Rolling window is starts-based, not days-based. A pitcher who
+    started 4 weeks ago looks the same as one who started 4 days ago,
+    as long as both have 3 prior starts.
 
 Run:
     python backtest_kalshi.py                    # default: 60 days, this season
@@ -89,9 +101,25 @@ WPCT_BUCKETS = [
     (0.20, 1.00, "20%+"),
 ]
 
+ROLLING_WINDOW = 3  # last-N starts for rolling ERA
+
 
 def _prev_day(d: str) -> str:
     return (datetime.strptime(d, "%Y-%m-%d").date() - timedelta(days=1)).isoformat()
+
+
+def _parse_ip(s: Any) -> float:
+    """MLB API encodes innings as decimals where the tenths digit is
+    outs-recorded (5.1 = 5⅓, 5.2 = 5⅔). Convert to real innings."""
+    if s is None:
+        return 0.0
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        return 0.0
+    whole = int(f)
+    tenths = round((f - whole) * 10)
+    return whole + tenths / 3.0
 
 
 def _wilson_lower(c: int, n: int, z: float = 1.96) -> float:
@@ -212,12 +240,17 @@ def fetch_team_records_as_of(season: int, as_of_date: str) -> dict[int, dict[str
 
 def fetch_pitcher_gamelog(pid: int, season: int) -> list[dict[str, Any]]:
     """Full-season pitching game log for `pid`. Returns sorted list of
-    {date, era} entries where `era` is cumulative season ERA through
-    that game (so to get ERA going into a game on date X, take the most
-    recent entry with date <= X-1)."""
+    {date, era, ip, er} entries where:
+      - era is cumulative season ERA after that game
+      - ip is innings pitched in that single game (decimal — 5⅓ = 5.333)
+      - er is earned runs in that single game
+    Enables both cumulative and rolling-window ERA lookups.
+
+    Cache filename is versioned (_v2) so older caches without ip/er
+    are bypassed and re-fetched on first run."""
     if pid is None:
         return []
-    path = _cache_path(f"gamelog_{pid}_{season}.json")
+    path = _cache_path(f"gamelog_{pid}_{season}_v2.json")
     if path.exists():
         return json.loads(path.read_text())
     entries: list[dict[str, Any]] = []
@@ -237,12 +270,20 @@ def fetch_pitcher_gamelog(pid: int, season: int) -> list[dict[str, Any]]:
         for stat_block in data.get("stats", []):
             for split in stat_block.get("splits", []):
                 d = split.get("date")
-                era_str = split.get("stat", {}).get("era")
-                if not d or era_str in (None, "-.--"):
+                stat = split.get("stat", {})
+                era_str = stat.get("era")
+                ip_str = stat.get("inningsPitched")
+                er = stat.get("earnedRuns")
+                if not d or era_str in (None, "-.--") or ip_str is None or er is None:
                     continue
                 try:
-                    entries.append({"date": d, "era": float(era_str)})
-                except ValueError:
+                    entries.append({
+                        "date": d,
+                        "era": float(era_str),
+                        "ip": _parse_ip(ip_str),
+                        "er": int(er),
+                    })
+                except (ValueError, TypeError):
                     continue
         entries.sort(key=lambda e: e["date"])
     except (requests.RequestException, ValueError, KeyError):
@@ -251,16 +292,30 @@ def fetch_pitcher_gamelog(pid: int, season: int) -> list[dict[str, Any]]:
     return entries
 
 
-def era_as_of(gamelog: list[dict[str, Any]], as_of_date: str) -> float | None:
-    """Cumulative season ERA from the most recent entry on-or-before as_of_date.
-    Returns None if the pitcher had no recorded starts in that window."""
-    best: float | None = None
-    for entry in gamelog:
-        if entry["date"] <= as_of_date:
-            best = entry["era"]
-        else:
-            break
-    return best
+def rolling_era_as_of(
+    gamelog: list[dict[str, Any]],
+    as_of_date: str,
+    window: int = ROLLING_WINDOW,
+) -> float | None:
+    """IP-weighted ERA over the pitcher's last `window` starts on-or-before
+    `as_of_date`. Computed as (sum_ER * 9) / sum_IP — the standard ERA
+    formula applied to the windowed slice, not a naive arithmetic mean
+    of game-level ERAs (which would let one 1-IP blowup dominate two
+    7-IP gems).
+
+    Returns None if the pitcher has fewer than `window` prior starts —
+    no fallback to season cumulative ERA, because that would contaminate
+    the answer to 'does rolling form predict outcomes given enough data'.
+    """
+    prior = [e for e in gamelog if e["date"] <= as_of_date]
+    if len(prior) < window:
+        return None
+    recent = prior[-window:]
+    total_ip = sum(e["ip"] for e in recent)
+    total_er = sum(e["er"] for e in recent)
+    if total_ip <= 0:
+        return None
+    return (total_er * 9.0) / total_ip
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +386,11 @@ def run_backtest_as_of(
             skipped["no_record"] += 1
             continue
         home_era = (
-            era_as_of(gamelogs_by_pid.get(g.home_pitcher_id, []), as_of)
+            rolling_era_as_of(gamelogs_by_pid.get(g.home_pitcher_id, []), as_of)
             if g.home_pitcher_id else None
         )
         away_era = (
-            era_as_of(gamelogs_by_pid.get(g.away_pitcher_id, []), as_of)
+            rolling_era_as_of(gamelogs_by_pid.get(g.away_pitcher_id, []), as_of)
             if g.away_pitcher_id else None
         )
         if home_era is None or away_era is None:
@@ -433,9 +488,10 @@ def report(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
     print(f"  HIGH_CONF_THRESHOLD     = {HIGH_CONF_THRESHOLD}")
     print(f"  MEDIUM_CONF_THRESHOLD   = {MEDIUM_CONF_THRESHOLD}")
     print()
-    print("v2 caveats — what's still imperfect:")
-    print("  - Pitcher gameLog `era` is cumulative season ERA, not rolling form.")
-    print("    A pitcher who's been hot vs cold lately looks identical.")
+    print(f"\nPitcher ERA = rolling last-{ROLLING_WINDOW} starts (IP-weighted, not naive avg).")
+    print("Games where a starter has <3 prior starts as of game-date-1 are skipped.")
+    print()
+    print("Caveats — what's still imperfect:")
     print("  - No market-price feed → directional accuracy only. Live strategy")
     print("    needs accuracy > implied market probability, not just > 50%.")
     print("  - Heuristic ignores injuries, lineup news, weather, bullpen depth.")
