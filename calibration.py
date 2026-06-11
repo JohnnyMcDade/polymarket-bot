@@ -250,8 +250,26 @@ def compute_calibration(
             min_wr = float(c.get("min_win_rate", 0.55))
             req_pnl = bool(c.get("require_pnl_positive", True))
             high_cap = float(c.get("max_high_conf_cal_err", 0.15))
+            min_high_n = int(c.get("min_high_conf_n", 10))
             high = conf_summaries.get("HIGH")
-            high_err = high["cal_err"] if high else None
+
+            # HIGH calibration criterion requires BOTH: enough HIGH trades to
+            # be statistically meaningful (n >= min_high_n), AND cal_err under
+            # high_cap. Without the n-floor a single lucky 99% HIGH trade
+            # could trip the criterion at n=1.
+            if high and high["n"] >= min_high_n:
+                high_pass = high["cal_err"] < high_cap
+                high_actual = f"have {high['cal_err']:.1%} on n={high['n']}"
+            elif high:
+                high_pass = False
+                high_actual = (
+                    f"have n={high['n']}, need n>={min_high_n} "
+                    f"({high['cal_err']:.1%} cal err)"
+                )
+            else:
+                high_pass = False
+                high_actual = f"no HIGH trades yet (need n>={min_high_n})"
+
             criteria_checks = [
                 (f"Settled trades >= {min_n_req}",
                  overall["n"] >= min_n_req,
@@ -262,9 +280,9 @@ def compute_calibration(
                 ("PnL positive" if req_pnl else "(PnL not required)",
                  (overall["pnl"] > 0) if req_pnl else True,
                  f"have ${overall['pnl']:+.2f}"),
-                (f"HIGH cal err < {high_cap:.0%}",
-                 high_err is not None and high_err < high_cap,
-                 f"have {high_err:.1%} on n={high['n']}" if high else "no HIGH trades yet"),
+                (f"HIGH cal err < {high_cap:.0%} on n>={min_high_n}",
+                 high_pass,
+                 high_actual),
             ]
             all_pass = all(p for _, p, _ in criteria_checks)
 
