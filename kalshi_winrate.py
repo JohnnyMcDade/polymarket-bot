@@ -241,6 +241,166 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pace_estimate(
+    trades: list[dict[str, Any]],
+    since_iso: str | None,
+    target_n: int,
+) -> dict[str, Any]:
+    """Days remaining until trade count reaches target_n at the current pace.
+
+    Uses calendar days between `since_iso` (UTC midnight if bare date) and now.
+    Returns dict with keys: pace_per_day, days_remaining (None if pace<=0 and
+    threshold not yet met).
+    """
+    if not since_iso:
+        return {"pace_per_day": None, "days_remaining": None}
+    iso = since_iso if "T" in since_iso else f"{since_iso}T00:00:00+00:00"
+    try:
+        since_dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return {"pace_per_day": None, "days_remaining": None}
+    days = max((datetime.now(timezone.utc) - since_dt).total_seconds() / 86400.0, 1.0)
+    n = len(trades)
+    pace = n / days
+    if n >= target_n:
+        return {"pace_per_day": pace, "days_remaining": 0.0}
+    if pace <= 0:
+        return {"pace_per_day": 0.0, "days_remaining": None}
+    return {"pace_per_day": pace, "days_remaining": (target_n - n) / pace}
+
+
+def _last_n_pnl_path(trades: list[dict[str, Any]], k: int = 5) -> str:
+    """Cumulative PnL after each of the last k trades, chronological."""
+    if not trades:
+        return "—"
+    ordered = sorted(
+        trades,
+        key=lambda t: str(t.get("settled_at") or t.get("timestamp") or ""),
+    )
+    recent = ordered[-k:]
+    cum = 0.0
+    parts = []
+    for t in recent:
+        cum += float(t.get("pnl", 0))
+        sign = "+" if cum >= 0 else "−"
+        parts.append(f"{sign}${abs(cum):.0f}")
+    return " → ".join(parts)
+
+
+def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    n = r["n"]
+    since_iso = r.get("since_iso")
+    title_suffix = f" (since {since_iso})" if since_iso else ""
+
+    if n == 0 or not r.get("overall"):
+        return {
+            "title": f"📐 KALSHI CALIBRATION — daily{title_suffix}",
+            "color": 0x95A5A6,
+            "fields": [{
+                "name": "Status",
+                "value": (
+                    f"No settled trades in window "
+                    f"(filtered {r['n']} of {r['raw_n']})."
+                ),
+                "inline": False,
+            }],
+            "footer": {"text": f"PassivePoly Kalshi Calibration  •  {now_str}"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    overall = r["overall"]
+    checks = r["criteria_checks"]
+    passes = sum(1 for _, p, _ in checks if p)
+    total = len(checks) or 1
+    if r["all_pass"]:
+        color = 0x2ECC71
+    elif passes >= max(total // 2, 1):
+        color = 0xF39C12
+    else:
+        color = 0xE74C3C
+
+    high = r["conf"].get("HIGH")
+    high_str = f"{high['cal_err']:.1%} (n={high['n']})" if high else "— (no HIGH)"
+
+    series_ranked = sorted(r["series"].values(), key=lambda s: -s["pnl"])[:2]
+    if series_ranked:
+        series_str = "\n".join(
+            f"`{s['label']:<11}` {s['win_rate']:.0%} "
+            f"({s['wins']}W/{s['n'] - s['wins']}L) "
+            f"{_format_usd(s['pnl'])} cal_err={s['cal_err']:.0%}"
+            for s in series_ranked
+        )
+    else:
+        series_str = "—"
+
+    if checks:
+        crit_str = "\n".join(
+            f"{'✅' if passed else '❌'} {label} — {actual}"
+            for label, passed, actual in checks
+        )
+    else:
+        crit_str = "—"
+
+    target_n = int(((r.get("criteria") or {}).get("criteria") or {}).get("min_settled_trades", 50))
+    pace = _pace_estimate(r["trades"], since_iso, target_n)
+    if n >= target_n:
+        pace_str = f"N={target_n} threshold met ✓"
+    elif pace["pace_per_day"]:
+        pace_str = (
+            f"{pace['pace_per_day']:.1f} trades/day → "
+            f"~{pace['days_remaining']:.0f} days to N={target_n}"
+        )
+    else:
+        pace_str = "insufficient data"
+
+    path_str = _last_n_pnl_path(r["trades"], k=5)
+    verdict = "GO LIVE" if r["all_pass"] else "STAY PAPER"
+
+    fields = [
+        {"name": "🪟 Window",
+         "value": f"{n} of {r['raw_n']} settled",
+         "inline": True},
+        {"name": "🏆 Win Rate",
+         "value": f"{overall['win_rate']:.1%} ({overall['wins']}W/{n - overall['wins']}L)",
+         "inline": True},
+        {"name": "💰 PnL",
+         "value": _format_usd(overall["pnl"]),
+         "inline": True},
+        {"name": "📊 Brier",
+         "value": f"{r['brier']:.3f} (vs 0.25)",
+         "inline": True},
+        {"name": "📉 ECE",
+         "value": f"{r['ece']:.1%}",
+         "inline": True},
+        {"name": "🎯 HIGH cal err",
+         "value": high_str,
+         "inline": True},
+        {"name": f"🚦 Go-Live: {passes}/{total} → {verdict}",
+         "value": crit_str,
+         "inline": False},
+        {"name": "🥇 Best Series (by PnL)",
+         "value": series_str,
+         "inline": False},
+        {"name": "📅 Pace",
+         "value": pace_str,
+         "inline": False},
+        {"name": "📈 Cumulative PnL (last 5)",
+         "value": f"`{path_str}`",
+         "inline": False},
+    ]
+
+    return {
+        "title": f"📐 KALSHI CALIBRATION — daily{title_suffix}",
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"PassivePoly Kalshi Calibration  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def send_discord(embed: dict[str, Any]) -> None:
     if not WEBHOOK_KALSHI_WINRATE:
         print(embed)
@@ -280,6 +440,31 @@ def _do_report() -> None:
     except Exception as e:
         print(f"[WARN] winrate CSV append failed: {e}", flush=True)
     send_discord(_build_embed(stats))
+
+    # Calibration report (same channel, immediately after winrate).
+    # `since_date` from go_live_criteria.json windows the analysis to post-fix
+    # trades (default 2026-06-07 after the KALSHI_MAX_EDGE cap in 24ae529).
+    try:
+        from calibration import compute_calibration
+        cal = compute_calibration()
+        o = cal.get("overall")
+        passes = sum(1 for _, p, _ in cal["criteria_checks"] if p)
+        total = len(cal["criteria_checks"])
+        if o:
+            print(
+                f"[winrate] calibration: n={cal['n']}/{cal['raw_n']} "
+                f"win_rate={o['win_rate']:.1%} brier={cal['brier']:.3f} "
+                f"ece={cal['ece']:.1%} pass={passes}/{total}",
+                flush=True,
+            )
+        else:
+            print(f"[winrate] calibration: n=0 in window", flush=True)
+        send_discord(_build_calibration_embed(cal))
+    except Exception as e:
+        print(
+            f"[WARN] calibration report failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
 
 
 def run() -> None:

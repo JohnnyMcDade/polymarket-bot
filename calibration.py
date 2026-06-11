@@ -27,8 +27,8 @@ TRADES_LOG = os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json")
 CRITERIA = os.getenv("KALSHI_GO_LIVE_CRITERIA", "/app/data/go_live_criteria.json")
 
 
-def load_trades() -> list[dict[str, Any]]:
-    with open(TRADES_LOG) as f:
+def load_trades(path: str | None = None) -> list[dict[str, Any]]:
+    with open(path or TRADES_LOG) as f:
         raw = json.load(f)
     return [t for t in raw if t.get("outcome") in ("won", "lost")]
 
@@ -167,6 +167,128 @@ def fmt(s: dict[str, Any], label_key: str) -> dict[str, Any]:
     }
 
 
+def compute_calibration(
+    trades_log_path: str = TRADES_LOG,
+    criteria_path: str = CRITERIA,
+    cli_since: str | None = None,
+) -> dict[str, Any]:
+    """Compute the full calibration report as a structured dict.
+
+    Reads trades_log_path, applies the --since window (CLI flag wins over
+    `since_date` in the criteria file), and returns:
+      raw_n, n, since_iso, since_src, overall, conf, buckets, series,
+      brier, log_loss, ece, criteria (parsed JSON), criteria_checks, all_pass,
+      trades (the filtered list, for callers that want their own pass).
+    """
+    trades_log_path = str(trades_log_path)
+    criteria_path = str(criteria_path)
+
+    raw_trades = load_trades(trades_log_path)
+    raw_n = len(raw_trades)
+
+    since_iso, since_src = resolve_since(cli_since, criteria_path)
+    trades = filter_since(raw_trades, since_iso)
+    n = len(trades)
+
+    by_conf: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        by_conf[str(t.get("confidence") or "?")].append(t)
+    conf_summaries: dict[str, dict[str, Any]] = {}
+    for conf in ("HIGH", "MEDIUM", "LOW"):
+        s = summarize(conf, by_conf.get(conf, []))
+        if s:
+            conf_summaries[conf] = s
+
+    by_bucket: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        by_bucket[bucket_for(float(t["our_prob"]))].append(t)
+    bucket_summaries: dict[str, dict[str, Any]] = {}
+    for b in ("<0.5", "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"):
+        s = summarize(b, by_bucket.get(b, []))
+        if s:
+            bucket_summaries[b] = s
+
+    by_series: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        by_series[series_of(t.get("ticker", ""))].append(t)
+    series_summaries: dict[str, dict[str, Any]] = {}
+    for ser, items in by_series.items():
+        s = summarize(ser, items)
+        if s:
+            series_summaries[ser] = s
+
+    if n:
+        wins = sum(1 for t in trades if t["outcome"] == "won")
+        mean_pred = sum(float(t["our_prob"]) for t in trades) / n
+        total_pnl = sum(float(t["pnl"]) for t in trades)
+        overall = {
+            "label": "overall",
+            "n": n,
+            "wins": wins,
+            "win_rate": wins / n,
+            "mean_pred": mean_pred,
+            "cal_err": abs(mean_pred - wins / n),
+            "pnl": total_pnl,
+        }
+    else:
+        overall = None
+
+    crit_doc: dict[str, Any] = {}
+    criteria_checks: list[tuple[str, bool, str]] = []
+    all_pass = False
+    crit_path = Path(criteria_path)
+    if crit_path.exists():
+        try:
+            with open(crit_path) as f:
+                crit_doc = json.load(f)
+        except Exception as e:
+            print(f"[WARN] criteria file unreadable: {e}", flush=True)
+            crit_doc = {}
+        if overall and crit_doc:
+            c = crit_doc.get("criteria", {})
+            min_n_req = int(c.get("min_settled_trades", 50))
+            min_wr = float(c.get("min_win_rate", 0.55))
+            req_pnl = bool(c.get("require_pnl_positive", True))
+            high_cap = float(c.get("max_high_conf_cal_err", 0.15))
+            high = conf_summaries.get("HIGH")
+            high_err = high["cal_err"] if high else None
+            criteria_checks = [
+                (f"Settled trades >= {min_n_req}",
+                 overall["n"] >= min_n_req,
+                 f"have {overall['n']}"),
+                (f"Win rate >= {min_wr:.0%}",
+                 overall["win_rate"] >= min_wr,
+                 f"have {overall['win_rate']:.1%}"),
+                ("PnL positive" if req_pnl else "(PnL not required)",
+                 (overall["pnl"] > 0) if req_pnl else True,
+                 f"have ${overall['pnl']:+.2f}"),
+                (f"HIGH cal err < {high_cap:.0%}",
+                 high_err is not None and high_err < high_cap,
+                 f"have {high_err:.1%} on n={high['n']}" if high else "no HIGH trades yet"),
+            ]
+            all_pass = all(p for _, p, _ in criteria_checks)
+
+    return {
+        "trades_log_path": trades_log_path,
+        "criteria_path": criteria_path,
+        "raw_n": raw_n,
+        "n": n,
+        "since_iso": since_iso,
+        "since_src": since_src,
+        "trades": trades,
+        "overall": overall,
+        "conf": conf_summaries,
+        "buckets": bucket_summaries,
+        "series": series_summaries,
+        "brier": brier(trades) if n else float("nan"),
+        "log_loss": log_loss(trades) if n else float("nan"),
+        "ece": ece(bucket_summaries) if n else 0.0,
+        "criteria": crit_doc,
+        "criteria_checks": criteria_checks,
+        "all_pass": all_pass,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -179,118 +301,60 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    raw_trades = load_trades()
-    raw_n = len(raw_trades)
-    since_iso, since_src = resolve_since(args.since, CRITERIA)
-    trades = filter_since(raw_trades, since_iso)
-    n = len(trades)
+def _print_report(r: dict[str, Any]) -> None:
     print(f"\n=== Kalshi Bot Calibration Analysis ===")
-    print(f"Source : {TRADES_LOG}")
-    if since_iso:
-        print(f"Window : trades since {since_iso} ({since_src})")
-        print(f"Filtered: {n} of {raw_n} settled trades")
+    print(f"Source : {r['trades_log_path']}")
+    if r["since_iso"]:
+        print(f"Window : trades since {r['since_iso']} ({r['since_src']})")
+        print(f"Filtered: {r['n']} of {r['raw_n']} settled trades")
     else:
         print(f"Window : all settled trades")
-        print(f"Settled trades : {n}")
-    if n == 0:
+        print(f"Settled trades : {r['n']}")
+    if r["n"] == 0:
         print("No settled trades in window.")
-        return 0
+        return
 
-    # By confidence tier
     print("\n--- By confidence tier ---")
-    by_conf: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for t in trades:
-        by_conf[str(t.get("confidence") or "?")].append(t)
-    rows = []
-    conf_summaries: dict[str, dict[str, Any]] = {}
-    for conf in ("HIGH", "MEDIUM", "LOW"):
-        s = summarize(conf, by_conf.get(conf, []))
-        if s:
-            rows.append(fmt(s, "tier"))
-            conf_summaries[conf] = s
+    rows = [fmt(r["conf"][k], "tier") for k in ("HIGH", "MEDIUM", "LOW") if k in r["conf"]]
     render_table(rows, ["tier", "n", "wins", "win_rate", "mean_pred", "cal_err", "pnl"])
 
-    # By probability bucket
     print("\n--- By predicted probability bucket ---")
-    by_bucket: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for t in trades:
-        by_bucket[bucket_for(float(t["our_prob"]))].append(t)
-    rows = []
-    bucket_summaries: dict[str, dict[str, Any]] = {}
-    for b in ("<0.5", "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"):
-        s = summarize(b, by_bucket.get(b, []))
-        if s:
-            rows.append(fmt(s, "bucket"))
-            bucket_summaries[b] = s
+    bucket_order = ["<0.5", "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1.0"]
+    rows = [fmt(r["buckets"][b], "bucket") for b in bucket_order if b in r["buckets"]]
     render_table(rows, ["bucket", "n", "wins", "win_rate", "mean_pred", "cal_err", "pnl"])
-    print(f"\nECE (overall) : {ece(bucket_summaries):.1%}")
+    print(f"\nECE (overall) : {r['ece']:.1%}")
 
-    # By series
     print("\n--- By series ---")
-    by_series: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for t in trades:
-        by_series[series_of(t.get("ticker", ""))].append(t)
-    rows = []
-    for ser in sorted(by_series.keys()):
-        s = summarize(ser, by_series[ser])
-        if s:
-            rows.append(fmt(s, "series"))
+    rows = [fmt(r["series"][k], "series") for k in sorted(r["series"].keys())]
     render_table(rows, ["series", "n", "wins", "win_rate", "mean_pred", "cal_err", "pnl"])
 
-    # Overall scoring
+    o = r["overall"]
     print("\n--- Scoring metrics ---")
-    wins = sum(1 for t in trades if t["outcome"] == "won")
-    mean_pred = sum(float(t["our_prob"]) for t in trades) / n
-    print(f"Overall    : n={n}  wins={wins}  win_rate={wins/n:.1%}  mean_pred={mean_pred:.1%}  cal_err={abs(mean_pred - wins/n):.1%}")
-    print(f"Brier score: {brier(trades):.4f}   (0.25 = always-guess-50%, lower is better)")
-    print(f"Log loss   : {log_loss(trades):.4f}")
-    print(f"Total PnL  : ${sum(float(t['pnl']) for t in trades):+.2f}")
+    print(f"Overall    : n={o['n']}  wins={o['wins']}  win_rate={o['win_rate']:.1%}  "
+          f"mean_pred={o['mean_pred']:.1%}  cal_err={o['cal_err']:.1%}")
+    print(f"Brier score: {r['brier']:.4f}   (0.25 = always-guess-50%, lower is better)")
+    print(f"Log loss   : {r['log_loss']:.4f}")
+    print(f"Total PnL  : ${o['pnl']:+.2f}")
 
-    # Go-live criteria
     print("\n--- Pre-registered go-live criteria ---")
-    crit_path = Path(CRITERIA)
-    if not crit_path.exists():
-        print(f"(no criteria file at {CRITERIA})")
-        return 0
-    with open(crit_path) as f:
-        crit_doc = json.load(f)
-    c = crit_doc.get("criteria", {})
+    if not r["criteria"]:
+        print(f"(no criteria file at {r['criteria_path']})")
+        return
+    crit_doc = r["criteria"]
     print(f"Registered  : {crit_doc.get('registered_at_utc') or crit_doc.get('registered_at') or '?'}")
     print(f"Live bankroll on pass: ${crit_doc.get('live_bankroll_usd', '?')}")
-    print(f"Criteria    : {json.dumps(c)}")
+    print(f"Criteria    : {json.dumps(crit_doc.get('criteria', {}))}")
     print()
-
-    min_n = int(c.get("min_settled_trades", 50))
-    min_wr = float(c.get("min_win_rate", 0.55))
-    req_pnl = bool(c.get("require_pnl_positive", True))
-    high_cap = float(c.get("max_high_conf_cal_err", 0.15))
-
-    overall_wr = wins / n
-    overall_pnl = sum(float(t["pnl"]) for t in trades)
-    high = conf_summaries.get("HIGH")
-    high_err = high["cal_err"] if high else None
-
-    checks: list[tuple[str, bool, str]] = [
-        (f"1. Settled trades >= {min_n}",
-         n >= min_n,
-         f"have {n}"),
-        (f"2. Win rate >= {min_wr:.0%}",
-         overall_wr >= min_wr,
-         f"have {overall_wr:.1%}"),
-        (f"3. PnL positive" if req_pnl else "3. (PnL not required)",
-         (overall_pnl > 0) if req_pnl else True,
-         f"have ${overall_pnl:+.2f}"),
-        (f"4. HIGH cal err < {high_cap:.0%}",
-         high_err is not None and high_err < high_cap,
-         f"have {high_err:.1%} on n={high['n']}" if high else "no HIGH trades yet"),
-    ]
-    for label, passed, actual in checks:
+    for label, passed, actual in r["criteria_checks"]:
         mark = "PASS" if passed else "FAIL"
         print(f"  [{mark}] {label} -- {actual}")
-    all_pass = all(p for _, p, _ in checks)
-    print(f"\nVERDICT: {'GO LIVE' if all_pass else 'STAY PAPER'}")
+    print(f"\nVERDICT: {'GO LIVE' if r['all_pass'] else 'STAY PAPER'}")
+
+
+def main() -> int:
+    args = parse_args()
+    r = compute_calibration(cli_since=args.since)
+    _print_report(r)
     return 0
 
 
