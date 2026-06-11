@@ -36,6 +36,23 @@ WEBHOOK_KALSHI_WINRATE = os.getenv("WEBHOOK_KALSHI_WINRATE", "")
 WINRATE_HOUR = int(os.getenv("KALSHI_WINRATE_HOUR", "7"))
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 CSV_HISTORY_PATH = Path(os.getenv("KALSHI_WINRATE_CSV", "/app/data/winrate_history.csv"))
+
+# Auto-go-live: flip PAPER_TRADING=false via Railway API when all 4 calibration
+# criteria pass on N consecutive daily reports. Disabled by default — user must
+# set KALSHI_AUTO_LIVE_ENABLED=true on Railway to arm. `skipDeploys: true` is
+# used so the redeploy is a separate, manual step (the process running this
+# code is the one being redeployed; auto-redeploy would kill the Discord post
+# mid-flight).
+AUTO_LIVE_ENABLED = os.getenv("KALSHI_AUTO_LIVE_ENABLED", "false").lower() in ("1", "true", "yes")
+REQUIRED_CONSECUTIVE_PASSES = int(os.getenv("KALSHI_AUTO_LIVE_CONSECUTIVE", "2"))
+GO_LIVE_STATE_PATH = Path(os.getenv("KALSHI_GO_LIVE_STATE", "/app/data/go_live_state.json"))
+RAILWAY_API_URL = os.getenv("RAILWAY_API_URL", "https://backboard.railway.com/graphql/v2")
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
+RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID", "")
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "")
+RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID", "")
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
 CSV_FIELDS = [
     "date", "dimension", "key",
     "decided", "wins", "losses", "win_rate",
@@ -401,6 +418,333 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_go_live_state() -> dict[str, Any]:
+    if not GO_LIVE_STATE_PATH.exists():
+        return {
+            "consecutive_pass_count": 0,
+            "last_pass_date": None,
+            "last_report_date": None,
+            "is_live": False,
+            "live_flipped_at": None,
+            "trigger_snapshot": None,
+            "history": [],
+        }
+    try:
+        with GO_LIVE_STATE_PATH.open() as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[WARN] go_live_state unreadable: {e}", flush=True)
+        return {
+            "consecutive_pass_count": 0,
+            "last_pass_date": None,
+            "last_report_date": None,
+            "is_live": False,
+            "live_flipped_at": None,
+            "trigger_snapshot": None,
+            "history": [],
+        }
+
+
+def _save_go_live_state(state: dict[str, Any]) -> None:
+    GO_LIVE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with GO_LIVE_STATE_PATH.open("w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _railway_set_variable(name: str, value: str) -> tuple[bool, str]:
+    """Upsert a service-scoped Railway variable via GraphQL.
+
+    Uses `skipDeploys: true` so this does NOT auto-redeploy. The caller (or a
+    human reviewing the Discord notification) must redeploy for the new value
+    to take effect on the running container.
+
+    Returns (ok, message). On success message is "ok"; on failure it carries
+    the diagnostic to surface in logs.
+    """
+    if not RAILWAY_API_TOKEN:
+        return False, "RAILWAY_API_TOKEN not set"
+    if not (RAILWAY_PROJECT_ID and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID):
+        return False, "RAILWAY_PROJECT_ID / SERVICE_ID / ENVIRONMENT_ID not all set"
+    query = (
+        "mutation variableUpsert($input: VariableUpsertInput!) { "
+        "variableUpsert(input: $input) }"
+    )
+    payload = {
+        "query": query,
+        "variables": {
+            "input": {
+                "projectId": RAILWAY_PROJECT_ID,
+                "environmentId": RAILWAY_ENVIRONMENT_ID,
+                "serviceId": RAILWAY_SERVICE_ID,
+                "name": name,
+                "value": value,
+                "skipDeploys": True,
+            }
+        },
+    }
+    try:
+        r = requests.post(
+            RAILWAY_API_URL,
+            headers={
+                "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+    except Exception as e:
+        return False, f"request failed: {type(e).__name__}: {e}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        body = r.json()
+    except Exception as e:
+        return False, f"non-JSON response: {type(e).__name__}: {e}"
+    if body.get("errors"):
+        return False, f"GraphQL errors: {body['errors']}"
+    return True, "ok"
+
+
+def _send_pushover(title: str, message: str) -> bool:
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER_KEY):
+        return False
+    try:
+        r = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER_KEY,
+                "title": title,
+                "message": message,
+                "priority": 1,
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(f"[WARN] Pushover {r.status_code}: {r.text[:200]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"[WARN] Pushover send failed: {e}", flush=True)
+        return False
+
+
+def _build_going_live_embed(
+    cal: dict[str, Any], state: dict[str, Any], railway_ok: bool, railway_msg: str
+) -> dict[str, Any]:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    overall = cal["overall"]
+    n = cal["n"]
+    high = cal["conf"].get("HIGH")
+    high_str = f"{high['cal_err']:.1%} (n={high['n']})" if high else "—"
+
+    crit_lines = "\n".join(
+        f"✅ {label} — {actual}" for label, _, actual in cal["criteria_checks"]
+    )
+
+    bankroll = (cal.get("criteria") or {}).get("live_bankroll_usd", "?")
+
+    if railway_ok:
+        action_value = (
+            f"`PAPER_TRADING=false` set on Railway with `skipDeploys: true`.\n"
+            f"**Run `railway redeploy` to activate live trading** — the running "
+            f"container still has `PAPER_TRADING=true` until restart."
+        )
+    else:
+        action_value = (
+            f"⚠️ Railway variable update FAILED: {railway_msg}\n"
+            f"Flip `PAPER_TRADING=false` manually in the Railway dashboard, "
+            f"then redeploy."
+        )
+
+    return {
+        "title": "🚀 GOING LIVE — all 4 criteria passed!",
+        "color": 0x9B59B6,
+        "fields": [
+            {"name": "🏆 Stats that triggered it",
+             "value": (
+                 f"n={n}, win rate {overall['win_rate']:.1%} "
+                 f"({overall['wins']}W/{n - overall['wins']}L)\n"
+                 f"PnL {_format_usd(overall['pnl'])}, "
+                 f"Brier {cal['brier']:.3f}, ECE {cal['ece']:.1%}\n"
+                 f"HIGH cal err {high_str}"
+             ),
+             "inline": False},
+            {"name": "✅ Criteria", "value": crit_lines, "inline": False},
+            {"name": "💵 Live bankroll", "value": f"${bankroll}", "inline": True},
+            {"name": "📊 Consecutive passes",
+             "value": f"{state.get('consecutive_pass_count', '?')}",
+             "inline": True},
+            {"name": "🕒 Triggered at",
+             "value": state.get("live_flipped_at", now_str),
+             "inline": True},
+            {"name": "🎯 Action", "value": action_value, "inline": False},
+        ],
+        "footer": {"text": f"PassivePoly Auto-Live Trigger  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _check_auto_live(cal: dict[str, Any]) -> None:
+    """Daily auto-go-live evaluator. Called after the calibration report.
+
+    State machine (persisted at GO_LIVE_STATE_PATH):
+      - If already live: no-op.
+      - If cal has no trades in window: no-op (counter unchanged).
+      - On a fail: counter resets to 0.
+      - On a pass: counter += 1 if yesterday also passed, else counter = 1
+        (a missed report breaks the streak).
+      - When counter >= REQUIRED_CONSECUTIVE_PASSES and AUTO_LIVE_ENABLED:
+        call Railway API to set PAPER_TRADING=false (skipDeploys=true), post
+        the going-live Discord embed, send Pushover, mark state as live.
+
+    AUTO_LIVE_ENABLED=false short-circuits the flip but still tracks the
+    counter and logs `[AUTO-LIVE] would flip but disabled` so the user can
+    see the threshold was met in the logs before arming the feature.
+    """
+    state = _load_go_live_state()
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if state.get("is_live"):
+        print("[AUTO-LIVE] already live, skipping", flush=True)
+        return
+
+    if state.get("last_report_date") == today:
+        print(
+            f"[AUTO-LIVE] already processed today ({today}), skipping",
+            flush=True,
+        )
+        return
+
+    if not cal.get("overall"):
+        print(
+            "[AUTO-LIVE] no trades in window — counter unchanged",
+            flush=True,
+        )
+        state["last_report_date"] = today
+        _save_go_live_state(state)
+        return
+
+    passes = sum(1 for _, p, _ in cal["criteria_checks"] if p)
+    total = len(cal["criteria_checks"])
+    all_pass = bool(cal.get("all_pass"))
+
+    state.setdefault("history", []).append({
+        "date": today,
+        "all_pass": all_pass,
+        "passes": passes,
+        "total": total,
+        "n": cal["n"],
+        "win_rate": cal["overall"]["win_rate"],
+        "pnl": cal["overall"]["pnl"],
+        "brier": cal["brier"],
+        "ece": cal["ece"],
+    })
+    state["history"] = state["history"][-60:]
+    state["last_report_date"] = today
+
+    if not all_pass:
+        prior = state.get("consecutive_pass_count", 0)
+        state["consecutive_pass_count"] = 0
+        if prior:
+            print(
+                f"[AUTO-LIVE] criteria {passes}/{total} — counter reset "
+                f"(was {prior})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[AUTO-LIVE] criteria {passes}/{total} — no streak",
+                flush=True,
+            )
+        _save_go_live_state(state)
+        return
+
+    if state.get("last_pass_date") == yesterday:
+        state["consecutive_pass_count"] = state.get("consecutive_pass_count", 0) + 1
+    else:
+        if state.get("last_pass_date") not in (None, yesterday):
+            print(
+                f"[AUTO-LIVE] gap in streak — last pass was "
+                f"{state['last_pass_date']!r}, expected {yesterday!r}; "
+                f"restarting counter at 1",
+                flush=True,
+            )
+        state["consecutive_pass_count"] = 1
+    state["last_pass_date"] = today
+
+    count = state["consecutive_pass_count"]
+    if count < REQUIRED_CONSECUTIVE_PASSES:
+        print(
+            f"[AUTO-LIVE] criteria {passes}/{total} pass "
+            f"(consecutive={count}/{REQUIRED_CONSECUTIVE_PASSES}) — awaiting next",
+            flush=True,
+        )
+        _save_go_live_state(state)
+        return
+
+    print(
+        f"[AUTO-LIVE] criteria {passes}/{total} pass "
+        f"(consecutive={count}) — THRESHOLD MET",
+        flush=True,
+    )
+
+    if not AUTO_LIVE_ENABLED:
+        print(
+            "[AUTO-LIVE] KALSHI_AUTO_LIVE_ENABLED=false — would flip but disabled. "
+            "Set the env var to true on Railway to arm.",
+            flush=True,
+        )
+        _save_go_live_state(state)
+        return
+
+    railway_ok, railway_msg = _railway_set_variable("PAPER_TRADING", "false")
+    if railway_ok:
+        print(
+            "[AUTO-LIVE] PAPER_TRADING=false set via Railway API "
+            "(skipDeploys=true). Redeploy required to activate.",
+            flush=True,
+        )
+        state["is_live"] = True
+        state["live_flipped_at"] = now.isoformat()
+        state["trigger_snapshot"] = {
+            "n": cal["n"],
+            "win_rate": cal["overall"]["win_rate"],
+            "pnl": cal["overall"]["pnl"],
+            "brier": cal["brier"],
+            "ece": cal["ece"],
+            "checks": cal["criteria_checks"],
+        }
+    else:
+        print(
+            f"[AUTO-LIVE] Railway API call FAILED: {railway_msg}",
+            flush=True,
+        )
+    _save_go_live_state(state)
+
+    try:
+        send_discord(_build_going_live_embed(cal, state, railway_ok, railway_msg))
+    except Exception as e:
+        print(
+            f"[WARN] going-live Discord post failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+    pushover_title = (
+        "🚀 KALSHI BOT — GOING LIVE" if railway_ok
+        else "⚠️ KALSHI BOT — auto-live FAILED"
+    )
+    pushover_msg = (
+        f"All 4 go-live criteria passed for {count} consecutive days.\n"
+        f"n={cal['n']}, win rate {cal['overall']['win_rate']:.1%}, "
+        f"PnL ${cal['overall']['pnl']:+.2f}\n\n"
+        f"{'PAPER_TRADING set to false. Redeploy required to activate.' if railway_ok else f'Railway API failed: {railway_msg}. Flip manually.'}"
+    )
+    _send_pushover(pushover_title, pushover_msg)
+
+
 def send_discord(embed: dict[str, Any]) -> None:
     if not WEBHOOK_KALSHI_WINRATE:
         print(embed)
@@ -463,6 +807,17 @@ def _do_report() -> None:
     except Exception as e:
         print(
             f"[WARN] calibration report failed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return
+
+    # Auto-go-live evaluator. Walls itself off in try/except so a Railway API
+    # blip or state-file issue can never break the rest of the daily report.
+    try:
+        _check_auto_live(cal)
+    except Exception as e:
+        print(
+            f"[WARN] auto-live evaluator crashed: {type(e).__name__}: {e}",
             flush=True,
         )
 
