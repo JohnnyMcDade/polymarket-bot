@@ -99,6 +99,9 @@ def _is_cache_fresh() -> bool:
         if "upcoming_games" not in mlb:
             print("[stats] cache missing mlb.upcoming_games — treating as stale (schema upgrade)", flush=True)
             return False
+        if "bullpens" not in mlb:
+            print("[stats] cache missing mlb.bullpens — treating as stale (schema upgrade)", flush=True)
+            return False
         if not cache.get("economic"):
             print("[stats] cache missing economic block — treating as stale (schema upgrade)", flush=True)
             return False
@@ -436,6 +439,92 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
     return out
 
 
+def _fetch_team_bullpen(team_ids: set[int], meta: dict[int, dict]) -> dict[str, dict]:
+    """Per-team bullpen stats over the last 15 days. Returns
+    {team_abbr: {bullpen_era_15d, saves_15d, save_opportunities_15d,
+    save_conversion_15d, blown_saves_15d}}.
+
+    Aggregates from each team's active pitching roster, filtered to
+    appearances where gamesStarted == 0 (relief appearances only). That's
+    ~2 HTTP calls per team; we only call for teams playing in the
+    upcoming_games slate so cost is bounded by the day's schedule, not
+    the full 30-team league. statsapi's /teams/stats endpoint does NOT
+    expose a starter/relief split — this per-pitcher aggregation is the
+    cheapest path that's actually bullpen-only."""
+    today = datetime.now(ET).date()
+    start = (today - timedelta(days=15)).isoformat()
+    end = today.isoformat()
+    out: dict[str, dict] = {}
+    for tid in team_ids:
+        m = meta.get(tid)
+        if not m:
+            continue
+        roster_data = _http_get_json(
+            f"{_MLB_STATSAPI}/teams/{tid}/roster?rosterType=active&season=2026"
+        )
+        roster = (roster_data or {}).get("roster", []) or []
+        pids = [
+            p["person"]["id"] for p in roster
+            if (p.get("position") or {}).get("abbreviation") == "P"
+            and (p.get("person") or {}).get("id")
+        ]
+        if not pids:
+            continue
+        ids_csv = ",".join(str(p) for p in pids)
+        data = _http_get_json(
+            f"{_MLB_STATSAPI}/people?personIds={ids_csv}"
+            f"&hydrate=stats(type=byDateRange,startDate={start},endDate={end},group=pitching)"
+        )
+        rel_er = 0
+        rel_outs = 0
+        saves = save_opps = blown = 0
+        seen_pids: set[int] = set()
+        for p in (data or {}).get("people", []) or []:
+            pid = p.get("id")
+            # statsapi sometimes returns the same pitcher twice (AL + MLB
+            # league splits) — dedupe so we don't double-count outs.
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            for sg in p.get("stats", []) or []:
+                if (sg.get("group") or {}).get("displayName") != "pitching":
+                    continue
+                splits = sg.get("splits") or []
+                if not splits:
+                    continue
+                st = splits[0].get("stat", {}) or {}
+                try:
+                    gs = int(st.get("gamesStarted") or 0)
+                    gp = int(st.get("gamesPitched") or 0)
+                except (TypeError, ValueError):
+                    break
+                if gs > 0 or gp <= 0:
+                    break
+                try:
+                    rel_er += int(st.get("earnedRuns") or 0)
+                except (TypeError, ValueError):
+                    pass
+                ip_real = _parse_ip(st.get("inningsPitched"))
+                rel_outs += int(round(ip_real * 3))
+                try:
+                    saves += int(st.get("saves") or 0)
+                    save_opps += int(st.get("saveOpportunities") or 0)
+                    blown += int(st.get("blownSaves") or 0)
+                except (TypeError, ValueError):
+                    pass
+                break
+        bullpen_era = round(rel_er * 27.0 / rel_outs, 2) if rel_outs > 0 else None
+        save_conv = round(saves / save_opps, 3) if save_opps > 0 else None
+        out[m["abbr"]] = {
+            "bullpen_era_15d": bullpen_era,
+            "saves_15d": saves,
+            "save_opportunities_15d": save_opps,
+            "save_conversion_15d": save_conv,
+            "blown_saves_15d": blown,
+        }
+    return out
+
+
 def _fetch_mlb_leaders() -> dict[str, dict[str, list[dict]]]:
     """Top-10 leaderboards for hitting and pitching."""
     def one(cat: str, group: str) -> list[dict]:
@@ -487,6 +576,17 @@ def _fetch_mlb_block() -> dict[str, Any]:
         for g in _fetch_mlb_todays_games(d, meta):
             g["game_date"] = d
             upcoming.append(g)
+    # Bullpen stats only for teams actually on the upcoming slate — the
+    # /roster + /people calls cost ~2 HTTP requests per team, and we
+    # only ever score markets for those teams.
+    abbr_to_tid = {m["abbr"]: tid for tid, m in meta.items()}
+    playing_tids: set[int] = set()
+    for g in upcoming:
+        for side in ("away", "home"):
+            tid = abbr_to_tid.get(g.get(side, ""))
+            if tid:
+                playing_tids.add(tid)
+    bullpens = _fetch_team_bullpen(playing_tids, meta)
     return {
         "standings": _fetch_mlb_standings(meta),
         "hitting_leaders": leaders["hitting_leaders"],
@@ -494,6 +594,7 @@ def _fetch_mlb_block() -> dict[str, Any]:
         "notable_players": [],
         "team_scoring": _fetch_mlb_team_scoring(meta),
         "upcoming_games": upcoming,
+        "bullpens": bullpens,
     }
 
 
@@ -648,6 +749,7 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
     n_teams = len(mlb.get("standings", {}) or {})
     n_team_scoring = len(mlb.get("team_scoring", {}) or {})
     n_upcoming_games = len(mlb.get("upcoming_games", []) or [])
+    n_bullpens = len(mlb.get("bullpens", {}) or {})
     n_nba_results = len(nba.get("playoff_results", []) or [])
     n_nhl_results = len(nhl.get("playoff_results", []) or [])
     n_hitters = len((mlb.get("hitting_leaders", {}) or {}).get("hr", []) or [])
@@ -671,6 +773,7 @@ def _build_embed(stats: dict[str, Any]) -> dict[str, Any]:
             {"name": "MLB HR leaders", "value": str(n_hitters), "inline": True},
             {"name": "Team scoring", "value": str(n_team_scoring), "inline": True},
             {"name": "Upcoming games", "value": str(n_upcoming_games), "inline": True},
+            {"name": "Bullpens (15d)", "value": str(n_bullpens), "inline": True},
             {"name": "NBA playoff results", "value": str(n_nba_results), "inline": True},
             {"name": "NHL playoff results", "value": str(n_nhl_results), "inline": True},
             {"name": "NBA round", "value": nba.get("current_round", "?"), "inline": True},
