@@ -40,7 +40,7 @@ from kalshi_auth import KALSHI_BASE_URL, get_auth_headers
 
 WEBHOOK_KALSHI_EDGE = os.getenv("WEBHOOK_KALSHI_EDGE", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-sonnet-4-6")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-haiku-4-5-20251001")
 CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
 # Sanity ceiling on claimed edge. >25% edge on liquid Kalshi markets is
