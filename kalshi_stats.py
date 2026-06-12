@@ -205,43 +205,76 @@ def _parse_ip(s: Any) -> float:
     return whole + tenths / 3.0
 
 
-def _fetch_pitcher_rolling_era(pitcher_ids: set[int], window: int = 3) -> dict[int, float | None]:
-    """For each pitcher id, fetch gameLog and compute IP-weighted ERA over
-    the last `window` starts: (sum_ER * 9) / sum_IP. Returns None for
-    pitchers with fewer than `window` prior starts so callers can decide
-    whether to skip or fall back. ~one HTTP call per pitcher; called from
-    the daily stats refresh so cost is bounded."""
-    out: dict[int, float | None] = {}
+def _fetch_pitcher_gamelogs(pitcher_ids: set[int]) -> dict[int, list[dict]]:
+    """For each pitcher id, fetch gameLog and return ordered list of
+    starts: [{date, ip, er, runs, hits, walks, opp_id}, ...] sorted asc.
+    One HTTP call per pitcher; called from the daily stats refresh so
+    cost is bounded. Used to derive rolling ERA AND head-to-head stats
+    against the day's opponent — fetching the log once and reusing it."""
+    out: dict[int, list[dict]] = {}
     for pid in pitcher_ids:
         data = _http_get_json(
             f"{_MLB_STATSAPI}/people/{pid}/stats"
             f"?stats=gameLog&season=2026&group=pitching&sportId=1"
         )
-        if not data:
-            out[pid] = None
-            continue
-        entries: list[tuple[str, float, int]] = []
-        for sb in data.get("stats", []):
+        entries: list[dict] = []
+        for sb in (data or {}).get("stats", []):
             for sp in sb.get("splits", []):
                 d = sp.get("date")
                 stat = sp.get("stat", {}) or {}
+                opp = sp.get("opponent", {}) or {}
                 ip_str = stat.get("inningsPitched")
                 er = stat.get("earnedRuns")
                 if not d or ip_str is None or er is None:
                     continue
                 try:
-                    entries.append((d, _parse_ip(ip_str), int(er)))
+                    entries.append({
+                        "date": d,
+                        "ip": _parse_ip(ip_str),
+                        "er": int(er),
+                        "runs": int(stat.get("runs") or er),
+                        "hits": int(stat.get("hits") or 0),
+                        "walks": int(stat.get("baseOnBalls") or 0),
+                        "opp_id": opp.get("id"),
+                    })
                 except (TypeError, ValueError):
                     continue
-        entries.sort(key=lambda e: e[0])
-        if len(entries) < window:
-            out[pid] = None
-            continue
-        recent = entries[-window:]
-        total_ip = sum(e[1] for e in recent)
-        total_er = sum(e[2] for e in recent)
-        out[pid] = (total_er * 9.0) / total_ip if total_ip > 0 else None
+        entries.sort(key=lambda e: e["date"])
+        out[pid] = entries
     return out
+
+
+def _rolling_era_last(entries: list[dict], window: int = 3) -> float | None:
+    """IP-weighted ERA across the last `window` starts. None if fewer."""
+    if len(entries) < window:
+        return None
+    recent = entries[-window:]
+    total_ip = sum(e["ip"] for e in recent)
+    total_er = sum(e["er"] for e in recent)
+    return round((total_er * 9.0) / total_ip, 2) if total_ip > 0 else None
+
+
+def _h2h_vs_opponent(entries: list[dict], opp_id: int | None) -> dict | None:
+    """ERA / WHIP / avg-runs-last-3 against a specific opponent team id.
+    Returns None when there are no prior starts vs that opponent so the
+    edge agent treats absence as 'no signal' rather than zero."""
+    if not opp_id:
+        return None
+    vs = [e for e in entries if e.get("opp_id") == opp_id]
+    if not vs:
+        return None
+    total_ip = sum(e["ip"] for e in vs)
+    total_er = sum(e["er"] for e in vs)
+    total_h = sum(e["hits"] for e in vs)
+    total_bb = sum(e["walks"] for e in vs)
+    last3 = vs[-3:]
+    avg_runs_last3 = sum(e["runs"] for e in last3) / len(last3)
+    return {
+        "starts": len(vs),
+        "era_vs": round((total_er * 9.0) / total_ip, 2) if total_ip > 0 else None,
+        "whip_vs": round((total_h + total_bb) / total_ip, 3) if total_ip > 0 else None,
+        "avg_runs_last3_vs": round(avg_runs_last3, 2),
+    }
 
 
 def _fetch_mlb_teams_meta() -> dict[int, dict[str, str]]:
@@ -362,8 +395,9 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
 
     # Rolling last-3-starts ERA per starter — backtest showed this is a
     # materially sharper signal than season cumulative ERA. One gameLog
-    # call per pitcher; ~30 pitchers per refresh, ~9s added latency.
-    rolling_era = _fetch_pitcher_rolling_era(pitcher_ids)
+    # call per pitcher; ~30 pitchers per refresh, ~9s added latency. The
+    # same gameLog feed also drives the new vs-opponent H2H stats below.
+    gamelogs = _fetch_pitcher_gamelogs(pitcher_ids)
 
     out: list[dict] = []
     for g in games_raw:
@@ -372,24 +406,30 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
         home_team = (teams.get("home", {}) or {}).get("team", {}) or {}
         away_abbr = away_team.get("abbreviation") or meta.get(away_team.get("id"), {}).get("abbr", "")
         home_abbr = home_team.get("abbreviation") or meta.get(home_team.get("id"), {}).get("abbr", "")
+        away_tid = away_team.get("id")
+        home_tid = home_team.get("id")
         try:
             start_t = datetime.fromisoformat(g.get("gameDate", "").replace("Z", "+00:00")).strftime("%H:%M")
         except (TypeError, ValueError):
             start_t = "?"
         ap = (teams.get("away", {}) or {}).get("probablePitcher") or {}
         hp = (teams.get("home", {}) or {}).get("probablePitcher") or {}
+        ap_log = gamelogs.get(ap.get("id"), [])
+        hp_log = gamelogs.get(hp.get("id"), [])
         out.append({
             "away": away_abbr,
             "home": home_abbr,
             "start_time_utc": start_t,
             "away_pitcher": {
                 "player": ap.get("fullName", ""),
-                "rolling_era_last3": rolling_era.get(ap.get("id")),
+                "rolling_era_last3": _rolling_era_last(ap_log),
+                "vs_opponent": _h2h_vs_opponent(ap_log, home_tid),
                 **(pitcher_stats.get(ap.get("id")) or {"era": None, "whip": None}),
             },
             "home_pitcher": {
                 "player": hp.get("fullName", ""),
-                "rolling_era_last3": rolling_era.get(hp.get("id")),
+                "rolling_era_last3": _rolling_era_last(hp_log),
+                "vs_opponent": _h2h_vs_opponent(hp_log, away_tid),
                 **(pitcher_stats.get(hp.get("id")) or {"era": None, "whip": None}),
             },
         })
