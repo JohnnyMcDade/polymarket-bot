@@ -107,10 +107,9 @@ PRICE_HISTORY_MAX_AGE_SECS = int(os.getenv("KALSHI_PRICE_HISTORY_MAX_AGE", "8640
 SERIES_TICKERS = [
     s.strip() for s in os.getenv(
         "KALSHI_EDGE_SERIES",
-        # KXMLBGAME and KXAAAGASD disabled temporarily — negative PnL.
-        # Focus on KXMLBTOTAL and KXMLBSPREAD which have real positive PnL.
-        "KXMLBTOTAL,KXMLBSPREAD,KXNHLGAME,KXATPMATCH,KXWTAMATCH,"
-        "KXNBAGAME,KXCPI,KXFED,KXBTC",
+        # Only KXMLBTOTAL and KXMLBSPREAD have real positive PnL —
+        # all other series disabled temporarily.
+        "KXMLBTOTAL,KXMLBSPREAD",
     ).split(",") if s.strip()
 ]
 
