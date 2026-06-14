@@ -160,6 +160,52 @@ def _is_today_utc(timestamp_iso: str, today: datetime) -> bool:
     return dt.date() == today.date()
 
 
+# Per-series daily caps. Different from _correlation_collision — this
+# rejects further trades on a specific series once N have been placed
+# today, regardless of whether individual events / entities collide.
+# Motivated by 2026-06-14 EOD: a 4-trade KXMLBTEAMTOTAL cluster all
+# resolved as losses; even with the cohort filter, repeated bets in
+# one series during a single day amplify single-day P&L variance.
+# KXMLBTOTAL is the series we'd most want exposure on (only positive-EV
+# MLB cohort in the recent 30-day backtest), so cap at 2 — keeps a
+# diversified slate without all-in on one prediction loop. Tennis series
+# (KXATPMATCH / KXWTAMATCH) are deliberately excluded — independent
+# matches, independent prediction inputs, no series-cluster risk.
+SERIES_DAILY_CAPS: dict[str, int] = {
+    "KXMLBTOTAL": int(os.getenv("KALSHI_KXMLBTOTAL_DAILY_CAP", "2")),
+}
+
+
+def _series_daily_cap_collision(ticker: str) -> str | None:
+    """Return a reject_reason if a per-series daily cap is exhausted,
+    else None. Counts today's trades whose ticker starts with the
+    capped prefix and whose outcome is not 'rejected' (queued, pending,
+    or settled all count — only pre-placement rejections are free).
+    """
+    series = next(
+        (p for p in SERIES_DAILY_CAPS if ticker.startswith(p)),
+        None,
+    )
+    if series is None:
+        return None
+    today = datetime.now(timezone.utc)
+    cap = SERIES_DAILY_CAPS[series]
+    with _log_lock:
+        entries = _load_log()
+    count = sum(
+        1 for e in entries
+        if (e.get("ticker") or "").startswith(series)
+        and e.get("outcome") not in (None, "rejected")
+        and _is_today_utc(e.get("timestamp", ""), today)
+    )
+    if count >= cap:
+        return (
+            f"daily cap on {series} hit "
+            f"({count}/{cap} already placed today UTC)"
+        )
+    return None
+
+
 def _correlation_collision(ticker: str, entities: list[str]) -> str | None:
     """Return a reject_reason if this trade collides with one we already
     placed today (same ticker, same event, or any shared entity);
@@ -512,6 +558,15 @@ def run() -> None:
                         print(
                             f"[trader] reject {ticker}: correlation — "
                             f"{correlation_reject}",
+                            flush=True,
+                        )
+                        rejected += 1
+                        continue
+
+                    series_cap_reject = _series_daily_cap_collision(ticker)
+                    if series_cap_reject:
+                        print(
+                            f"[CORR-GUARD] {ticker} skip: {series_cap_reject}",
                             flush=True,
                         )
                         rejected += 1
