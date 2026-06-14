@@ -630,7 +630,12 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         f"(window: {MIN_SECS_TO_CLOSE//60}min–{MAX_SECS_TO_CLOSE//3600}h)",
         flush=True,
     )
-    return kept
+    # Merge timing_drops under a `timing_` prefix so the funnel line has a
+    # single flat drops dict without key collisions.
+    combined_drops = dict(drops)
+    for k, v in timing_drops.items():
+        combined_drops[f"timing_{k}"] = v
+    return kept, combined_drops
 
 
 # ─── Claude call ────────────────────────────────────────────────────────
@@ -1434,8 +1439,22 @@ def run() -> None:
                     f"[edge] cycle={cycle} fetched {len(markets)} open markets",
                     flush=True,
                 )
-                candidates = _filter_markets(markets, stats, seen, price_history)
+                candidates, pre_drops = _filter_markets(
+                    markets, stats, seen, price_history
+                )
                 _save_price_history(price_history)
+
+                # Funnel counters — populated at every SKIP / demote /
+                # promote site below, then dumped in one [CYCLE-FUNNEL]
+                # line at cycle end. Lets you grep one line per cycle to
+                # see which gate did what, instead of cross-referencing
+                # 8 different log patterns.
+                post_drops: dict[str, int] = {}
+                demoted: dict[str, int] = {}
+                reached_claude = 0
+                parsed = 0
+                approved = 0
+                skipped = 0
 
                 if not candidates:
                     print(
@@ -1445,10 +1464,9 @@ def run() -> None:
                     )
                 else:
                     system_prompt = _build_system_prompt(stats)
-                    approved = 0
-                    skipped = 0
                     for start in range(0, len(candidates), BATCH_SIZE):
                         batch = candidates[start : start + BATCH_SIZE]
+                        reached_claude += len(batch)
                         preds = _ask_claude(system_prompt, batch, stats, log_raw=(start == 0))
                         for it in batch:
                             ticker = it["ticker"]
@@ -1456,9 +1474,13 @@ def run() -> None:
                             pred = preds.get(ticker)
                             if not pred:
                                 skipped += 1
+                                post_drops["no_prediction"] = (
+                                    post_drops.get("no_prediction", 0) + 1
+                                )
                                 if DEBUG_LOG:
                                     print(f"[edge-debug] {ticker} no prediction parsed", flush=True)
                                 continue
+                            parsed += 1
                             if DEBUG_LOG:
                                 print(
                                     f"[edge-debug] {ticker} rec={pred['recommendation']} "
@@ -1487,6 +1509,9 @@ def run() -> None:
                                 if sig:
                                     old_conf = pred["confidence"]
                                     pred["confidence"] = _CONFIDENCE_LADDER[old_conf]
+                                    demoted["whale_boost"] = (
+                                        demoted.get("whale_boost", 0) + 1
+                                    )
                                     age = time.time() - sig["ts"]
                                     pred["reasoning"] = (
                                         f"[whale-boost {old_conf}->{pred['confidence']}] "
@@ -1511,6 +1536,9 @@ def run() -> None:
                                 )
                                 pred["edge"] = MAX_EDGE
                                 pred["recommendation"] = "SKIP"
+                                post_drops["max_edge_cap"] = (
+                                    post_drops.get("max_edge_cap", 0) + 1
+                                )
                             # Backtest-validated cohort cap for KXMLBTOTAL /
                             # KXMLBTEAMTOTAL. 180-day backtest showed real
                             # lift over the trivial baseline only when the
@@ -1529,6 +1557,9 @@ def run() -> None:
                                 )
                                 if not cohort_ok:
                                     pred["confidence"] = "MEDIUM"
+                                    demoted["backtest_filter"] = (
+                                        demoted.get("backtest_filter", 0) + 1
+                                    )
                                     pred["reasoning"] = (
                                         "[backtest-filter HIGH->MEDIUM] "
                                         + pred.get("reasoning", "")
@@ -1572,6 +1603,9 @@ def run() -> None:
                                         )
                                     else:
                                         pred["confidence"] = "HIGH"
+                                        demoted["backtest_boost"] = (
+                                            demoted.get("backtest_boost", 0) + 1
+                                        )
                                         pred["reasoning"] = (
                                             "[backtest-boost MEDIUM->HIGH] "
                                             + pred.get("reasoning", "")
@@ -1599,6 +1633,9 @@ def run() -> None:
                                 demoting, reason = _check_recalibration_demote()
                                 if demoting:
                                     pred["confidence"] = "MEDIUM"
+                                    demoted["recalib_demote"] = (
+                                        demoted.get("recalib_demote", 0) + 1
+                                    )
                                     pred["reasoning"] = (
                                         f"[recalib-demote HIGH->MEDIUM {reason}] "
                                         + pred.get("reasoning", "")
@@ -1628,6 +1665,15 @@ def run() -> None:
                                 ok, reason = _tennis_filter_passes(it, pred, stats)
                                 if not ok:
                                     pred["recommendation"] = "SKIP"
+                                    # Bucket grass-specialist SKIPs separately
+                                    # from generic tennis-filter SKIPs so the
+                                    # funnel surfaces which one is doing the work.
+                                    bucket = (
+                                        "tennis_grass_filter"
+                                        if "grass" in reason.lower()
+                                        else "tennis_filter"
+                                    )
+                                    post_drops[bucket] = post_drops.get(bucket, 0) + 1
                                     pred["reasoning"] = (
                                         f"[tennis-filter SKIP] {reason} | "
                                         + pred.get("reasoning", "")
@@ -1654,6 +1700,17 @@ def run() -> None:
                                 high_ok or medium_ok
                             ):
                                 skipped += 1
+                                # Distinguish "Claude voted SKIP" from "Claude
+                                # voted BUY but tier-edge floor wasn't cleared"
+                                # — different signals, different fixes.
+                                if pred["recommendation"] != "BUY":
+                                    post_drops["claude_skip"] = (
+                                        post_drops.get("claude_skip", 0) + 1
+                                    )
+                                else:
+                                    post_drops["low_edge"] = (
+                                        post_drops.get("low_edge", 0) + 1
+                                    )
                                 continue
                             approved += 1
                             payload = {
@@ -1676,12 +1733,45 @@ def run() -> None:
                             }
                             kalshi_queue.enqueue("risk", ticker, payload)
                             send_discord(_build_embed(it, pred))
-                    _save_seen(seen)
-                    print(
-                        f"[edge] cycle={cycle} done: approved={approved} "
-                        f"skipped={skipped}",
-                        flush=True,
-                    )
+                _save_seen(seen)
+                print(
+                    f"[edge] cycle={cycle} done: approved={approved} "
+                    f"skipped={skipped}",
+                    flush=True,
+                )
+                # ─── Cycle funnel summary ──────────────────────────────
+                # One structured line per cycle so you can grep one
+                # pattern and see exactly which gate dropped what.
+                # Sums:
+                #   fetched   = total markets pulled from Kalshi
+                #   kept      = passed pre-Claude filter
+                #   parsed    = Claude returned a parseable verdict
+                #   approved  = made it to the queue
+                # Drops (true rejections) are in `drops={...}`; demotions
+                # / promotions (confidence-tier changes that did NOT drop
+                # the trade) are in `demoted={...}` so you can see filter
+                # activity even on markets that ultimately approved.
+                pre_drop_total = sum(pre_drops.values())
+                fetched_total = len(candidates) + pre_drop_total
+                drops_str = ",".join(
+                    f"{k}:{v}" for k, v in sorted(pre_drops.items()) if v
+                )
+                post_drops_str = ",".join(
+                    f"{k}:{v}" for k, v in sorted(post_drops.items()) if v
+                )
+                demoted_str = ",".join(
+                    f"{k}:{v}" for k, v in sorted(demoted.items()) if v
+                )
+                print(
+                    f"[CYCLE-FUNNEL] cycle={cycle} "
+                    f"fetched={fetched_total} kept={len(candidates)} "
+                    f"reached_claude={reached_claude} parsed={parsed} "
+                    f"approved={approved} skipped={skipped} "
+                    f"pre_drops={{{drops_str}}} "
+                    f"post_drops={{{post_drops_str}}} "
+                    f"demoted={{{demoted_str}}}",
+                    flush=True,
+                )
         except Exception as e:
             # Print the full traceback so we can pinpoint where the cycle
             # died — bare str(e) was hiding the real cause (e.g. naive vs
