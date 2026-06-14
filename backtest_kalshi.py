@@ -605,6 +605,451 @@ def report(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
     print("=" * 78)
 
 
+# ============================================================================
+# TOTALS / TEAM-TOTALS BACKTEST (extension)
+# ============================================================================
+# Two new Kalshi series:
+#   - KXMLBTOTAL: combined-runs OVER/UNDER for the full game
+#   - KXMLBTEAMTOTAL: single-team runs OVER/UNDER (one ticker per team)
+#
+# Feature set differs from the winner predictor:
+#   - Target = home_score + away_score (totals) or single-team score
+#   - Predictor combines team rs_per_game / ra_per_game (derived directly
+#     from the schedule, leak-free to as_of_date) with both starters'
+#     rolling ERAs (reused from the existing gamelog cache)
+#   - Threshold × edge-δ sweep: for each candidate line T and edge δ,
+#     bet OVER if predicted >= T+δ, UNDER if <= T-δ, else SKIP
+#
+# Limitation honestly stated: no bullpen-ERA feature in v1. The production
+# edge prompt uses bullpens[abbr].bullpen_era_15d which would need per-team
+# per-as-of-date statsapi pulls (~5400 calls for 180 days × 30 teams).
+# Documented in the report footer as the next improvement.
+
+TOTAL_LINES = (7.5, 8.5, 9.5, 10.5, 11.5)
+TEAM_TOTAL_LINES = (2.5, 3.5, 4.5, 5.5)
+EDGE_DELTAS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+HOME_BAT_BOOST_RUNS = 0.3
+LEAGUE_AVG_ERA = 4.0       # neutral anchor for ERA adjustments
+PITCHER_RUN_WEIGHT = 0.25  # runs shaved per ERA-point above neutral, per pitcher
+OPP_PITCHER_RUN_WEIGHT = 0.4  # team-total: own runs shaved per ERA-point of opposing starter
+
+
+def derive_team_run_stats(
+    games: list[Game], as_of_date: str
+) -> dict[int, dict[str, float]]:
+    """Each team's runs scored / runs allowed per game over the season
+    SO FAR (games whose date < as_of_date). Pure schedule arithmetic —
+    no extra API, leak-free."""
+    agg: dict[int, dict[str, float]] = {}
+    for g in games:
+        if g.date >= as_of_date:
+            continue
+        for tid, rs, ra in (
+            (g.home_team_id, g.home_score, g.away_score),
+            (g.away_team_id, g.away_score, g.home_score),
+        ):
+            d = agg.setdefault(tid, {"rs": 0, "ra": 0, "n": 0})
+            d["rs"] += rs
+            d["ra"] += ra
+            d["n"] += 1
+    return {
+        tid: {
+            "rs_per_game": d["rs"] / d["n"],
+            "ra_per_game": d["ra"] / d["n"],
+            "games": d["n"],
+        }
+        for tid, d in agg.items()
+        if d["n"] > 0
+    }
+
+
+def predict_total(
+    game: Game,
+    home_era: float | None,
+    away_era: float | None,
+    team_stats: dict[int, dict[str, float]],
+) -> float | None:
+    """Predicted combined runs. Average of (own RS, opp RA) for each side,
+    plus +0.3 home-batting boost, shaded by both starters' ERA delta
+    from league average. Returns None if any input missing."""
+    home = team_stats.get(game.home_team_id)
+    away = team_stats.get(game.away_team_id)
+    if not home or not away or home_era is None or away_era is None:
+        return None
+    home_exp = (home["rs_per_game"] + away["ra_per_game"]) / 2.0
+    away_exp = (away["rs_per_game"] + home["ra_per_game"]) / 2.0
+    base_total = home_exp + away_exp + HOME_BAT_BOOST_RUNS
+    starter_adj = (
+        (home_era - LEAGUE_AVG_ERA) + (away_era - LEAGUE_AVG_ERA)
+    ) * PITCHER_RUN_WEIGHT
+    return base_total + starter_adj
+
+
+def predict_team_total(
+    game: Game,
+    side: str,
+    home_era: float | None,
+    away_era: float | None,
+    team_stats: dict[int, dict[str, float]],
+) -> float | None:
+    """Predicted runs for one team. Own rs_per_game + opp ra_per_game
+    averaged, +0.3 if home, shaded by opposing starter's ERA delta from
+    league average. Returns None if any input missing."""
+    if side == "home":
+        own_tid, opp_tid, opp_era = game.home_team_id, game.away_team_id, away_era
+    elif side == "away":
+        own_tid, opp_tid, opp_era = game.away_team_id, game.home_team_id, home_era
+    else:
+        return None
+    own = team_stats.get(own_tid)
+    opp = team_stats.get(opp_tid)
+    if not own or not opp or opp_era is None:
+        return None
+    base = (own["rs_per_game"] + opp["ra_per_game"]) / 2.0
+    if side == "home":
+        base += HOME_BAT_BOOST_RUNS
+    starter_adj = (opp_era - LEAGUE_AVG_ERA) * OPP_PITCHER_RUN_WEIGHT
+    return base + starter_adj
+
+
+def run_total_backtest(
+    games: list[Game],
+    gamelogs_by_pid: dict[int, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rows: list[dict[str, Any]] = []
+    skipped = {"no_pitcher_data": 0, "no_team_stats": 0}
+    team_stats_cache: dict[str, dict[int, dict[str, float]]] = {}
+    for g in games:
+        as_of = _prev_day(g.date)
+        if as_of not in team_stats_cache:
+            team_stats_cache[as_of] = derive_team_run_stats(games, as_of)
+        team_stats = team_stats_cache[as_of]
+        home_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.home_pitcher_id, []), as_of)
+            if g.home_pitcher_id else None
+        )
+        away_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.away_pitcher_id, []), as_of)
+            if g.away_pitcher_id else None
+        )
+        if home_era is None or away_era is None:
+            skipped["no_pitcher_data"] += 1
+            continue
+        predicted = predict_total(g, home_era, away_era, team_stats)
+        if predicted is None:
+            skipped["no_team_stats"] += 1
+            continue
+        rows.append({
+            "date": g.date,
+            "home_team": g.home_team,
+            "away_team": g.away_team,
+            "predicted_total": predicted,
+            "actual_total": g.home_score + g.away_score,
+            "home_era": home_era,
+            "away_era": away_era,
+            "starter_avg_era": (home_era + away_era) / 2.0,
+        })
+    return rows, skipped
+
+
+def run_team_total_backtest(
+    games: list[Game],
+    gamelogs_by_pid: dict[int, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rows: list[dict[str, Any]] = []
+    skipped = {"no_pitcher_data": 0, "no_team_stats": 0}
+    team_stats_cache: dict[str, dict[int, dict[str, float]]] = {}
+    for g in games:
+        as_of = _prev_day(g.date)
+        if as_of not in team_stats_cache:
+            team_stats_cache[as_of] = derive_team_run_stats(games, as_of)
+        team_stats = team_stats_cache[as_of]
+        home_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.home_pitcher_id, []), as_of)
+            if g.home_pitcher_id else None
+        )
+        away_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.away_pitcher_id, []), as_of)
+            if g.away_pitcher_id else None
+        )
+        if home_era is None or away_era is None:
+            skipped["no_pitcher_data"] += 2
+            continue
+        for side, actual, opp_era in (
+            ("home", g.home_score, away_era),
+            ("away", g.away_score, home_era),
+        ):
+            predicted = predict_team_total(g, side, home_era, away_era, team_stats)
+            if predicted is None:
+                skipped["no_team_stats"] += 1
+                continue
+            rows.append({
+                "date": g.date,
+                "team": g.home_team if side == "home" else g.away_team,
+                "side": side,
+                "predicted_runs": predicted,
+                "actual_runs": actual,
+                "opp_era": opp_era,
+            })
+    return rows, skipped
+
+
+def _sweep_at_line(
+    rows: list[dict[str, Any]],
+    line_T: float,
+    delta: float,
+    pred_key: str,
+    actual_key: str,
+) -> tuple[int, int, int]:
+    """Bet OVER if predicted >= T+δ, UNDER if predicted <= T-δ, else SKIP.
+    Return (wins, losses, skipped). Lines are half-integer so ties never
+    occur in real game scores; we still guard with `==` to be safe."""
+    wins = losses = skipped = 0
+    for r in rows:
+        p = r[pred_key]
+        a = r[actual_key]
+        if a == line_T:
+            continue
+        if p >= line_T + delta:
+            bet_over = True
+        elif p <= line_T - delta:
+            bet_over = False
+        else:
+            skipped += 1
+            continue
+        actual_over = a > line_T
+        if bet_over == actual_over:
+            wins += 1
+        else:
+            losses += 1
+    return wins, losses, skipped
+
+
+def _report_totals_like(
+    rows: list[dict[str, Any]],
+    skipped: dict[str, int],
+    series_name: str,
+    pred_key: str,
+    actual_key: str,
+    lines: tuple[float, ...],
+    cohort_field: str,
+    cohort_label: str,
+    default_line: float,
+    default_delta: float,
+) -> None:
+    """Shared report scaffold for KXMLBTOTAL and KXMLBTEAMTOTAL — only
+    the threshold list, prediction field, and cohort dimension differ."""
+    print("=" * 78)
+    print(f"{series_name} BACKTEST — {len(rows)} simulated bets pre-filter")
+    print("=" * 78)
+    print("Skipped:", skipped)
+    if not rows:
+        print("\nNo rows — try expanding --days or rebuilding the pitcher cache.")
+        return
+
+    preds = [r[pred_key] for r in rows]
+    actuals = [r[actual_key] for r in rows]
+    print(
+        f"\nPrediction calibration: mean_pred={sum(preds)/len(preds):.2f}  "
+        f"mean_actual={sum(actuals)/len(actuals):.2f}  "
+        f"(if mean_pred is systematically off, edit the weight constants)"
+    )
+
+    # ─── Naive baseline per line ───────────────────────────────────────
+    # Critical sanity check: at a non-market-balanced line (e.g. 11.5 on
+    # MLB totals), simply ALWAYS betting one side wins ~70% of the time
+    # because that's how the run-total distribution sits. Our predictor
+    # only adds value if it beats this baseline — Kalshi prices already
+    # reflect the baseline, so we earn no edge from rediscovering it.
+    print("\n--- Naive baselines (no prediction, just always bet one side) ---")
+    baselines: dict[float, tuple[float, float]] = {}
+    for T in lines:
+        over_w = sum(1 for a in actuals if a > T)
+        under_w = sum(1 for a in actuals if a < T)
+        n_total = sum(1 for a in actuals if a != T)
+        if n_total == 0:
+            continue
+        over_wr = over_w / n_total
+        under_wr = under_w / n_total
+        baselines[T] = (over_wr, under_wr)
+        better = max(over_wr, under_wr)
+        side = "OVER" if over_wr >= under_wr else "UNDER"
+        print(
+            f"  line={T:<5.1f}  always-OVER={over_wr:>5.1%}  "
+            f"always-UNDER={under_wr:>5.1%}  best-trivial={better:>5.1%} ({side})"
+        )
+    print(
+        "  Your predictor MUST beat best-trivial at each line to earn any edge"
+    )
+    print("  vs a Kalshi market that already reflects the run distribution.")
+
+    print(f"\n--- Win-rate sweep: line × edge-δ (vs trivial-baseline lift) ---")
+    print(f"{'line ↓ / δ →':>14}  " + "  ".join(f"δ={d:<4.2f}" for d in EDGE_DELTAS))
+    print("  (cell = our win-rate; ★ = beats best-trivial baseline at that line by >=2%)")
+    found: list[tuple[float, float, int, int, float, float, float]] = []
+    for T in lines:
+        baseline_best = max(baselines.get(T, (0.5, 0.5)))
+        cells_wr: list[tuple[float, int, bool]] = []
+        for d in EDGE_DELTAS:
+            w, l, _ = _sweep_at_line(rows, T, d, pred_key, actual_key)
+            n = w + l
+            wr = (w / n) if n else 0.0
+            beats = (n >= 15 and wr >= baseline_best + 0.02)
+            cells_wr.append((wr, n, beats))
+            if beats and wr >= 0.55:
+                wlo = _wilson_lower(w, n)
+                found.append((wlo, wr, w, n, T, d, baseline_best))
+        wr_row = "  ".join(
+            f"{wr:>5.1%}{'★' if beats else ' '}"
+            for (wr, n, beats) in cells_wr
+        )
+        n_row = "  ".join(f"n={n:<5}" for (wr, n, _) in cells_wr)
+        print(
+            f"  T={T:<5.1f}base={baseline_best:>4.0%}  {wr_row}"
+        )
+        print(f"  {' ' * 18}{n_row}")
+
+    print(
+        "\n--- Stable combos (Wilson 95% lower bound > best-trivial baseline) ---"
+    )
+    print("  These are the only rows that represent real predictive signal.")
+    stable = [x for x in found if x[0] > x[6]]  # wilson_lo > baseline_best
+    if not stable:
+        print("  (none — at every line, the predictor's Wilson 95% lower bound")
+        print("   sits at or below the trivial 'always one side' baseline. This")
+        print("   means we have NO statistically-supported edge in this window.)")
+    else:
+        for wlo, wr, w, n, T, d, base in sorted(stable, reverse=True)[:12]:
+            lift = wr - base
+            print(
+                f"  line={T:<5.1f} δ={d:<4.2f} n={n:>4} win_rate={wr:>5.1%} "
+                f"baseline={base:>5.1%} lift={lift:+5.1%} wilson_lo={wlo:>5.1%}"
+            )
+
+    print(
+        f"\n--- {cohort_label} cohort at line={default_line}, δ={default_delta} ---"
+    )
+    cohort_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if cohort_field == "starter_avg_era":
+            key = era_tier(r["starter_avg_era"])
+        elif cohort_field == "opp_era":
+            key = era_tier(r["opp_era"])
+        elif cohort_field == "side":
+            key = r["side"]
+        else:
+            key = "all"
+        cohort_groups[key].append(r)
+    for key in ("elite", "good", "average", "below_avg", "bad", "unknown",
+                "home", "away"):
+        subset = cohort_groups.get(key)
+        if not subset:
+            continue
+        w, l, _ = _sweep_at_line(
+            subset, default_line, default_delta, pred_key, actual_key
+        )
+        n = w + l
+        if n == 0:
+            continue
+        wr = w / n
+        wlo = _wilson_lower(w, n)
+        marker = " ★" if n >= 15 and wr >= 0.55 else ""
+        print(
+            f"  {key:<10}  n={n:>4}  win_rate={wr:>5.1%}  "
+            f"({w}W/{l}L)  wilson_lo={wlo:>5.1%}{marker}"
+        )
+
+    print("\n--- Optimal threshold (highest LIFT over baseline, n >= 30) ---")
+    print("  Lift = (our win_rate − best-trivial baseline at that line).")
+    print("  Positive lift is the only thing that matters — high raw win-rate")
+    print("  on a low/high line is just rediscovering the run distribution.")
+    best: tuple[float, float, int, int, float, float, float] | None = None
+    for T in lines:
+        base = max(baselines.get(T, (0.5, 0.5)))
+        for d in EDGE_DELTAS:
+            w, l, _ = _sweep_at_line(rows, T, d, pred_key, actual_key)
+            n = w + l
+            if n < 30:
+                continue
+            wr = w / n
+            lift = wr - base
+            wlo = _wilson_lower(w, n)
+            if best is None or lift > best[0]:
+                best = (lift, wr, w, n, T, d, wlo)
+    if best is None:
+        print("  (no cell with n >= 30 — expand --days)")
+    else:
+        lift, wr, w, n, T, d, wlo = best
+        if lift >= 0.02 and wlo > max(baselines.get(T, (0.5, 0.5))):
+            verdict = "REAL SIGNAL"
+        elif lift >= 0.02:
+            verdict = "LIFT PRESENT BUT NOT STATISTICALLY ROBUST"
+        else:
+            verdict = "NO LIFT — predictor adds nothing the market can't price"
+        print(
+            f"  line={T}  δ={d}  n={n}  win_rate={wr:.1%}  "
+            f"lift={lift:+.1%}  wilson_lo={wlo:.1%}  → {verdict}"
+        )
+
+    print("\nCaveats:")
+    print("  - No bullpen-ERA feature in v1 (production prompt uses 15-day")
+    print("    bullpen ERA + save_conv). Adding it would need ~5400 cached")
+    print("    /teams/<id>/stats pulls; defer until v1 numbers justify it.")
+    print("  - No market-price data → directional accuracy only.")
+    print("  - PITCHER_RUN_WEIGHT, OPP_PITCHER_RUN_WEIGHT, LEAGUE_AVG_ERA")
+    print("    are first-pass guesses — calibrate against mean_actual then")
+    print("    re-run.")
+    print("=" * 78)
+
+
+def report_total(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
+    _report_totals_like(
+        rows,
+        skipped,
+        series_name="KXMLBTOTAL",
+        pred_key="predicted_total",
+        actual_key="actual_total",
+        lines=TOTAL_LINES,
+        cohort_field="starter_avg_era",
+        cohort_label="By starter-avg-ERA tier (both starters averaged)",
+        default_line=9.5,
+        default_delta=0.5,
+    )
+
+
+def report_team_total(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
+    _report_totals_like(
+        rows,
+        skipped,
+        series_name="KXMLBTEAMTOTAL",
+        pred_key="predicted_runs",
+        actual_key="actual_runs",
+        lines=TEAM_TOTAL_LINES,
+        cohort_field="opp_era",
+        cohort_label="By opposing-starter ERA tier",
+        default_line=4.5,
+        default_delta=0.5,
+    )
+    # Extra: home vs away breakdown — KXMLBTEAMTOTAL has a clear home/away
+    # asymmetry (home batting boost) that's worth surfacing separately.
+    print("\n--- KXMLBTEAMTOTAL home vs away batting (line=4.5, δ=0.5) ---")
+    for side in ("home", "away"):
+        subset = [r for r in rows if r["side"] == side]
+        w, l, _ = _sweep_at_line(subset, 4.5, 0.5, "predicted_runs", "actual_runs")
+        n = w + l
+        if n == 0:
+            print(f"  {side:<5}: empty")
+            continue
+        wr = w / n
+        wlo = _wilson_lower(w, n)
+        marker = " ★" if n >= 15 and wr >= 0.55 else ""
+        print(
+            f"  {side:<5}  n={n:>4}  win_rate={wr:>5.1%}  ({w}W/{l}L)  "
+            f"wilson_lo={wlo:>5.1%}{marker}"
+        )
+    print("=" * 78)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -615,6 +1060,13 @@ def main() -> None:
     parser.add_argument("--start", type=str, default=None, help="YYYY-MM-DD; overrides --days when paired with --end")
     parser.add_argument("--end", type=str, default=None, help="YYYY-MM-DD; overrides --days when paired with --start")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--mode",
+        choices=("winner", "total", "team-total", "all"),
+        default="winner",
+        help="winner (default, original game-winner backtest), total "
+             "(KXMLBTOTAL), team-total (KXMLBTEAMTOTAL), or all three.",
+    )
     args = parser.parse_args()
 
     if args.no_cache and CACHE_DIR.exists():
@@ -633,19 +1085,6 @@ def main() -> None:
     games = fetch_schedule(start.isoformat(), end.isoformat())
     print(f"  {len(games)} finished games loaded")
 
-    as_of_dates = sorted({_prev_day(g.date) for g in games})
-    print(
-        f"Fetching as-of standings for {len(as_of_dates)} unique game dates "
-        f"(season {args.season}, cached on disk)...",
-        flush=True,
-    )
-    standings_by_date: dict[str, dict[int, dict[str, Any]]] = {}
-    for i, d in enumerate(as_of_dates, 1):
-        standings_by_date[d] = fetch_team_records_as_of(args.season, d)
-        if i % 15 == 0:
-            print(f"  {i}/{len(as_of_dates)}...", flush=True)
-    print(f"  done ({sum(1 for v in standings_by_date.values() if v)} dates with data)")
-
     pitcher_ids = {
         pid for g in games
         for pid in (g.home_pitcher_id, g.away_pitcher_id)
@@ -663,9 +1102,34 @@ def main() -> None:
     with_data = sum(1 for v in gamelogs_by_pid.values() if v)
     print(f"  done ({with_data} pitchers with gameLog entries)")
 
-    rows, skipped = run_backtest_as_of(games, gamelogs_by_pid, standings_by_date)
-    print()
-    report(rows, skipped)
+    if args.mode in ("winner", "all"):
+        as_of_dates = sorted({_prev_day(g.date) for g in games})
+        print(
+            f"\nFetching as-of standings for {len(as_of_dates)} unique game dates "
+            f"(season {args.season}, cached on disk)...",
+            flush=True,
+        )
+        standings_by_date: dict[str, dict[int, dict[str, Any]]] = {}
+        for i, d in enumerate(as_of_dates, 1):
+            standings_by_date[d] = fetch_team_records_as_of(args.season, d)
+            if i % 15 == 0:
+                print(f"  {i}/{len(as_of_dates)}...", flush=True)
+        print(f"  done ({sum(1 for v in standings_by_date.values() if v)} dates with data)")
+        rows, skipped = run_backtest_as_of(games, gamelogs_by_pid, standings_by_date)
+        print()
+        report(rows, skipped)
+
+    if args.mode in ("total", "all"):
+        print("\nRunning KXMLBTOTAL backtest...", flush=True)
+        rows_t, skipped_t = run_total_backtest(games, gamelogs_by_pid)
+        print()
+        report_total(rows_t, skipped_t)
+
+    if args.mode in ("team-total", "all"):
+        print("\nRunning KXMLBTEAMTOTAL backtest...", flush=True)
+        rows_tt, skipped_tt = run_team_total_backtest(games, gamelogs_by_pid)
+        print()
+        report_team_total(rows_tt, skipped_tt)
 
 
 if __name__ == "__main__":
