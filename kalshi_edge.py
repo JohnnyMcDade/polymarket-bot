@@ -107,9 +107,9 @@ PRICE_HISTORY_MAX_AGE_SECS = int(os.getenv("KALSHI_PRICE_HISTORY_MAX_AGE", "8640
 SERIES_TICKERS = [
     s.strip() for s in os.getenv(
         "KALSHI_EDGE_SERIES",
-        # Only KXMLBTOTAL and KXMLBSPREAD have real positive PnL —
+        # Only KXMLBTOTAL, KXMLBSPREAD, and KXMLBTEAMTOTAL are active —
         # all other series disabled temporarily.
-        "KXMLBTOTAL,KXMLBSPREAD",
+        "KXMLBTOTAL,KXMLBSPREAD,KXMLBTEAMTOTAL",
     ).split(",") if s.strip()
 ]
 
@@ -545,7 +545,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 _METHODOLOGY = f"""You are a Kalshi prediction-market edge finder. For each market in the user message, estimate the TRUE probability of YES using the STATS CONTEXT block in this system prompt.
 
 The STATS CONTEXT block has two halves:
-- SPORTS STATS — team scoring, pitcher ERA/WHIP, standings, leaders, and an mlb.upcoming_games list of matchups tagged with `game_date` (YYYY-MM-DD, US Eastern) and probable pitchers. Each probable pitcher entry also carries `rolling_era_last3` (IP-weighted ERA over his last 3 starts) and `vs_opponent` — head-to-head stats versus today's opposing team: `{{starts, era_vs, whip_vs, avg_runs_last3_vs}}`. `vs_opponent` is null when the starter has no prior appearances against this opponent. `mlb.bullpens` is a `{{team_abbr: {{bullpen_era_15d, saves_15d, save_opportunities_15d, save_conversion_15d, blown_saves_15d}}}}` map covering only the teams in upcoming_games — use it for KXMLBGAME and KXMLBTOTAL markets. For tennis, `tennis.atp_rankings` / `tennis.wta_rankings` carry the current top-ranked players, and `tennis.atp_recent` / `tennis.wta_recent` carry the last ~10 days of completed match results (winner, loser, score, event). Use these for MLB / NHL / NBA / ATP / WTA markets.
+- SPORTS STATS — team scoring, pitcher ERA/WHIP, standings, leaders, and an mlb.upcoming_games list of matchups tagged with `game_date` (YYYY-MM-DD, US Eastern) and probable pitchers. Each probable pitcher entry also carries `rolling_era_last3` (IP-weighted ERA over his last 3 starts) and `vs_opponent` — head-to-head stats versus today's opposing team: `{{starts, era_vs, whip_vs, avg_runs_last3_vs}}`. `vs_opponent` is null when the starter has no prior appearances against this opponent. `mlb.bullpens` is a `{{team_abbr: {{bullpen_era_15d, saves_15d, save_opportunities_15d, save_conversion_15d, blown_saves_15d}}}}` map covering only the teams in upcoming_games — use it for KXMLBGAME, KXMLBTOTAL, and KXMLBTEAMTOTAL markets. For tennis, `tennis.atp_rankings` / `tennis.wta_rankings` carry the current top-ranked players, and `tennis.atp_recent` / `tennis.wta_recent` carry the last ~10 days of completed match results (winner, loser, score, event). Use these for MLB / NHL / NBA / ATP / WTA markets.
 - ECONOMIC DATA — current national gas price, latest CPI, Fed funds target + next FOMC meeting expectations, BTC spot. Use these for KXAAAGASD / KXCPI / KXFED / KXBTC markets, combined with your own knowledge of macro trends, central-bank reaction functions, and recent price action.
 
 EDGE = true_probability - market_implied_probability  (market price in cents / 100)
@@ -607,6 +607,15 @@ MLB PITCHER VS OPPONENT (HEAD-TO-HEAD)
 - When `vs_opponent.avg_runs_last3_vs >= 5.0` OR `era_vs >= 6.00` across `starts >= 2`, the H2H signal points AGAINST the pitcher's team. Do not BUY YES on the pitcher's team in that case unless season ERA + rolling_era_last3 both clearly dominate the opponent's bats.
 - For KXMLBTOTAL markets, weight `avg_runs_last3_vs` and `era_vs` from BOTH starters jointly — two pitchers with low H2H runs allowed argues UNDER, two with high argues OVER.
 - `vs_opponent: null` means no prior matchup — do NOT treat absence as a positive or negative signal.
+
+MLB TEAM TOTAL (KXMLBTEAMTOTAL) — BATTING TEAM RUN PROJECTION
+- KXMLBTEAMTOTAL resolves on ONE team's total runs hitting a threshold (e.g. KXMLBTEAMTOTAL-26JUN141215MIAPIT-PIT5 → "Will PIT score 5+?"). The ticker tail is `<batting_team_abbr><threshold>`. Score only the BATTING team's run-scoring ability — opponent runs do not resolve this market.
+- Anchor: `team_scoring[batting_abbr].rs_per_game` against the opposing team's `bullpens[opposing_abbr].bullpen_era_15d`. High rs_per_game versus a high opposing bullpen ERA argues OVER; low rs_per_game versus a low opposing bullpen ERA argues UNDER.
+- Opposing pitcher adjustment: factor in the OPPOSING probable starter's season ERA and WHIP. Shade DOWN when ERA < 3.50 AND WHIP < 1.20; shade UP when ERA > 4.50 OR WHIP > 1.40.
+- Home-team boost: add +0.3 expected runs when the batting team is the home team (the trailing abbr in the matchup code).
+- ELITE STARTER FLAG (BEARISH FOR TEAM TOTAL): if the opposing probable starter has `rolling_era_last3 < 2.50`, treat OVER on the batting team as bearish — an in-form elite arm compresses run scoring sharply. Drop one confidence tier (HIGH→MEDIUM, MEDIUM→SKIP) on any BUY YES tied to an OVER threshold against such a starter.
+- Edge threshold matches KXMLBTOTAL — only the global +0.25 sanity cap applies; there is no series-specific ceiling.
+- If `team_scoring[batting_abbr]` is missing rs_per_game, or the opposing probable starter is missing from the matched upcoming_games entry, SKIP.
 
 TENNIS MATCH WINNER (KXATPMATCH / KXWTAMATCH) RULES
 - Both players named in the title must appear in `tennis.atp_rankings` (or `tennis.wta_rankings`) — match against the surname in `player`. If only one is ranked, set RECOMMENDATION: SKIP.
