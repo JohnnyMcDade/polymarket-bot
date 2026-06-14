@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +39,11 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.10"))
 MIN_BET_USD = float(os.getenv("KALSHI_MIN_BET_USD", "5"))
 MIN_CONTRACTS = int(os.getenv("KALSHI_MIN_CONTRACTS", "1"))
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
+DAILY_SPENT_PATH = Path(os.getenv("KALSHI_DAILY_SPENT", "/app/data/daily_spent.json"))
 
-# Daily-spend tracking. Resets at UTC midnight.
+# Daily-spend tracking. Resets at UTC midnight. Persisted to disk so the
+# cap survives container restarts — without persistence, every redeploy
+# zeroes the budget and a noisy deploy day can multiply the effective cap.
 _daily_spent = 0.0
 _last_reset = datetime.now(timezone.utc).date()
 
@@ -64,7 +67,39 @@ def _check_daily_reset() -> None:
     if today > _last_reset:
         _daily_spent = 0.0
         _last_reset = today
+        _save_daily_spent()
         print("[trader] daily spend reset", flush=True)
+
+
+def _load_daily_spent() -> tuple[date, float]:
+    """Return (date, spent) from /app/data/daily_spent.json. If the file is
+    missing, malformed, or its date doesn't match today (UTC), return
+    (today, 0.0) so a new UTC day starts the cap clean."""
+    today = datetime.now(timezone.utc).date()
+    if not DAILY_SPENT_PATH.exists():
+        return today, 0.0
+    try:
+        with DAILY_SPENT_PATH.open() as f:
+            data = json.load(f)
+        saved_date = date.fromisoformat(str(data.get("date", "")))
+        spent = float(data.get("spent", 0.0))
+    except Exception as e:
+        print(f"[WARN] daily_spent unreadable: {e} — resetting", flush=True)
+        return today, 0.0
+    if saved_date != today:
+        return today, 0.0
+    return saved_date, spent
+
+
+def _save_daily_spent() -> None:
+    DAILY_SPENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DAILY_SPENT_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(
+            {"date": _last_reset.isoformat(), "spent": round(_daily_spent, 2)},
+            f,
+        )
+    tmp.replace(DAILY_SPENT_PATH)
 
 
 # ─── Trades log ────────────────────────────────────────────────────────
@@ -428,11 +463,13 @@ def send_discord(embed: dict[str, Any]) -> None:
 # ─── Main loop ─────────────────────────────────────────────────────────
 
 def run() -> None:
-    global _daily_spent
+    global _daily_spent, _last_reset
+    _last_reset, _daily_spent = _load_daily_spent()
     mode = "PAPER TRADING" if PAPER_TRADING else "LIVE TRADING"
     print(
         f"Kalshi Trader Agent starting — {mode}, bankroll={_format_usd(BANKROLL)}, "
-        f"max_bet={MAX_BET_PCT:.0%}, interval={CHECK_INTERVAL}s"
+        f"max_bet={MAX_BET_PCT:.0%}, interval={CHECK_INTERVAL}s, "
+        f"daily_spent={_format_usd(_daily_spent)} (restored from {DAILY_SPENT_PATH.name})"
     )
     last_settlement_check = 0.0
 
@@ -509,6 +546,7 @@ def run() -> None:
                     send_discord(_placement_embed(entry, placed=placed, error=error))
                     if placed:
                         _daily_spent += bet_size
+                        _save_daily_spent()
                         executed += 1
                     else:
                         failed += 1
