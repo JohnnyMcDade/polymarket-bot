@@ -40,6 +40,9 @@ MIN_BET_USD = float(os.getenv("KALSHI_MIN_BET_USD", "5"))
 MIN_CONTRACTS = int(os.getenv("KALSHI_MIN_CONTRACTS", "1"))
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 DAILY_SPENT_PATH = Path(os.getenv("KALSHI_DAILY_SPENT", "/app/data/daily_spent.json"))
+CALIBRATION_RUNNING_PATH = Path(os.getenv(
+    "KALSHI_CALIBRATION_RUNNING", "/app/data/calibration_running.json"
+))
 
 # Daily-spend tracking. Resets at UTC midnight. Persisted to disk so the
 # cap survives container restarts — without persistence, every redeploy
@@ -382,6 +385,100 @@ def _compute_pnl(entry: dict[str, Any], winning_side: str) -> float:
     return round(-bet_size, 2)
 
 
+_SERIES_PREFIXES = (
+    "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
+    "KXATPMATCH", "KXWTAMATCH", "KXBTC", "KXAAAGASD",
+    "KXNHL", "KXNBA",
+)
+
+
+def _series_of_ticker(ticker: str) -> str:
+    """Map a Kalshi ticker to its series prefix for calibration bucketing.
+    Returns 'other' for anything not in _SERIES_PREFIXES."""
+    for p in _SERIES_PREFIXES:
+        if ticker.startswith(p):
+            return p
+    return "other"
+
+
+def _update_calibration_running(trades: list[dict]) -> None:
+    """Recompute per-series + per-confidence calibration stats from every
+    settled trade and persist to /app/data/calibration_running.json.
+
+    Stats per bucket:
+      n          — settled trade count
+      wins       — count won
+      win_rate   — wins / n
+      mean_pred  — average of our_prob (the model's claimed probability)
+      cal_err_pp — (mean_pred - win_rate) * 100, the calibration gap in
+                   percentage points; positive = overconfident
+      brier      — mean of (our_prob - outcome)^2 where outcome ∈ {0,1};
+                   lower is better; random=0.25
+      pnl        — sum of realized PnL
+
+    Recompute-from-scratch (vs incremental update) keeps the file
+    correct even if late-arriving outcomes shuffle the trade list.
+    Cheap: O(n) once per settlement sweep."""
+    def _stats(rows: list[dict]) -> dict | None:
+        usable = [
+            t for t in rows
+            if isinstance(t.get("our_prob"), (int, float))
+            and t.get("outcome") in ("won", "lost")
+        ]
+        if not usable:
+            return None
+        n = len(usable)
+        wins = sum(1 for t in usable if t["outcome"] == "won")
+        sum_pred = sum(float(t["our_prob"]) for t in usable)
+        sum_brier = sum(
+            (float(t["our_prob"]) - (1.0 if t["outcome"] == "won" else 0.0)) ** 2
+            for t in usable
+        )
+        pnl = sum(float(t.get("pnl") or 0) for t in usable)
+        mean_pred = sum_pred / n
+        win_rate = wins / n
+        return {
+            "n": n,
+            "wins": wins,
+            "win_rate": round(win_rate, 4),
+            "mean_pred": round(mean_pred, 4),
+            "cal_err_pp": round((mean_pred - win_rate) * 100, 2),
+            "brier": round(sum_brier / n, 4),
+            "pnl": round(pnl, 2),
+        }
+
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    if not settled:
+        return
+
+    by_series: dict[str, list[dict]] = {}
+    for t in settled:
+        s = _series_of_ticker(t.get("ticker", ""))
+        by_series.setdefault(s, []).append(t)
+    by_conf: dict[str, list[dict]] = {}
+    for t in settled:
+        c = t.get("confidence", "?") or "?"
+        by_conf.setdefault(c, []).append(t)
+
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "overall": _stats(settled),
+        "by_series": {k: _stats(v) for k, v in by_series.items()},
+        "by_confidence": {k: _stats(v) for k, v in by_conf.items()},
+    }
+    try:
+        CALIBRATION_RUNNING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CALIBRATION_RUNNING_PATH.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(payload, f, indent=2)
+        tmp.replace(CALIBRATION_RUNNING_PATH)
+    except Exception as e:
+        print(
+            f"[WARN] calibration_running write failed: {e}",
+            flush=True,
+        )
+
+
 def _check_settlements() -> None:
     with _log_lock:
         entries = _load_log()
@@ -409,6 +506,19 @@ def _check_settlements() -> None:
         entry["pnl"] = _compute_pnl(entry, resolved)
         entry["settled_at"] = datetime.now(timezone.utc).isoformat()
         entry["resolved_side"] = resolved
+        # Per-trade Brier: (our_prob − outcome)^2, outcome ∈ {0, 1}.
+        # Lower is better; random = 0.25. Logged immediately so settlement-
+        # time calibration is visible without parsing the JSON file.
+        our_prob = entry.get("our_prob")
+        if isinstance(our_prob, (int, float)):
+            brier = (float(our_prob) - (1.0 if won else 0.0)) ** 2
+            entry["brier"] = round(brier, 4)
+            print(
+                f"[BRIER] {ticker} our_prob={our_prob:.2f} outcome="
+                f"{'WON' if won else 'LOST'} brier={brier:.3f} "
+                f"conf={entry.get('confidence', '?')}",
+                flush=True,
+            )
         updated += 1
         send_discord(_settlement_embed(entry))
         # Tiny pause to be polite to the API
@@ -427,6 +537,11 @@ def _check_settlements() -> None:
                         current[j] = e
                         break
             _save_log(current)
+        # Recompute and persist running calibration from all settled
+        # trades — per-series + per-confidence Brier, calibration error,
+        # win-rate, P&L. Read by scripts/calibration_live.py and any
+        # downstream dashboards.
+        _update_calibration_running(current)
         print(f"[trader] settled {updated} trades", flush=True)
 
 
