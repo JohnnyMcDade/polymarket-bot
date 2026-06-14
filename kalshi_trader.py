@@ -442,6 +442,15 @@ def run() -> None:
 
         try:
             items = kalshi_queue.drain_fresh("risk")
+            # Highest-edge first: the daily-loss cap and per-side budgets
+            # bind mid-cycle, so without this ordering a $5 trade with +0.05
+            # edge could eat the budget that a +0.20 edge trade needs. Sort
+            # is stable, so ties fall back to enqueue order.
+            items = sorted(
+                items,
+                key=lambda it: float(it.get("edge") or 0),
+                reverse=True,
+            )
             executed = failed = rejected = 0
             for item in items:
                 try:
