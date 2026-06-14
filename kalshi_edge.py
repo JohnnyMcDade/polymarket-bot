@@ -43,10 +43,15 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-haiku-4-5-20251001")
 CHECK_INTERVAL = int(os.getenv("KALSHI_EDGE_INTERVAL", "1800"))   # 30 min
 MIN_EDGE = float(os.getenv("KALSHI_MIN_EDGE", "0.10"))             # 10%
-# Sanity ceiling on claimed edge. >25% edge on liquid Kalshi markets is
+# Sanity ceiling on claimed edge. >18% edge on liquid Kalshi markets is
 # almost always Claude misreading the market (wrong bucket, in-progress
 # game it can't see, etc.) — clamp the recorded edge and force SKIP.
-MAX_EDGE = float(os.getenv("KALSHI_MAX_EDGE", "0.25"))             # 25%
+# Lowered from 25% to 18% on 2026-06-14 after the 7-day calibration
+# showed mean_pred=62% vs actual win_rate=29% (ECE 33%) — the model is
+# systematically overconfident, and a tighter cap kills the worst
+# offenders without affecting genuine edges (real edges on liquid
+# Kalshi markets cluster well below 18%).
+MAX_EDGE = float(os.getenv("KALSHI_MAX_EDGE", "0.18"))             # 18%
 # Tiered BUY gate: HIGH confidence trades at MIN_EDGE, MEDIUM only at the
 # higher MEDIUM_MIN_EDGE. The extra edge buffer on MEDIUM compensates
 # for the model's admitted uncertainty — without it, every borderline
@@ -603,8 +608,8 @@ REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
 
 EDGE SANITY CAP (GLOBAL OVERRIDE — APPLIES TO EVERY MARKET)
-- Real edge on liquid Kalshi markets almost never exceeds 25%. If you computed an edge of +0.25 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
-- When this happens, set RECOMMENDATION: SKIP and CONFIDENCE: LOW. Do not BUY at +25% claimed edge regardless of how obvious the reasoning feels.
+- Real edge on liquid Kalshi markets almost never exceeds 18%. If you computed an edge of +0.18 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
+- When this happens, set RECOMMENDATION: SKIP and CONFIDENCE: LOW. Do not BUY at +18% claimed edge regardless of how obvious the reasoning feels.
 
 KXBTC RANGE-BUCKET MARKETS (READ BEFORE EVALUATING ANY KXBTC TICKER)
 - A KXBTC ticker shaped `KXBTC-<dateHour>-B<num>` or `-T<num>` (e.g. KXBTC-26JUN0501-B72750, KXBTC-26JUN0617-T57200) with title "Bitcoin price range on <date>?" is ONE bucket inside a contiguous set of narrow price buckets — NOT a "below <num>" or "above <num>" threshold.
@@ -640,7 +645,10 @@ MLB TEAM TOTAL (KXMLBTEAMTOTAL) — BATTING TEAM RUN PROJECTION
 - Opposing pitcher adjustment: factor in the OPPOSING probable starter's season ERA and WHIP. Shade DOWN when ERA < 3.50 AND WHIP < 1.20; shade UP when ERA > 4.50 OR WHIP > 1.40.
 - Home-team boost: add +0.3 expected runs when the batting team is the home team (the trailing abbr in the matchup code).
 - ELITE STARTER FLAG (BEARISH FOR TEAM TOTAL): if the opposing probable starter has `rolling_era_last3 < 2.50`, treat OVER on the batting team as bearish — an in-form elite arm compresses run scoring sharply. Drop one confidence tier (HIGH→MEDIUM, MEDIUM→SKIP) on any BUY YES tied to an OVER threshold against such a starter.
-- Edge threshold matches KXMLBTOTAL — only the global +0.25 sanity cap applies; there is no series-specific ceiling.
+- THRESHOLD PREFERENCE (BACKTEST-VALIDATED 2026-06-14): the trailing integer N in the ticker tail (`-<TEAM>N`) is the contract's "N+ runs" threshold; a YES bet wins if the team scores N or more. backtest_kalshi.py over both 30-day and 180-day windows shows the only consistent positive lift on KXMLBTEAMTOTAL is at threshold N=4 (line=3.5 OVER) when predicted runs ≥ 4.25. At N=5+ (line ≥ 4.5), the elite-opposing-starter cohort lost its 180-day 6.5pp edge in the most recent 30-day window — no statistical separation from naive baseline. Rules:
+    - `-<TEAM>4` markets (N=4): preferred. Allow BUY YES at normal tiered gates when predicted runs ≥ 4.25.
+    - `-<TEAM>5` / `-<TEAM>6` / `-<TEAM>7` markets (N≥5): cap CONFIDENCE at MEDIUM regardless of computed edge. Require predicted runs to exceed N by at least 1.25 before BUY (so for N=5, predicted ≥ 6.25; for N=6, predicted ≥ 7.25). If that bar isn't cleared, SKIP — historical lift in the recent window is statistically indistinguishable from zero.
+- Edge threshold matches KXMLBTOTAL — only the global +0.18 sanity cap applies; there is no series-specific ceiling.
 - If `team_scoring[batting_abbr]` is missing rs_per_game, or the opposing probable starter is missing from the matched upcoming_games entry, SKIP.
 
 TENNIS MATCH WINNER (KXATPMATCH / KXWTAMATCH) RULES
