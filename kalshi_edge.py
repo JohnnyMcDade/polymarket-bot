@@ -628,6 +628,11 @@ MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - For ANY MLB market, locate the entry in mlb.upcoming_games whose `game_date` matches the ticker date AND whose away/home abbreviations match. Use the pitchers and stats from THAT entry.
 - If no upcoming_games entry matches the ticker date, SKIP. Do NOT fall back to team_scoring alone or to a different day's pitching matchup — yesterday's starter is rarely tomorrow's starter, and using the wrong pitcher silently breaks the edge calculation.
 
+MLB FACTS BLOCK (PER-MARKET INJECTION)
+- For MLB markets, each user-message MARKET block may include a `FACTS:` section with the matched upcoming_games entry, both teams' rs_per_game, both probable pitchers (ERA, WHIP, rolling_era_last3, vs_opponent), both bullpens, and (when parseable) CONTRACT_TEAM.
+- When FACTS is present, use it as the authoritative data source for that ticker — you do NOT need to scan STATS CONTEXT for the same matchup, and you should NOT emit "matching upcoming_games entry not found" or "team_scoring missing" when the FACTS block has the values.
+- When FACTS is absent on an MLB ticker, the cache had no matching game — SKIP per the date-matching rule.
+
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
 - Always emit --- after every block including the last.
@@ -646,12 +651,104 @@ def _build_system_prompt(stats: dict[str, Any]) -> str:
     )
 
 
-def _build_user_message(items: list[dict[str, Any]]) -> str:
+_MLB_SERIES_PREFIXES = (
+    "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
+)
+
+
+def _fmt_pitcher(p: dict[str, Any] | None) -> str:
+    if not p:
+        return "n/a"
+    parts = [p.get("player") or "?"]
+    for key, label in (
+        ("era", "ERA"), ("whip", "WHIP"),
+        ("rolling_era_last3", "rolling_era_last3"),
+    ):
+        v = p.get(key)
+        if v is not None:
+            parts.append(f"{label}={v}")
+    vs = p.get("vs_opponent")
+    if vs:
+        parts.append(
+            f"vs_opp(starts={vs.get('starts')},era_vs={vs.get('era_vs')},"
+            f"whip_vs={vs.get('whip_vs')},avg_runs_last3_vs={vs.get('avg_runs_last3_vs')})"
+        )
+    return ", ".join(parts)
+
+
+def _fmt_bullpen(b: dict[str, Any] | None) -> str:
+    if not b:
+        return "n/a"
+    parts = []
+    for k in ("bullpen_era_15d", "save_conversion_15d",
+              "save_opportunities_15d", "blown_saves_15d"):
+        v = b.get(k)
+        if v is not None:
+            parts.append(f"{k}={v}")
+    return ", ".join(parts) or "n/a"
+
+
+def _mlb_facts_for_ticker(ticker: str, stats: dict[str, Any]) -> str | None:
+    """Inline the relevant upcoming_games entry + both teams' team_scoring
+    and bullpens for an MLB ticker. Returns None for non-MLB tickers or
+    when no matching game is in the cache. Removes the attention-drift
+    failure mode where Claude couldn't find data already sitting in the
+    big STATS CONTEXT blob."""
+    if not any(ticker.startswith(p) for p in _MLB_SERIES_PREFIXES):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return None
+    body = parts[1]
+    if len(body) < 11:
+        return None
+    yy, mon, dd = body[:2], body[2:5], body[5:7]
+    mm = _MLB_TICKER_MONTH.get(mon.upper())
+    if not mm:
+        return None
+    game_date = f"20{yy}-{mm}-{dd}"
+    matchup = body[11:]  # AWAY+HOME concatenated
+    mlb = stats.get("mlb", {}) or {}
+    game = None
+    for g in mlb.get("upcoming_games", []) or []:
+        if g.get("game_date") != game_date:
+            continue
+        if (g.get("away", "") + g.get("home", "")) == matchup:
+            game = g
+            break
+    if not game:
+        return None
+    away = game.get("away", "?")
+    home = game.get("home", "?")
+    ts_map = mlb.get("team_scoring", {}) or {}
+    bp_map = mlb.get("bullpens", {}) or {}
+    away_rs = (ts_map.get(away) or {}).get("rs_per_game")
+    home_rs = (ts_map.get(home) or {}).get("rs_per_game")
+    contract_seg = parts[2]
+    contract_team = None
+    for abbr in (away, home):
+        if abbr and contract_seg.startswith(abbr):
+            if contract_team is None or len(abbr) > len(contract_team):
+                contract_team = abbr
+    lines = [
+        f"GAME: {away} @ {home}, {game_date} {game.get('start_time_utc', '?')}Z",
+        f"BATTING RS/G: {away}={away_rs} (away), {home}={home_rs} (home, +0.3 boost when batting at home)",
+        f"AWAY PITCHER ({away}): {_fmt_pitcher(game.get('away_pitcher'))}",
+        f"HOME PITCHER ({home}): {_fmt_pitcher(game.get('home_pitcher'))}",
+        f"AWAY BULLPEN ({away}): {_fmt_bullpen(bp_map.get(away))}",
+        f"HOME BULLPEN ({home}): {_fmt_bullpen(bp_map.get(home))}",
+    ]
+    if contract_team:
+        lines.append(f"CONTRACT_TEAM: {contract_team}")
+    return "\n".join(lines)
+
+
+def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> str:
     blocks = []
     for i, it in enumerate(items, 1):
         ya = it["yes_ask_cents"]
         entities = ", ".join(it.get("entities") or []) or "(none matched)"
-        blocks.append(
+        block = (
             f"=== MARKET {i} ===\n"
             f"TICKER: {it['ticker']}\n"
             f"TITLE: {it['title']}\n"
@@ -659,6 +756,10 @@ def _build_user_message(items: list[dict[str, Any]]) -> str:
             f"MARKET YES PRICE: {ya}¢ (implies {ya/100:.2%} YES)\n"
             f"STATS ENTITIES MATCHED: {entities}"
         )
+        facts = _mlb_facts_for_ticker(it["ticker"], stats)
+        if facts:
+            block += "\nFACTS:\n" + facts
+        blocks.append(block)
     return "\n\n".join(blocks)
 
 
@@ -695,6 +796,7 @@ def _parse_response(text: str) -> dict[str, dict[str, Any]]:
 
 
 def _ask_claude(system_prompt: str, batch: list[dict[str, Any]],
+                stats: dict[str, Any],
                 log_raw: bool = False) -> dict[str, dict[str, Any]]:
     if not ANTHROPIC_API_KEY or not batch:
         return {}
@@ -716,7 +818,7 @@ def _ask_claude(system_prompt: str, batch: list[dict[str, Any]],
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
-                "messages": [{"role": "user", "content": _build_user_message(batch)}],
+                "messages": [{"role": "user", "content": _build_user_message(batch, stats)}],
             },
             timeout=120,
         )
@@ -859,7 +961,7 @@ def run() -> None:
                     skipped = 0
                     for start in range(0, len(candidates), BATCH_SIZE):
                         batch = candidates[start : start + BATCH_SIZE]
-                        preds = _ask_claude(system_prompt, batch, log_raw=(start == 0))
+                        preds = _ask_claude(system_prompt, batch, stats, log_raw=(start == 0))
                         for it in batch:
                             ticker = it["ticker"]
                             seen.add(ticker)
