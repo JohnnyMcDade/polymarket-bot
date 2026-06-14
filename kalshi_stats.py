@@ -157,8 +157,8 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 _MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
 _ESPN_NBA_STANDINGS = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
 _ESPN_NHL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/hockey/nhl/standings"
-_ESPN_ATP_RANKINGS = "https://site.api.espn.com/apis/v2/sports/tennis/atp/rankings"
-_ESPN_WTA_RANKINGS = "https://site.api.espn.com/apis/v2/sports/tennis/wta/rankings"
+_ESPN_ATP_RANKINGS = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/rankings"
+_ESPN_WTA_RANKINGS = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/rankings"
 _ESPN_ATP_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
 _ESPN_WTA_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
 _HTTP_TIMEOUT = 15
@@ -651,19 +651,26 @@ def _fetch_nhl_block() -> dict[str, Any]:
 # and recent W/L form instead of asking Claude to remember the tour.
 
 def _fetch_tennis_rankings(url: str) -> list[dict]:
-    """Flatten ESPN's tennis rankings into {rank, player, country}."""
+    """Flatten ESPN's tennis rankings into {rank, player, country}.
+
+    ESPN's current shape (2026): board.ranks[*].{current, athlete}, with
+    athlete.displayName + athlete.flagAltText. Previous shape used
+    board.athletes[*] and athlete.flag.alt — keep a defensive fallback
+    in case ESPN flips back or serves both."""
     data = _http_get_json(url)
     out: list[dict] = []
     for board in (data or {}).get("rankings", []):
-        for entry in (board.get("athletes") or []):
+        entries = board.get("ranks") or board.get("athletes") or []
+        for entry in entries:
             athlete = entry.get("athlete") or {}
             name = athlete.get("displayName") or athlete.get("fullName") or ""
             if not name:
                 continue
-            country = ""
-            flag = athlete.get("flag") or {}
-            if isinstance(flag, dict):
-                country = flag.get("alt", "") or flag.get("countryCode", "")
+            country = athlete.get("flagAltText") or ""
+            if not country:
+                flag = athlete.get("flag")
+                if isinstance(flag, dict):
+                    country = flag.get("alt", "") or flag.get("countryCode", "")
             rank = entry.get("current") or entry.get("rank")
             try:
                 rank_i = int(rank) if rank is not None else None
@@ -689,7 +696,15 @@ def _fetch_tennis_recent(url: str) -> list[dict]:
         data = _http_get_json(f"{url}?dates={d.strftime('%Y%m%d')}")
         for ev in (data or {}).get("events", []):
             event_name = (ev.get("league") or {}).get("name", "") or ev.get("name", "")
-            for comp in ev.get("competitions", []) or []:
+            # ESPN nests singles matches under ev.groupings[*].competitions
+            # for tour-level / slam events. Older shape (and some smaller
+            # events) still expose a flat ev.competitions — try both.
+            competitions: list[dict] = []
+            for grp in (ev.get("groupings") or []):
+                competitions.extend(grp.get("competitions") or [])
+            if not competitions:
+                competitions = ev.get("competitions") or []
+            for comp in competitions:
                 status_t = ((comp.get("status") or {}).get("type") or {})
                 if not status_t.get("completed"):
                     continue
