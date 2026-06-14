@@ -140,7 +140,9 @@ TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
 GRASS_FILTER_ENABLED = os.getenv("KALSHI_GRASS_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
 GRASS_MIN_DELTA_DIFF_PP = float(os.getenv("KALSHI_GRASS_MIN_DELTA_DIFF_PP", "5.0"))
 GRASS_SPECIALISTS_PATH = Path(os.getenv(
-    "KALSHI_GRASS_SPECIALISTS_JSON", "data/grass_specialists.json"
+    # Bundled resource under resources/ — NOT under /app/data/ which
+    # is a Railway persistent volume that masks image files at runtime.
+    "KALSHI_GRASS_SPECIALISTS_JSON", "resources/grass_specialists.json"
 ))
 GRASS_TOURNAMENTS = (
     "wimbledon", "halle", "boss open", "queen's club", "queens club",
@@ -720,7 +722,21 @@ CRITICAL RULES
 def _build_system_prompt(stats: dict[str, Any]) -> str:
     # Keep the stats JSON compact in the prompt — every extra token is
     # paid for on the first call of the day (cache write). Drop indentation.
-    stats_json = json.dumps(stats, separators=(",", ":"))
+    # Trim tennis.*_recent before serializing. 2026-06-14: the raw cache
+    # held 2,500 ATP + 3,525 WTA recent-match entries (kalshi_stats fetches
+    # 10 days of scoreboard). At ~100 bytes per JSON entry, that's ~600KB
+    # of context — enough to push the system prompt past Haiku 4.5's
+    # 200k token limit (live failure: 202,676 tokens > 200,000). Last 500
+    # per tour gives Claude plenty of form context without overflowing.
+    trimmed = dict(stats)
+    tennis = dict(trimmed.get("tennis") or {})
+    for key in ("atp_recent", "wta_recent"):
+        rows = tennis.get(key) or []
+        if len(rows) > 500:
+            tennis[key] = rows[-500:]
+    if tennis:
+        trimmed["tennis"] = tennis
+    stats_json = json.dumps(trimmed, separators=(",", ":"))
     return (
         _METHODOLOGY
         + "\n\nSTATS CONTEXT (refresh date in fetched_at, includes both sports and economic blocks):\n"
