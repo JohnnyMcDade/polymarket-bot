@@ -132,6 +132,7 @@ def main() -> int:
     pred = synth_pred()
     passes: list[dict] = []
     fails: list[tuple[str, str, dict]] = []
+    funnel = {"fetched": 0, "no_ask": 0, "priced": 0}
 
     for series in series_list:
         print(f"Fetching open {series} markets...", flush=True)
@@ -141,16 +142,20 @@ def main() -> int:
             print(f"  [ERROR] {series} fetch failed: {e}", flush=True)
             continue
         print(f"  {len(markets)} open markets", flush=True)
+        funnel["fetched"] += len(markets)
 
         for m in markets:
             ticker = m.get("ticker", "")
             title = m.get("title", "")
             yes_ask = m.get("yes_ask")
             if not isinstance(yes_ask, (int, float)) or yes_ask <= 0:
-                # No live order book — filter treats this as illiquid; skip
-                # silently so the report focuses on tradeable markets.
+                # Open but no live order book — production drops these
+                # as "illiquid". Surface the count here so the dry-run
+                # explains "0 PASS" when the books are simply asleep.
+                funnel["no_ask"] += 1
                 continue
             yes_ask = int(yes_ask)
+            funnel["priced"] += 1
 
             entities = kalshi_edge._extract_entities(title, stats)
             item = {
@@ -176,6 +181,16 @@ def main() -> int:
     print("=" * 78)
     print(f"DRY-RUN RESULT — {datetime.now(timezone.utc).isoformat()}")
     print("=" * 78)
+    print(
+        f"\nFunnel: fetched={funnel['fetched']} | "
+        f"open-but-no-ask={funnel['no_ask']} | "
+        f"with-live-ask={funnel['priced']}"
+    )
+    if funnel["priced"] == 0 and funnel["fetched"] > 0:
+        print(
+            "  → no live order books right now; filter has nothing to "
+            "evaluate. Re-run during US trading hours."
+        )
 
     print(f"\nPASSING markets ({len(passes)}):")
     if passes:
