@@ -995,7 +995,14 @@ def _ask_claude(system_prompt: str, batch: list[dict[str, Any]],
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 200 * len(batch),
+                # 400 tok/market (was 200): tennis predictions on
+                # KXATPMATCH/KXWTAMATCH need rank-gap + recent-form
+                # reasoning that frequently overran the prior cap, causing
+                # the last few tickers in a batch to be silently truncated
+                # — logs showed every tennis ticker hitting "no prediction
+                # parsed" because Claude ran out of tokens before echoing
+                # their TICKER block.
+                "max_tokens": 400 * len(batch),
                 "system": [
                     {
                         "type": "text",
