@@ -95,6 +95,25 @@ BACKTEST_BOOST_MAX_ASK_CENTS = int(os.getenv("KALSHI_BACKTEST_BOOST_MAX_ASK_CENT
 BACKTEST_FILTER_ENABLED = os.getenv("KALSHI_BACKTEST_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
 BACKTEST_FILTER_ERA_CAP = float(os.getenv("KALSHI_BACKTEST_FILTER_ERA_CAP", "3.50"))
 
+# Recalibration demote. When the live win-rate on the last N settled
+# trades drops below RECALIB_WR_THRESHOLD, downgrade all HIGH→MEDIUM
+# verdicts for RECALIB_DEMOTE_HOURS. Cools down model overconfidence
+# during a losing streak: HIGH bets at MIN_EDGE (3%) become MEDIUM bets
+# at the higher MEDIUM_MIN_EDGE (8%) floor, so the bar is higher and
+# the position-size impact is smaller. State persists across restarts
+# in /app/data/recalibration_demote.json so a redeploy mid-cooldown
+# doesn't reset the timer.
+RECALIB_DEMOTE_ENABLED = os.getenv("KALSHI_RECALIB_DEMOTE_ENABLED", "true").lower() in ("1", "true", "yes")
+RECALIB_LOOKBACK_N = int(os.getenv("KALSHI_RECALIB_LOOKBACK_N", "10"))
+RECALIB_WR_THRESHOLD = float(os.getenv("KALSHI_RECALIB_WR_THRESHOLD", "0.40"))
+RECALIB_DEMOTE_HOURS = float(os.getenv("KALSHI_RECALIB_DEMOTE_HOURS", "24"))
+RECALIB_STATE_PATH = Path(os.getenv(
+    "KALSHI_RECALIB_STATE", "/app/data/recalibration_demote.json"
+))
+TRADES_LOG_PATH = Path(os.getenv(
+    "KALSHI_TRADES_LOG", "/app/data/trades_log.json"
+))
+
 # Tennis (KXATPMATCH / KXWTAMATCH) market-price filter. The 180-day
 # backtest (backtest_kalshi_tennis.py) showed the directional model has
 # essentially no lift over "always pick the higher-ranked player" — that
@@ -851,6 +870,116 @@ def _backtest_cohort_passes(
     return False, f"avg-bad ({avg_era:.2f})"
 
 
+_RECALIB_CACHE: dict[str, Any] = {
+    "checked_at": 0.0,
+    "demoting": False,
+    "reason": "",
+}
+_RECALIB_CACHE_TTL = 300  # 5 minutes — avoid re-reading trades_log per call
+
+
+def _check_recalibration_demote() -> tuple[bool, str]:
+    """Return (is_demoting, reason).
+
+    Three paths through the function:
+      1. Recently checked (<5 min ago) → return cached answer.
+      2. Persistent state says we're still inside a demote window → return
+         demoting=True with the original trigger reason + expiry.
+      3. Window expired or never set → load trades_log.json, compute win
+         rate over the last RECALIB_LOOKBACK_N settled trades. If below
+         RECALIB_WR_THRESHOLD, write a new demote state file with
+         demote_until_ts = now + RECALIB_DEMOTE_HOURS hours.
+
+    State file persists so a container restart mid-cooldown preserves the
+    cool-down window. State + cache both keyed independently to keep the
+    persistent decision separate from the in-process call rate-limit.
+    """
+    if not RECALIB_DEMOTE_ENABLED:
+        return False, "disabled"
+    now = time.time()
+    if now - _RECALIB_CACHE["checked_at"] < _RECALIB_CACHE_TTL:
+        return _RECALIB_CACHE["demoting"], _RECALIB_CACHE["reason"]
+
+    # Path 2: existing demote window still active?
+    state: dict[str, Any] = {}
+    if RECALIB_STATE_PATH.exists():
+        try:
+            with RECALIB_STATE_PATH.open() as f:
+                state = json.load(f)
+        except Exception as e:
+            print(f"[WARN] recalib state unreadable: {e}", flush=True)
+    demote_until = float(state.get("demote_until_ts") or 0)
+    if demote_until > now:
+        hours_left = (demote_until - now) / 3600
+        reason = (
+            f"{state.get('trigger_reason','unknown')} "
+            f"(active for {hours_left:.1f}h more)"
+        )
+        _RECALIB_CACHE.update(checked_at=now, demoting=True, reason=reason)
+        return True, reason
+
+    # Path 3: re-evaluate from trades_log
+    if not TRADES_LOG_PATH.exists():
+        _RECALIB_CACHE.update(
+            checked_at=now, demoting=False, reason="no trades_log"
+        )
+        return False, "no trades_log"
+    try:
+        with TRADES_LOG_PATH.open() as f:
+            data = json.load(f)
+        trades = data if isinstance(data, list) else data.get("trades", [])
+    except Exception as e:
+        _RECALIB_CACHE.update(
+            checked_at=now, demoting=False,
+            reason=f"trades_log unreadable: {e}",
+        )
+        return False, _RECALIB_CACHE["reason"]
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    if len(settled) < RECALIB_LOOKBACK_N:
+        msg = f"only {len(settled)} settled < {RECALIB_LOOKBACK_N}"
+        _RECALIB_CACHE.update(checked_at=now, demoting=False, reason=msg)
+        return False, msg
+    last_n = settled[-RECALIB_LOOKBACK_N:]
+    wins = sum(1 for t in last_n if t.get("outcome") == "won")
+    wr = wins / len(last_n)
+    if wr < RECALIB_WR_THRESHOLD:
+        demote_until = now + RECALIB_DEMOTE_HOURS * 3600
+        reason = (
+            f"last{RECALIB_LOOKBACK_N} wr={wr:.1%} < "
+            f"{RECALIB_WR_THRESHOLD:.0%} threshold"
+        )
+        new_state = {
+            "triggered_at_ts": now,
+            "triggered_at_iso": datetime.now(timezone.utc).isoformat(),
+            "demote_until_ts": demote_until,
+            "demote_until_iso": datetime.fromtimestamp(
+                demote_until, tz=timezone.utc
+            ).isoformat(),
+            "trigger_reason": reason,
+            "lookback_wr": wr,
+            "lookback_n": len(last_n),
+        }
+        try:
+            RECALIB_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = RECALIB_STATE_PATH.with_suffix(".tmp")
+            with tmp.open("w") as f:
+                json.dump(new_state, f, indent=2)
+            tmp.replace(RECALIB_STATE_PATH)
+        except Exception as e:
+            print(f"[WARN] recalib state save failed: {e}", flush=True)
+        print(
+            f"[RECALIB-DEMOTE] TRIGGERED: {reason} — "
+            f"demoting HIGH→MEDIUM for {RECALIB_DEMOTE_HOURS}h",
+            flush=True,
+        )
+        _RECALIB_CACHE.update(checked_at=now, demoting=True, reason=reason)
+        return True, reason
+
+    msg = f"last{RECALIB_LOOKBACK_N} wr={wr:.1%} >= threshold (no demote)"
+    _RECALIB_CACHE.update(checked_at=now, demoting=False, reason=msg)
+    return False, msg
+
+
 def _tennis_filter_passes(
     item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -1125,6 +1254,13 @@ def run() -> None:
         f"series={['KXATPMATCH','KXWTAMATCH']}",
         flush=True,
     )
+    print(
+        f"[edge] recalib-demote: enabled={RECALIB_DEMOTE_ENABLED} "
+        f"lookback_n={RECALIB_LOOKBACK_N} "
+        f"wr_threshold={RECALIB_WR_THRESHOLD:.0%} "
+        f"demote_hours={RECALIB_DEMOTE_HOURS}",
+        flush=True,
+    )
     print(f"[edge] series active: {SERIES_TICKERS}", flush=True)
     seen = _load_seen()
     price_history = _load_price_history()
@@ -1301,6 +1437,33 @@ def run() -> None:
                                             f"{common}",
                                             flush=True,
                                         )
+                            # Recalibration demote. If the live win-rate on
+                            # the last N settled trades is below threshold,
+                            # cool off model overconfidence by capping HIGH
+                            # at MEDIUM for RECALIB_DEMOTE_HOURS. Fires
+                            # AFTER BACKTEST-BOOST so a boosted MEDIUM→HIGH
+                            # gets demoted right back during a losing
+                            # streak, and BEFORE TENNIS-FILTER so a demoted
+                            # MEDIUM correctly fails the HIGH-only tennis
+                            # gate. State persists across restarts in
+                            # /app/data/recalibration_demote.json.
+                            if (
+                                RECALIB_DEMOTE_ENABLED
+                                and pred["recommendation"] == "BUY"
+                                and pred["confidence"] == "HIGH"
+                            ):
+                                demoting, reason = _check_recalibration_demote()
+                                if demoting:
+                                    pred["confidence"] = "MEDIUM"
+                                    pred["reasoning"] = (
+                                        f"[recalib-demote HIGH->MEDIUM {reason}] "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[RECALIB-DEMOTE] {ticker} "
+                                        f"HIGH->MEDIUM ({reason})",
+                                        flush=True,
+                                    )
                             # Tennis market-price filter. KXATPMATCH /
                             # KXWTAMATCH only: backtest showed no
                             # directional lift over "always pick higher-
