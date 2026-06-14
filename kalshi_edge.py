@@ -80,6 +80,16 @@ BACKTEST_BOOST_WPCT_GAP_MIN = float(os.getenv("KALSHI_BACKTEST_BOOST_WPCT_GAP_MI
 # that the boost almost never fires. Set to 100 to disable price filtering.
 BACKTEST_BOOST_MAX_ASK_CENTS = int(os.getenv("KALSHI_BACKTEST_BOOST_MAX_ASK_CENTS", "62"))
 
+# Cohort filter for KXMLBTOTAL / KXMLBTEAMTOTAL. 180-day backtest showed
+# real predictive lift on these series ONLY when the relevant starter(s)
+# sit in the elite/good cohort (rolling_era_last3 <= 3.50). Outside that
+# cohort, win-rate at the breakeven line tracked the trivial baseline —
+# i.e. HIGH-confidence verdicts couldn't be trusted as edge. Cap to MEDIUM
+# in that regime so we still trade (with a higher edge bar) but don't
+# upweight what the data says is noise.
+BACKTEST_FILTER_ENABLED = os.getenv("KALSHI_BACKTEST_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+BACKTEST_FILTER_ERA_CAP = float(os.getenv("KALSHI_BACKTEST_FILTER_ERA_CAP", "3.50"))
+
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
 # at least MIN_SECS_TO_CLOSE in the future but no more than MAX_SECS_TO_CLOSE.
@@ -743,6 +753,77 @@ def _mlb_facts_for_ticker(ticker: str, stats: dict[str, Any]) -> str | None:
     return "\n".join(lines)
 
 
+def _backtest_cohort_passes(
+    ticker: str, stats: dict[str, Any]
+) -> tuple[bool, str]:
+    """For KXMLBTOTAL / KXMLBTEAMTOTAL, return (passes, reason).
+
+    passes=True if the relevant starter(s) sit in the backtest-validated
+    cohort (rolling_era_last3 <= BACKTEST_FILTER_ERA_CAP):
+      - KXMLBTOTAL: BOTH starters must be in cohort
+      - KXMLBTEAMTOTAL: the OPPOSING starter (vs the contract team) must
+        be in cohort
+
+    Other series return (True, "n/a") so they're untouched. Missing
+    matchup or missing rolling_era_last3 returns False so we conservatively
+    cap to MEDIUM rather than trusting an unvalidated HIGH."""
+    if not (ticker.startswith("KXMLBTOTAL") or ticker.startswith("KXMLBTEAMTOTAL")):
+        return True, "n/a"
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return False, "ticker-parse"
+    body = parts[1]
+    if len(body) < 11:
+        return False, "ticker-parse"
+    yy, mon, dd = body[:2], body[2:5], body[5:7]
+    mm = _MLB_TICKER_MONTH.get(mon.upper())
+    if not mm:
+        return False, "ticker-parse"
+    game_date = f"20{yy}-{mm}-{dd}"
+    matchup = body[11:]
+    mlb = stats.get("mlb", {}) or {}
+    game = None
+    for g in mlb.get("upcoming_games", []) or []:
+        if g.get("game_date") != game_date:
+            continue
+        if (g.get("away", "") + g.get("home", "")) == matchup:
+            game = g
+            break
+    if not game:
+        return False, "no-upcoming-match"
+    away_abbr = game.get("away", "")
+    home_abbr = game.get("home", "")
+    away_era = (game.get("away_pitcher") or {}).get("rolling_era_last3")
+    home_era = (game.get("home_pitcher") or {}).get("rolling_era_last3")
+
+    if ticker.startswith("KXMLBTEAMTOTAL"):
+        contract_seg = parts[2]
+        batting = None
+        for abbr in (away_abbr, home_abbr):
+            if abbr and contract_seg.startswith(abbr):
+                if batting is None or len(abbr) > len(batting):
+                    batting = abbr
+        if not batting:
+            return False, "batting-team-parse"
+        opp_era = away_era if batting == home_abbr else home_era
+        if opp_era is None:
+            return False, "opp-era-missing"
+        if opp_era <= BACKTEST_FILTER_ERA_CAP:
+            return True, f"opp-elite/good ({opp_era:.2f})"
+        return False, f"opp-avg/bad ({opp_era:.2f})"
+
+    # KXMLBTOTAL
+    if away_era is None or home_era is None:
+        return False, "era-missing"
+    worst = max(away_era, home_era)
+    if (
+        away_era <= BACKTEST_FILTER_ERA_CAP
+        and home_era <= BACKTEST_FILTER_ERA_CAP
+    ):
+        return True, f"both-elite/good (max {worst:.2f})"
+    return False, f"pair-avg/bad (max {worst:.2f})"
+
+
 def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> str:
     blocks = []
     for i, it in enumerate(items, 1):
@@ -1023,6 +1104,33 @@ def run() -> None:
                                 )
                                 pred["edge"] = MAX_EDGE
                                 pred["recommendation"] = "SKIP"
+                            # Backtest-validated cohort cap for KXMLBTOTAL /
+                            # KXMLBTEAMTOTAL. 180-day backtest showed real
+                            # lift over the trivial baseline only when the
+                            # relevant starter(s) sit at rolling_era_last3
+                            # <= 3.50. Outside that cohort, HIGH-confidence
+                            # picks weren't statistically distinguishable
+                            # from coin-flip → cap to MEDIUM so we still
+                            # trade but at the higher MEDIUM_MIN_EDGE bar.
+                            if (
+                                BACKTEST_FILTER_ENABLED
+                                and pred["confidence"] == "HIGH"
+                                and pred["recommendation"] == "BUY"
+                            ):
+                                cohort_ok, reason = _backtest_cohort_passes(
+                                    ticker, stats
+                                )
+                                if not cohort_ok:
+                                    pred["confidence"] = "MEDIUM"
+                                    pred["reasoning"] = (
+                                        "[backtest-filter HIGH->MEDIUM] "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[BACKTEST-FILTER] {ticker} "
+                                        f"HIGH->MEDIUM reason={reason}",
+                                        flush=True,
+                                    )
                             # Backtest-validated boost. Fires only on
                             # BUY-MEDIUM (we don't override Claude's
                             # SKIP / LOW) and runs AFTER the MAX_EDGE
