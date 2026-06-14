@@ -90,6 +90,20 @@ BACKTEST_BOOST_MAX_ASK_CENTS = int(os.getenv("KALSHI_BACKTEST_BOOST_MAX_ASK_CENT
 BACKTEST_FILTER_ENABLED = os.getenv("KALSHI_BACKTEST_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
 BACKTEST_FILTER_ERA_CAP = float(os.getenv("KALSHI_BACKTEST_FILTER_ERA_CAP", "3.50"))
 
+# Tennis (KXATPMATCH / KXWTAMATCH) market-price filter. The 180-day
+# backtest (backtest_kalshi_tennis.py) showed the directional model has
+# essentially no lift over "always pick the higher-ranked player" — that
+# signal is already efficiently priced into rank-favorite Kalshi YES
+# contracts. The only positive-EV tennis cohort was HIGH-confidence rank
+# favorites available BELOW the break-even Wilson lower bound (~62¢). So
+# instead of a directional filter, we run a mispricing filter: BUY only
+# when the YES side IS the higher-ranked player AND the rank gap exceeds
+# MIN_RANK_GAP AND the YES ask sits at-or-below MAX_ASK_CENTS. Everything
+# else gets SKIP'd regardless of Claude's edge call.
+TENNIS_FILTER_ENABLED = os.getenv("KALSHI_TENNIS_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+TENNIS_MAX_ASK_CENTS = int(os.getenv("KALSHI_TENNIS_MAX_ASK_CENTS", "62"))
+TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
+
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
 # at least MIN_SECS_TO_CLOSE in the future but no more than MAX_SECS_TO_CLOSE.
@@ -117,9 +131,11 @@ PRICE_HISTORY_MAX_AGE_SECS = int(os.getenv("KALSHI_PRICE_HISTORY_MAX_AGE", "8640
 SERIES_TICKERS = [
     s.strip() for s in os.getenv(
         "KALSHI_EDGE_SERIES",
-        # Only KXMLBTOTAL, KXMLBSPREAD, and KXMLBTEAMTOTAL are active —
-        # all other series disabled temporarily.
-        "KXMLBTOTAL,KXMLBSPREAD,KXMLBTEAMTOTAL",
+        # Tennis (KXATPMATCH / KXWTAMATCH) re-enabled for the grass swing
+        # and Wimbledon — gated by the mispricing-only TENNIS_FILTER below
+        # (HIGH conf + gap > 50 + ask ≤ 62¢), so series re-add doesn't
+        # broaden trading on its own.
+        "KXMLBTOTAL,KXMLBSPREAD,KXMLBTEAMTOTAL,KXATPMATCH,KXWTAMATCH",
     ).split(",") if s.strip()
 ]
 
@@ -827,6 +843,91 @@ def _backtest_cohort_passes(
     return False, f"avg-bad ({avg_era:.2f})"
 
 
+def _tennis_filter_passes(
+    item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
+) -> tuple[bool, str]:
+    """Mispricing gate for KXATPMATCH / KXWTAMATCH. Returns (passes, reason).
+
+    PASS conditions (all required):
+      - Claude confidence is HIGH
+      - YES ask ≤ TENNIS_MAX_ASK_CENTS
+      - Both market entities are present in the corresponding rankings
+        (atp_rankings for KXATPMATCH, wta_rankings for KXWTAMATCH)
+      - YES side is the higher-ranked player (lower rank number) —
+        identified by which surname appears first in the market title
+      - (other_rank − yes_rank) > TENNIS_MIN_RANK_GAP
+
+    Anything else returns (False, "<diagnostic>") so the caller can
+    SKIP and log the reason. Non-tennis tickers return (True, "n/a")
+    so this is a no-op on every other series.
+    """
+    ticker = item.get("ticker", "")
+    is_atp = ticker.startswith("KXATPMATCH")
+    is_wta = ticker.startswith("KXWTAMATCH")
+    if not (is_atp or is_wta):
+        return True, "n/a"
+
+    if pred.get("confidence") != "HIGH":
+        return False, f"conf={pred.get('confidence')} != HIGH"
+
+    yes_ask = int(item.get("yes_ask_cents") or 100)
+    if yes_ask > TENNIS_MAX_ASK_CENTS:
+        return False, f"yes_ask={yes_ask}c > {TENNIS_MAX_ASK_CENTS}c"
+
+    tennis = stats.get("tennis", {}) or {}
+    board_key = "atp_rankings" if is_atp else "wta_rankings"
+    rankings: dict[str, int] = {}
+    for row in tennis.get(board_key, []) or []:
+        name = row.get("player")
+        rank = row.get("rank")
+        if name and isinstance(rank, int):
+            rankings[name] = rank
+
+    matched = [e for e in (item.get("entities") or []) if e in rankings]
+    if len(matched) < 2:
+        return False, f"only {len(matched)} ranked players matched ({matched!r})"
+
+    # Identify YES side = first surname appearance in title. Tennis market
+    # titles read "<Player A> vs <Player B>" or "Will <A> beat <B>?" — in
+    # both formats the YES side is the first-mentioned player.
+    title_l = (item.get("title", "") or "").lower()
+
+    def _first_pos(name: str) -> int:
+        last = name.split()[-1].lower()
+        if not last:
+            return 10**9
+        pos = title_l.find(last)
+        return pos if pos >= 0 else 10**9
+
+    by_pos = sorted(matched, key=_first_pos)
+    yes_player = by_pos[0]
+    if _first_pos(yes_player) >= 10**9:
+        return False, "no player surname found in title"
+    others = [p for p in matched if p != yes_player]
+    if not others:
+        return False, "could not isolate opponent"
+    no_player = others[0]
+    yes_rank = rankings[yes_player]
+    no_rank = rankings[no_player]
+
+    # Filter case is "favorite at a discount" — if YES is the underdog,
+    # the price ≤ 62¢ is correctly priced down, not mispriced up.
+    if yes_rank >= no_rank:
+        return False, (
+            f"YES={yes_player}(#{yes_rank}) is lower-ranked than "
+            f"{no_player}(#{no_rank})"
+        )
+
+    gap = no_rank - yes_rank
+    if gap <= TENNIS_MIN_RANK_GAP:
+        return False, f"gap={gap} <= {TENNIS_MIN_RANK_GAP}"
+
+    return True, (
+        f"YES={yes_player}(#{yes_rank}) vs {no_player}(#{no_rank}) "
+        f"gap={gap} ask={yes_ask}c"
+    )
+
+
 def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> str:
     blocks = []
     for i, it in enumerate(items, 1):
@@ -1002,6 +1103,14 @@ def run() -> None:
         f"max_ask_cents={BACKTEST_BOOST_MAX_ASK_CENTS}",
         flush=True,
     )
+    print(
+        f"[edge] tennis-filter: enabled={TENNIS_FILTER_ENABLED} "
+        f"max_ask_cents={TENNIS_MAX_ASK_CENTS} "
+        f"min_rank_gap={TENNIS_MIN_RANK_GAP} "
+        f"series={['KXATPMATCH','KXWTAMATCH']}",
+        flush=True,
+    )
+    print(f"[edge] series active: {SERIES_TICKERS}", flush=True)
     seen = _load_seen()
     price_history = _load_price_history()
     print(
@@ -1177,6 +1286,40 @@ def run() -> None:
                                             f"{common}",
                                             flush=True,
                                         )
+                            # Tennis market-price filter. KXATPMATCH /
+                            # KXWTAMATCH only: backtest showed no
+                            # directional lift over "always pick higher-
+                            # ranked", so we instead require a clear
+                            # mispricing — HIGH conf + rank-favorite YES
+                            # at ≤ 62¢ + gap > 50 spots. Everything else
+                            # on these series gets SKIP'd, regardless of
+                            # Claude's edge call. Non-tennis tickers pass
+                            # through unchanged.
+                            if (
+                                TENNIS_FILTER_ENABLED
+                                and pred["recommendation"] == "BUY"
+                                and (
+                                    ticker.startswith("KXATPMATCH")
+                                    or ticker.startswith("KXWTAMATCH")
+                                )
+                            ):
+                                ok, reason = _tennis_filter_passes(it, pred, stats)
+                                if not ok:
+                                    pred["recommendation"] = "SKIP"
+                                    pred["reasoning"] = (
+                                        f"[tennis-filter SKIP] {reason} | "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[TENNIS-FILTER] {ticker} SKIP "
+                                        f"reason={reason}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"[TENNIS-FILTER] {ticker} PASS {reason}",
+                                        flush=True,
+                                    )
                             high_ok = (
                                 pred["confidence"] == "HIGH"
                                 and pred["edge"] >= MIN_EDGE
