@@ -822,8 +822,46 @@ def _do_report() -> None:
         )
 
 
+def _should_catch_up_now() -> bool:
+    """True if today's daily report hasn't fired yet AND we're past
+    WINRATE_HOUR UTC. Without this, a launcher restart at HH:MM where
+    HH > WINRATE_HOUR causes _seconds_until_next_hour() to return ~24h
+    and silently skip a day of calibration. Reads
+    go_live_state.last_report_date which _do_report → _check_auto_live
+    sets to today's date on a successful run."""
+    now = datetime.now(timezone.utc)
+    if now.hour < WINRATE_HOUR:
+        return False  # natural sleep-loop will catch the normal window
+    today_str = now.strftime("%Y-%m-%d")
+    try:
+        state = _load_go_live_state()
+        return state.get("last_report_date") != today_str
+    except Exception:
+        return True  # state unreadable → fire it, the loop will recover
+
+
 def run() -> None:
     print(f"Kalshi Win-Rate Agent starting — fires daily at {WINRATE_HOUR:02d}:00 UTC")
+    # Catch-up fire on startup. Without this, a deploy/restart anywhere in
+    # the 07:01-23:59 UTC window puts the sleep loop on tomorrow's clock
+    # and silently skips today's calibration report — exactly what happened
+    # on 2026-06-14 when three back-to-back tennis-related deploys all
+    # landed in that window.
+    try:
+        if _should_catch_up_now():
+            state = _load_go_live_state()
+            print(
+                f"[winrate] startup catch-up: last_report_date="
+                f"{state.get('last_report_date')!r} — firing today's report now",
+                flush=True,
+            )
+            _do_report()
+    except Exception as e:
+        print(
+            f"[WARN] winrate startup catch-up crashed: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
     while True:
         wait_s = _seconds_until_next_hour(WINRATE_HOUR)
         print(f"[winrate] next report in {wait_s/3600:.1f}h", flush=True)
