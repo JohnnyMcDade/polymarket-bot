@@ -128,6 +128,26 @@ TENNIS_FILTER_ENABLED = os.getenv("KALSHI_TENNIS_FILTER_ENABLED", "true").lower(
 TENNIS_MAX_ASK_CENTS = int(os.getenv("KALSHI_TENNIS_MAX_ASK_CENTS", "62"))
 TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
 
+# Grass-court specialist filter. Layered on top of the tennis mispricing
+# filter — only fires when the market title references a grass
+# tournament. Requires YES side (the higher-ranked favorite) to have a
+# career grass-vs-overall delta that exceeds the opponent's by at least
+# GRASS_MIN_DELTA_DIFF_PP. 380-day backtest:
+#   A's grass-delta − B's: ≥+5pp → A wins 73.5% (Wilson_lo 56.9%)
+#   A's grass-delta − B's: ≤−5pp → A wins 53.7% (barely above 50%)
+# Specialist data lives in data/grass_specialists.json (regen by
+# re-running the backtest grass deep-dive — see backtest_kalshi_tennis.py).
+GRASS_FILTER_ENABLED = os.getenv("KALSHI_GRASS_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+GRASS_MIN_DELTA_DIFF_PP = float(os.getenv("KALSHI_GRASS_MIN_DELTA_DIFF_PP", "5.0"))
+GRASS_SPECIALISTS_PATH = Path(os.getenv(
+    "KALSHI_GRASS_SPECIALISTS_JSON", "data/grass_specialists.json"
+))
+GRASS_TOURNAMENTS = (
+    "wimbledon", "halle", "boss open", "queen's club", "queens club",
+    "queen's", "eastbourne", "s-hertogenbosch", "hertogenbosch",
+    "stuttgart open", "mallorca", "newport",
+)
+
 # Timing window. Pre-game stats only have an edge before the game starts,
 # and odds move fast in the last few minutes — so we want close_time to be
 # at least MIN_SECS_TO_CLOSE in the future but no more than MAX_SECS_TO_CLOSE.
@@ -675,6 +695,10 @@ TENNIS MATCH WINNER (KXATPMATCH / KXWTAMATCH) RULES
 - A 30+ rank gap between two top-100 players is roughly a 65/35 favorite. A 50+ gap is roughly 75/25. Use these as anchors; do not claim >85% favorite probability for any match without lopsided recent form to back it.
 - Recent form: weight the last ~10 days of `*_recent` matches for both players. Two recent wins by the underdog over comparably-ranked opponents should compress, not extend, the favorite edge.
 - If either player has no recent matches in the cache, set RECOMMENDATION: SKIP — without recent form we cannot anchor the call.
+- SLAM / WIMBLEDON COHORT (BACKTEST-VALIDATED 2026-06-14): at Wimbledon specifically — and to a lesser extent the other three slams — higher-ranked favorites win at a meaningfully higher rate than they do at tour-level events. 380-day backtest: tour-grass naive baseline 65.0%, Wimbledon naive baseline 71.5% (+6.5pp). Strongest cell is gap=35-75 at Wimbledon where naive hits 77.5% (Wilson_lo 66.5%). Two adjustments when the market title or event context indicates Wimbledon (or any slam — Australian Open, French Open, US Open):
+    - You may raise favorite probability up to 80% (vs the normal 75% ceiling) on a 50+ rank gap.
+    - Treat HIGH confidence as appropriate at gap≥35 (the normal threshold is gap≥50) — slam BO5 reduces variance enough that mid-gap favorites become near-locks.
+  Do NOT apply this adjustment at non-slam tour events (Halle, Queen's, Cincinnati, etc.) — only the four majors.
 
 MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - MLB market tickers encode the game date as YYMMMDD followed by HHMM and the away+home team abbreviations, e.g. KXMLBSPREAD-26JUN041335CLENYY → 2026-06-04 13:35 CLE@NYY.
@@ -980,6 +1004,51 @@ def _check_recalibration_demote() -> tuple[bool, str]:
     return False, msg
 
 
+_GRASS_SPECIALISTS_CACHE: dict[str, float] | None = None
+
+
+def _load_grass_specialists() -> dict[str, float]:
+    """Return {player_name: delta_pp} where delta_pp = (career grass
+    win rate) − (career overall win rate), in percentage points.
+
+    Loaded once from data/grass_specialists.json; cached for the
+    process lifetime. Empty dict on any failure (filter gracefully
+    skips when data is unavailable rather than blocking trades)."""
+    global _GRASS_SPECIALISTS_CACHE
+    if _GRASS_SPECIALISTS_CACHE is not None:
+        return _GRASS_SPECIALISTS_CACHE
+    try:
+        with GRASS_SPECIALISTS_PATH.open() as f:
+            data = json.load(f)
+        _GRASS_SPECIALISTS_CACHE = {
+            name: float(info.get("delta_pp", 0.0))
+            for name, info in (data.get("players") or {}).items()
+        }
+        print(
+            f"[edge] loaded {len(_GRASS_SPECIALISTS_CACHE)} grass "
+            f"specialists from {GRASS_SPECIALISTS_PATH}",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"[WARN] grass_specialists.json unloadable: {e} — "
+            f"grass filter will SKIP all grass markets",
+            flush=True,
+        )
+        _GRASS_SPECIALISTS_CACHE = {}
+    return _GRASS_SPECIALISTS_CACHE
+
+
+def _is_grass_event(title: str) -> bool:
+    """True if the market title matches a known grass-court tournament.
+    Heuristic but conservative — only the four slams (just Wimbledon
+    for grass) and the established summer-grass swing events qualify.
+    Adding a tournament here triggers the grass-specialist gate; leave
+    out events with unknown surface to fail safe (filter doesn't fire)."""
+    t = (title or "").lower()
+    return any(g in t for g in GRASS_TOURNAMENTS)
+
+
 def _tennis_filter_passes(
     item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -1058,6 +1127,37 @@ def _tennis_filter_passes(
     gap = no_rank - yes_rank
     if gap <= TENNIS_MIN_RANK_GAP:
         return False, f"gap={gap} <= {TENNIS_MIN_RANK_GAP}"
+
+    # Grass-event additional gate. 380-day backtest 2026-06-14 showed
+    # that on grass tournaments, the higher-ranked player's win rate is
+    # cleanly stratified by their grass-vs-overall career delta vs the
+    # opponent. When A's grass delta exceeds B's by ≥5pp, the favorite
+    # wins 73.5% (Wilson_lo 56.9%); when A is ≥5pp worse on grass, the
+    # favorite drops to 53.7%. Without this gate the filter would buy
+    # rank-favorites who are systematically worse on grass than their
+    # ranking suggests — exactly the wrong side at Wimbledon.
+    if GRASS_FILTER_ENABLED and _is_grass_event(item.get("title", "")):
+        specialists = _load_grass_specialists()
+        yes_delta = specialists.get(yes_player)
+        no_delta = specialists.get(no_player)
+        if yes_delta is None or no_delta is None:
+            return False, (
+                f"grass event but missing specialist data "
+                f"(yes={yes_player!r}: {yes_delta}, "
+                f"no={no_player!r}: {no_delta})"
+            )
+        diff = yes_delta - no_delta
+        if diff < GRASS_MIN_DELTA_DIFF_PP:
+            return False, (
+                f"grass event but YES grass-delta vs opp is "
+                f"{diff:+.1f}pp < {GRASS_MIN_DELTA_DIFF_PP:.1f}pp threshold "
+                f"({yes_player}={yes_delta:+.1f}pp, "
+                f"{no_player}={no_delta:+.1f}pp)"
+            )
+        return True, (
+            f"YES={yes_player}(#{yes_rank}) vs {no_player}(#{no_rank}) "
+            f"gap={gap} ask={yes_ask}c [grass-spec diff +{diff:.1f}pp]"
+        )
 
     return True, (
         f"YES={yes_player}(#{yes_rank}) vs {no_player}(#{no_rank}) "
@@ -1252,6 +1352,13 @@ def run() -> None:
         f"max_ask_cents={TENNIS_MAX_ASK_CENTS} "
         f"min_rank_gap={TENNIS_MIN_RANK_GAP} "
         f"series={['KXATPMATCH','KXWTAMATCH']}",
+        flush=True,
+    )
+    print(
+        f"[edge] grass-filter: enabled={GRASS_FILTER_ENABLED} "
+        f"min_delta_diff_pp={GRASS_MIN_DELTA_DIFF_PP} "
+        f"specialists_loaded={len(_load_grass_specialists())} "
+        f"tournaments={len(GRASS_TOURNAMENTS)}",
         flush=True,
     )
     print(

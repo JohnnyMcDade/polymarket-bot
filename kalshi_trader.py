@@ -520,11 +520,19 @@ def run() -> None:
                     placed, error, order = _place_order(ticker, side, contracts, yes_cents)
                     timestamp = datetime.now(timezone.utc).isoformat()
 
+                    _our_prob = round(float(item.get("true_probability", 0)), 4)
+                    _mkt_price = round(yes_cents / 100, 4)
                     entry = {
                         "ticker": ticker,
                         "title": item.get("title", ""),
-                        "our_prob": round(float(item.get("true_probability", 0)), 4),
-                        "market_price": round(yes_cents / 100, 4),
+                        "our_prob": _our_prob,
+                        # Aliases for downstream calibration tooling that
+                        # expects the canonical field names. Identical
+                        # values; kept alongside our_prob / market_price
+                        # so existing dashboards don't break.
+                        "true_probability": _our_prob,
+                        "market_price": _mkt_price,
+                        "yes_ask": _mkt_price,
                         "market_price_cents": yes_cents,
                         "edge": round(float(item.get("edge", 0)), 4),
                         "confidence": item.get("confidence", "?"),
