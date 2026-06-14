@@ -162,7 +162,7 @@ _ESPN_WTA_RANKINGS = "https://site.api.espn.com/apis/v2/sports/tennis/wta/rankin
 _ESPN_ATP_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
 _ESPN_WTA_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
 _HTTP_TIMEOUT = 15
-_TENNIS_RANK_DEPTH = int(os.getenv("KALSHI_STATS_TENNIS_RANK_DEPTH", "75"))
+_TENNIS_RANK_DEPTH = int(os.getenv("KALSHI_STATS_TENNIS_RANK_DEPTH", "200"))
 _TENNIS_FORM_DAYS = int(os.getenv("KALSHI_STATS_TENNIS_FORM_DAYS", "10"))
 
 # Stable division ID → name map (statsapi /divisions). Hardcoded because
