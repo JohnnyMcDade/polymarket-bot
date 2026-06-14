@@ -167,6 +167,23 @@ PRICE_HISTORY_PATH = Path(os.getenv("KALSHI_EDGE_PRICE_HISTORY", "/app/data/edge
 # many cents since we last saw it, someone with information we don't have
 # has been trading — skip the cycle for this ticker and let it stabilize.
 MAX_LINE_MOVE_CENTS = int(os.getenv("KALSHI_MAX_LINE_MOVE_CENTS", "5"))
+# Per-series tighter line-move thresholds. KXMLBTOTAL gets 3¢ (vs the
+# global 5¢) because total-runs markets reprice sharply on lineup
+# confirmations / weather updates that we can't see, and the few-cent
+# moves carry more information per cent than other series. Sharp-money
+# triggers > 3¢ on KXMLBTOTAL means someone has private data we don't.
+SERIES_LINE_MOVE_CENTS: dict[str, int] = {
+    "KXMLBTOTAL": int(os.getenv("KALSHI_KXMLBTOTAL_LINE_MOVE_CENTS", "3")),
+}
+
+
+def _line_move_threshold_for(ticker: str) -> int:
+    """Return the line-move skip threshold (cents) for a ticker.
+    Per-series override if defined, else global default."""
+    for prefix, thresh in SERIES_LINE_MOVE_CENTS.items():
+        if ticker.startswith(prefix):
+            return thresh
+    return MAX_LINE_MOVE_CENTS
 # Ignore stored prices older than this — a 3-day-old price isn't a
 # "movement signal," it's just a different market state.
 PRICE_HISTORY_MAX_AGE_SECS = int(os.getenv("KALSHI_PRICE_HISTORY_MAX_AGE", "86400"))
@@ -559,20 +576,24 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
 
         yes_cents = int(round(ya * 100))
 
-        # Line-movement guard. Use the persisted price for this ticker; if
-        # the YES price has shifted more than MAX_LINE_MOVE_CENTS since we
-        # last looked, someone with private information has been trading —
-        # skip this cycle and update history so the next cycle can re-check
-        # against the new baseline. New tickers (no prior entry) pass through.
+        # Line-movement guard. Use the persisted price for this ticker;
+        # if the YES price has shifted more than the per-series threshold
+        # since we last looked, someone with private information has been
+        # trading — skip this cycle and update history so the next cycle
+        # can re-check against the new baseline. KXMLBTOTAL uses a tighter
+        # 3¢ threshold via _line_move_threshold_for(); other series fall
+        # back to MAX_LINE_MOVE_CENTS (default 5¢). New tickers (no prior
+        # entry) pass through.
+        threshold = _line_move_threshold_for(ticker)
         prior = price_history.get(ticker)
         if prior and (now_ts - float(prior.get("ts", 0))) <= PRICE_HISTORY_MAX_AGE_SECS:
-            move = abs(yes_cents - float(prior.get("price_cents", yes_cents)))
-            if move > MAX_LINE_MOVE_CENTS:
+            old_cents = int(float(prior.get("price_cents", yes_cents)))
+            move = abs(yes_cents - old_cents)
+            if move > threshold:
                 drops["line_moved"] += 1
                 print(
-                    f"[edge] line-move skip {ticker}: "
-                    f"{prior.get('price_cents')}¢ → {yes_cents}¢ "
-                    f"(Δ{move:.0f}¢ > {MAX_LINE_MOVE_CENTS}¢)",
+                    f"[LINE-MOVE-SKIP] {ticker} {old_cents}¢→{yes_cents}¢ "
+                    f"(Δ{move}¢ > {threshold}¢ threshold)",
                     flush=True,
                 )
                 price_history[ticker] = {"price_cents": yes_cents, "ts": now_ts}
