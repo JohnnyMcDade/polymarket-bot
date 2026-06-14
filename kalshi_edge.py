@@ -812,16 +812,19 @@ def _backtest_cohort_passes(
             return True, f"opp-elite/good ({opp_era:.2f})"
         return False, f"opp-avg/bad ({opp_era:.2f})"
 
-    # KXMLBTOTAL
+    # KXMLBTOTAL — match the 180-day backtest cohort, which used
+    # era_tier(starter_avg_era), i.e. the AVERAGE of both starters'
+    # rolling_era_last3 (not min/max individually). "Both individually
+    # ≤ cap" was empirically too tight: live validation against the
+    # full slate showed 0% pass rate vs ~33% expected, because a single
+    # bad recent start can drag one rolling-3 above 3.50 even when the
+    # pair's edge is real (e.g. Skenes 2.25 + Meyer 3.93 → avg 3.09).
     if away_era is None or home_era is None:
         return False, "era-missing"
-    worst = max(away_era, home_era)
-    if (
-        away_era <= BACKTEST_FILTER_ERA_CAP
-        and home_era <= BACKTEST_FILTER_ERA_CAP
-    ):
-        return True, f"both-elite/good (max {worst:.2f})"
-    return False, f"pair-avg/bad (max {worst:.2f})"
+    avg_era = (away_era + home_era) / 2.0
+    if avg_era <= BACKTEST_FILTER_ERA_CAP:
+        return True, f"avg-elite/good ({avg_era:.2f})"
+    return False, f"avg-bad ({avg_era:.2f})"
 
 
 def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> str:
