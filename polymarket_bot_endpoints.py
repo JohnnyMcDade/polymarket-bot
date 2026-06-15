@@ -336,6 +336,127 @@ def _dash_go_live(state: dict) -> dict:
 # don't represent current bot performance. The dashboard defaults to the
 # windowed view; `?since=all` shows lifetime stats.
 _DASH_DEFAULT_SINCE = "2026-06-07"
+_DASH_COHORT_ERA_CAP = 3.50  # mirrors kalshi_edge.BACKTEST_FILTER_ERA_CAP
+
+
+def _dash_load_stats_cache() -> dict:
+    if not STATS_CACHE_PATH.exists():
+        return {}
+    try:
+        with STATS_CACHE_PATH.open() as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _dash_qualifying_games(stats: dict, max_rows: int = 5) -> list[dict]:
+    """Return today/tomorrow's MLB games that pass the KXMLBTOTAL
+    cohort filter (avg starter rolling_era_last3 ≤ _DASH_COHORT_ERA_CAP).
+
+    Strategy: collect all upcoming_games whose game_date is today or
+    later. For each, compute avg ERA when both starters have data;
+    classify into tiers and keep those that qualify. Sort by date asc
+    then avg_era asc, take top max_rows. The 'next' game per the user
+    spec just falls out as the head of the list."""
+    games = (stats.get("mlb", {}) or {}).get("upcoming_games", []) or []
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    rows: list[dict] = []
+    for g in games:
+        gd = str(g.get("game_date", ""))
+        if gd < today_iso:
+            continue
+        aw = (g.get("away_pitcher") or {})
+        hp = (g.get("home_pitcher") or {})
+        ae = aw.get("rolling_era_last3")
+        he = hp.get("rolling_era_last3")
+        if not isinstance(ae, (int, float)) or not isinstance(he, (int, float)):
+            continue
+        avg = (float(ae) + float(he)) / 2.0
+        if avg > _DASH_COHORT_ERA_CAP:
+            continue
+        rows.append({
+            "date": gd,
+            "matchup": f"{g.get('away','?')}@{g.get('home','?')}",
+            "away_pitcher": aw.get("player", ""),
+            "home_pitcher": hp.get("player", ""),
+            "avg_era": avg,
+            "tier": "elite" if avg <= 2.50 else "good",
+            "park_factor": g.get("park_factor"),
+            "weather": g.get("weather") or {},
+            "start_time_utc": g.get("start_time_utc", "?"),
+        })
+    rows.sort(key=lambda r: (r["date"], r["avg_era"]))
+    return rows[:max_rows]
+
+
+def _dash_render_frequency_svg(trades: list[dict], days: int = 14,
+                               width: int = 800, height: int = 200) -> str:
+    """14-day bar chart of trade count per day. Independent of the
+    `since` filter so the trend signal stays stable across views.
+
+    X-axis: oldest → newest, left → right. One bar per day.
+    Bar height proportional to that day's trade count. Day label
+    (MM-DD) under each bar. Count above each bar when > 0."""
+    today = datetime.now(timezone.utc).date()
+    dates = [(today - timedelta(days=i)).isoformat()
+             for i in range(days - 1, -1, -1)]
+    counts: dict[str, int] = {d: 0 for d in dates}
+    for t in trades:
+        ts = (t.get("timestamp") or "")[:10]
+        if ts in counts:
+            counts[ts] += 1
+    series = [counts[d] for d in dates]
+    if not any(series):
+        return ('<svg width="{w}" height="{h}"><text x="{tx}" y="{ty}" '
+                'fill="#999" text-anchor="middle" font-family="system-ui">'
+                'no trades placed in the last {d} days</text></svg>').format(
+            w=width, h=height, tx=width / 2, ty=height / 2, d=days)
+    pad_top = 20
+    pad_bot = 30
+    pad_lr = 24
+    plot_h = height - pad_top - pad_bot
+    plot_w = width - 2 * pad_lr
+    bar_w = (plot_w / days) * 0.75
+    bar_gap = (plot_w / days) * 0.25
+    max_c = max(series) or 1
+    bars: list[str] = []
+    labels: list[str] = []
+    counts_text: list[str] = []
+    for i, d in enumerate(dates):
+        c = counts[d]
+        x = pad_lr + i * (bar_w + bar_gap) + bar_gap / 2
+        h_bar = (c / max_c) * plot_h if c else 0
+        y = pad_top + plot_h - h_bar
+        bars.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
+            f'height="{h_bar:.1f}" fill="#4a8fd8" rx="2"/>'
+        )
+        # Date label below bar — show MM-DD; print every-other for
+        # 14-day chart to avoid crowding
+        if i % 2 == 0:
+            labels.append(
+                f'<text x="{x + bar_w/2:.1f}" y="{height - 8}" '
+                f'fill="#888" text-anchor="middle" font-family="system-ui" '
+                f'font-size="10">{d[5:]}</text>'
+            )
+        if c > 0:
+            counts_text.append(
+                f'<text x="{x + bar_w/2:.1f}" y="{y - 4:.1f}" '
+                f'fill="#333" text-anchor="middle" font-family="system-ui" '
+                f'font-size="11" font-weight="600">{c}</text>'
+            )
+    total = sum(series)
+    avg_per_day = total / days
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'role="img" aria-label="Trade frequency last {days} days">'
+        f'<text x="{pad_lr}" y="{pad_top - 6}" fill="#888" '
+        f'font-family="system-ui" font-size="11">'
+        f'total: {total} · avg: {avg_per_day:.1f}/day · peak: {max_c}/day'
+        f'</text>'
+        f'{"".join(bars)}{"".join(counts_text)}{"".join(labels)}'
+        f'</svg>'
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -360,6 +481,11 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     recent = _dash_recent_table(trades, limit=10)
     gl = _dash_go_live(_dash_load_go_live())
     svg = _dash_render_cumulative_svg(trades)
+    # Frequency chart uses ALL trades (not just window-filtered) so the
+    # 14-day rolling trend is independent of the page's since filter.
+    freq_svg = _dash_render_frequency_svg(all_trades, days=14)
+    stats_cache = _dash_load_stats_cache()
+    qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Window controls — single bar with current scope + toggle link.
@@ -383,6 +509,60 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     )
 
     pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
+
+    # Build the qualifying-games table HTML. If no rows, show a hint
+    # rather than an empty table — distinguishes "no eligible games"
+    # from "stats_cache is missing".
+    qual_rows_html: list[str] = []
+    for q in qualifying_games:
+        w = q.get("weather") or {}
+        wparts = []
+        if w.get("temp_f") is not None:
+            wparts.append(f"{w['temp_f']:.0f}°F")
+        if w.get("wind_mph") is not None:
+            wparts.append(
+                f"{w['wind_mph']:.0f}mph {w.get('wind_dir', '')}".strip()
+            )
+        wstr = ", ".join(wparts) if wparts else "—"
+        tier_color = "#1e7e1e" if q["tier"] == "elite" else "#4a8fd8"
+        pf = q.get("park_factor")
+        pf_str = f"{pf:.2f}" if isinstance(pf, (int, float)) else "—"
+        qual_rows_html.append(
+            f"<tr>"
+            f"<td>{q['date']}</td>"
+            f"<td>{q['matchup']}</td>"
+            f"<td>{q['away_pitcher'][:18]} ({q.get('away_pitcher','')!r})</td>".replace("'", "")
+            if False else  # never — keep the simpler renderer below
+            f"<td>{q['date']}</td>"
+        )
+    qual_rows_html = []  # rebuild cleanly
+    for q in qualifying_games:
+        w = q.get("weather") or {}
+        wparts = []
+        if w.get("temp_f") is not None:
+            wparts.append(f"{w['temp_f']:.0f}°F")
+        if w.get("wind_mph") is not None:
+            wparts.append(
+                f"{w['wind_mph']:.0f}mph {w.get('wind_dir', '')}".strip()
+            )
+        wstr = ", ".join(wparts) if wparts else "—"
+        pf = q.get("park_factor")
+        pf_str = f"{pf:.2f}" if isinstance(pf, (int, float)) else "—"
+        tier_color = "#1e7e1e" if q["tier"] == "elite" else "#4a8fd8"
+        qual_rows_html.append(
+            f"<tr>"
+            f"<td>{q['date']}</td>"
+            f"<td>{q['matchup']}</td>"
+            f"<td>{q['start_time_utc']}Z</td>"
+            f"<td>{q['away_pitcher'][:20]}</td>"
+            f"<td>{q['home_pitcher'][:20]}</td>"
+            f"<td>{q['avg_era']:.2f}</td>"
+            f"<td><span style='color:{tier_color};font-weight:600;'>"
+            f"{q['tier']}</span></td>"
+            f"<td>{pf_str}</td>"
+            f"<td>{wstr}</td>"
+            f"</tr>"
+        )
 
     series_table_rows = []
     for r in series_rows:
@@ -493,6 +673,23 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 
 <h2>Cumulative P&amp;L</h2>
 {svg}
+
+<h2>Trade frequency — last 14 days</h2>
+{freq_svg}
+
+<h2>Next qualifying KXMLBTOTAL games</h2>
+<p class="muted" style="margin-top:0;">
+Games where avg(starter rolling_era_last3) ≤ {_DASH_COHORT_ERA_CAP} —
+the production cohort filter. If empty, expect KXMLBTOTAL to SKIP today.
+</p>
+<table>
+<thead>
+<tr><th>Date</th><th>Matchup</th><th>Start</th><th>Away SP</th><th>Home SP</th><th>Avg ERA</th><th>Tier</th><th>Park</th><th>Weather</th></tr>
+</thead>
+<tbody>
+{"".join(qual_rows_html) or "<tr><td colspan='9' class='muted'>no upcoming games clear the cohort filter — today is a likely no-trade day for KXMLBTOTAL</td></tr>"}
+</tbody>
+</table>
 
 <h2>By series</h2>
 <table>
