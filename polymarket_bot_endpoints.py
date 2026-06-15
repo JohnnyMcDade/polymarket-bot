@@ -344,6 +344,59 @@ _DASH_COHORT_ERA_CAP = 3.50  # mirrors kalshi_edge.BACKTEST_FILTER_ERA_CAP
 _DASH_BTC_FG_LOW = int(os.getenv("KALSHI_BTC_FG_EXTREME_LOW", "20"))
 _DASH_BTC_FG_HIGH = int(os.getenv("KALSHI_BTC_FG_EXTREME_HIGH", "80"))
 
+# Stadium names per home team abbreviation. Current 2026 names — historical
+# names (Safeco/Minute Maid/Gerry Weber-style legacy aliases) are not
+# tracked here; if Kalshi titles ever use a sponsor name we don't know
+# about we'll fall back to the abbr.
+_DASH_STADIUM: dict[str, str] = {
+    "ARI": "Chase Field",
+    "ATL": "Truist Park",
+    "BAL": "Camden Yards",
+    "BOS": "Fenway Park",
+    "CHC": "Wrigley Field",
+    "CWS": "Guaranteed Rate Field",
+    "CIN": "Great American Ball Park",
+    "CLE": "Progressive Field",
+    "COL": "Coors Field",
+    "DET": "Comerica Park",
+    "HOU": "Daikin Park",
+    "KC":  "Kauffman Stadium",
+    "LAA": "Angel Stadium",
+    "LAD": "Dodger Stadium",
+    "MIA": "LoanDepot Park",
+    "MIL": "American Family Field",
+    "MIN": "Target Field",
+    "NYM": "Citi Field",
+    "NYY": "Yankee Stadium",
+    "OAK": "Sutter Health Park",  # Sacramento, since 2025
+    "PHI": "Citizens Bank Park",
+    "PIT": "PNC Park",
+    "SD":  "Petco Park",
+    "SEA": "T-Mobile Park",
+    "SF":  "Oracle Park",
+    "STL": "Busch Stadium",
+    "TB":  "Tropicana Field",
+    "TEX": "Globe Life Field",
+    "TOR": "Rogers Centre",
+    "WSH": "Nationals Park",
+}
+
+
+def _dash_utc_to_az_str(utc_hhmm: str) -> str:
+    """Convert a 'HH:MM' UTC time string to Arizona local 12-hour clock.
+    Arizona doesn't observe DST so it's MST year-round = UTC-7. Returns
+    e.g. '6:40 PM AZ'. Falls back to the original string on parse error
+    so the caller can still display something."""
+    try:
+        hh, mm = utc_hhmm.split(":")
+        h = (int(hh) - 7) % 24
+        m = int(mm)
+        suffix = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m:02d} {suffix} AZ"
+    except (ValueError, AttributeError):
+        return f"{utc_hhmm}Z"
+
 
 def _dash_load_stats_cache() -> dict:
     if not STATS_CACHE_PATH.exists():
@@ -557,8 +610,17 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         prefix = "Best game today" if bg["date"] == today_iso else (
             f"Best upcoming ({bg['date']})"
         )
+        # Stadium name from the home team. Matchup is 'AWAY@HOME', so the
+        # home abbr is the part after '@'.
+        home_abbr = bg["matchup"].split("@", 1)[-1] if "@" in bg["matchup"] else ""
+        stadium = _DASH_STADIUM.get(home_abbr, home_abbr or "—")
         pf = bg.get("park_factor")
-        pf_str = f"park {pf:.2f}" if isinstance(pf, (int, float)) else "park —"
+        pf_str = (
+            f"{stadium} {pf:.2f} park factor"
+            if isinstance(pf, (int, float)) else stadium
+        )
+        # UTC → Arizona local (MST, no DST → UTC-7) per spec.
+        az_time = _dash_utc_to_az_str(bg["start_time_utc"])
         w = bg.get("weather") or {}
         wstr = ""
         if w.get("temp_f") is not None and w.get("wind_mph") is not None:
@@ -566,8 +628,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         best_game_html = (
             f'<div class="highlight highlight-green">'
             f'🎯 <strong>{prefix}:</strong> {bg["matchup"]} — '
-            f'<strong>{bg["tier"]}</strong> tier ({bg["avg_era"]:.2f} avg ERA), '
-            f'{bg["start_time_utc"]}Z, {pf_str}{wstr}'
+            f'<strong>{bg["tier"].capitalize()}</strong> tier '
+            f'({bg["avg_era"]:.2f} avg ERA), '
+            f'{az_time}, {pf_str}{wstr}'
             f'</div>'
         )
     else:
