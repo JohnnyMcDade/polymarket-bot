@@ -137,6 +137,26 @@ TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
 #   A's grass-delta − B's: ≤−5pp → A wins 53.7% (barely above 50%)
 # Specialist data lives in data/grass_specialists.json (regen by
 # re-running the backtest grass deep-dive — see backtest_kalshi_tennis.py).
+# KXBTC strategy rebuild (2026-06-15). Prior history: 0W/5L because
+# Claude was claiming 99% on bucket markets (KXBTC-...-B<n> tickers).
+# The bucket filter still catches those. For the binary BTC direction
+# markets (e.g., KXBTC15M "BTC up in 15 mins"), we now require all of:
+#   - Fear & Greed Index in EXTREME zone (< BTC_FG_EXTREME_LOW or
+#     > BTC_FG_EXTREME_HIGH) — calm markets are too efficient
+#   - YES ask in BTC_PRICE_MIN_CENTS..BTC_PRICE_MAX_CENTS — avoids
+#     bucket-like long-tail tickers
+#   - Claude-claimed edge ≥ BTC_MIN_EDGE — much stricter than the
+#     global MIN_EDGE because BTC is harder to predict than sports
+# Direction agreement (F&G fear + positive 24h momentum = bounce; F&G
+# greed + negative momentum = reversal) is enforced in the prompt
+# methodology, not as a hard filter — Claude evaluates the direction.
+BTC_FILTER_ENABLED = os.getenv("KALSHI_BTC_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+BTC_FG_EXTREME_LOW = int(os.getenv("KALSHI_BTC_FG_EXTREME_LOW", "20"))
+BTC_FG_EXTREME_HIGH = int(os.getenv("KALSHI_BTC_FG_EXTREME_HIGH", "80"))
+BTC_PRICE_MIN_CENTS = int(os.getenv("KALSHI_BTC_PRICE_MIN_CENTS", "30"))
+BTC_PRICE_MAX_CENTS = int(os.getenv("KALSHI_BTC_PRICE_MAX_CENTS", "70"))
+BTC_MIN_EDGE = float(os.getenv("KALSHI_BTC_MIN_EDGE", "0.10"))
+
 GRASS_FILTER_ENABLED = os.getenv("KALSHI_GRASS_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
 GRASS_MIN_DELTA_DIFF_PP = float(os.getenv("KALSHI_GRASS_MIN_DELTA_DIFF_PP", "5.0"))
 GRASS_SPECIALISTS_PATH = Path(os.getenv(
@@ -223,8 +243,11 @@ SERIES_TICKERS = [
         # Tennis (KXATPMATCH / KXWTAMATCH) re-enabled for the grass swing
         # and Wimbledon — gated by the mispricing-only TENNIS_FILTER below
         # (HIGH conf + gap > 50 + ask ≤ 62¢), so series re-add doesn't
-        # broaden trading on its own.
-        "KXMLBTOTAL,KXMLBSPREAD,KXMLBTEAMTOTAL,KXATPMATCH,KXWTAMATCH",
+        # broaden trading on its own. KXBTC re-enabled 2026-06-15 with
+        # the new F&G + price-band + 10% edge gate (see _btc_filter_passes)
+        # — bucket tickers continue to be filtered by _is_btc_bucket_ticker
+        # before this filter is even consulted.
+        "KXMLBTOTAL,KXMLBSPREAD,KXMLBTEAMTOTAL,KXATPMATCH,KXWTAMATCH,KXBTC",
     ).split(",") if s.strip()
 ]
 
@@ -765,6 +788,16 @@ KXBTC RANGE-BUCKET MARKETS (READ BEFORE EVALUATING ANY KXBTC TICKER)
 - For any KXBTC ticker matching this shape, RECOMMENDATION must be SKIP regardless of computed edge. Set CONFIDENCE: LOW and REASONING: "KXBTC range-bucket ticker — narrow bucket, not a cumulative threshold; skipping per rule."
 - Binary BTC markets in other series (e.g. KXBTC15M "BTC price up in next 15 mins?") are not affected by this rule.
 
+KXBTC BINARY-DIRECTION STRATEGY (2026-06-15 rebuild)
+- Binary KXBTC tickers (KXBTC15M and other "BTC up/down in N mins/hours" forms) are evaluated via a strict three-gate filter implemented in code: Fear & Greed in EXTREME zone (< 20 or > 80), YES ask in 30-70¢ band, edge ≥ +10%. Predictions that don't clear all three get SKIP'd post-Claude.
+- Your role: estimate the directional probability using `economic.crypto_fear_greed_value` (0-100), `economic.crypto_fear_greed_classification`, and `economic.btc_24h_momentum_pct` (percent change of last vs. 24h-ago Coinbase BTC spot). Apply the contrarian-extreme rule:
+    - F&G < 20 (Extreme Fear) AND btc_24h_momentum_pct > 0  →  bounce signal; favor YES on "BTC up" markets.
+    - F&G < 20 (Extreme Fear) AND btc_24h_momentum_pct < -2 → momentum-down + fear; ambiguous; SKIP unless edge is obvious.
+    - F&G > 80 (Extreme Greed) AND btc_24h_momentum_pct < 0  →  reversal signal; favor YES on "BTC down" markets.
+    - F&G > 80 (Extreme Greed) AND btc_24h_momentum_pct > +2 → continued melt-up; ambiguous; SKIP.
+    - F&G in 20-80 (calm zone): SKIP regardless of momentum. The code filter will SKIP this too — your verdict here is informational.
+- Edge ceiling: do NOT claim >25% edge on KXBTC binary markets. BTC short-horizon direction is genuinely uncertain — even strong contrarian setups historically clear ~58-62%. A claimed edge of +30% on a binary BTC market means you are misreading the time window or the market's resolution criteria.
+
 GAS / THRESHOLD MARKETS (KXAAAGASD AND SIMILAR DAILY-AVERAGE TICKERS)
 - These markets resolve on the AAA daily national-average gas price for a specific date. The threshold is in the ticker tail (e.g. KXAAAGASD-26JUN04-4.260 → threshold $4.260).
 - If the current value of the underlying is within 0.5% of the threshold, treat the market as a coin flip. RECOMMENDATION: SKIP regardless of computed edge — daily settlement variance and rounding dominate any apparent edge from "we are already above/below by a tenth of a cent."
@@ -1207,6 +1240,68 @@ def _is_grass_event(title: str) -> bool:
     return any(g in t for g in GRASS_TOURNAMENTS)
 
 
+def _btc_filter_passes(
+    item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
+) -> tuple[bool, str]:
+    """Strict gate for KXBTC binary-direction markets. Returns
+    (passes, reason).
+
+    PASS conditions (all required):
+      - Crypto Fear & Greed Index in EXTREME zone (< BTC_FG_EXTREME_LOW
+        or > BTC_FG_EXTREME_HIGH)
+      - YES ask in [BTC_PRICE_MIN_CENTS, BTC_PRICE_MAX_CENTS] — avoids
+        bucket-shaped long tails (which the bucket regex catches anyway,
+        but this is belt-and-suspenders)
+      - Claude-claimed edge ≥ BTC_MIN_EDGE (default +10%)
+
+    Non-BTC tickers return (True, "n/a") so this is a no-op on other
+    series. Direction agreement (fear+momentum-up = bounce, etc.) is
+    enforced via prompt methodology, not as a hard filter, because the
+    direction-mapping depends on each market's specific YES semantics
+    (which Claude reads from the title)."""
+    ticker = item.get("ticker", "")
+    if not ticker.startswith("KXBTC"):
+        return True, "n/a"
+    # Bucket markets are killed by _is_btc_bucket_ticker upstream; defense-
+    # in-depth here so a bucket that somehow slips through still SKIPs.
+    if _is_btc_bucket_ticker(ticker):
+        return False, "bucket ticker (should have been filtered earlier)"
+
+    edge = float(pred.get("edge") or 0.0)
+    if edge < BTC_MIN_EDGE:
+        return False, f"edge={edge:+.2f} < +{BTC_MIN_EDGE:.2f} BTC floor"
+
+    yes_ask = int(item.get("yes_ask_cents") or 0)
+    if yes_ask < BTC_PRICE_MIN_CENTS or yes_ask > BTC_PRICE_MAX_CENTS:
+        return False, (
+            f"yes_ask={yes_ask}c outside [{BTC_PRICE_MIN_CENTS}, "
+            f"{BTC_PRICE_MAX_CENTS}]¢ band"
+        )
+
+    econ = (stats.get("economic") or {})
+    fng = econ.get("crypto_fear_greed_value")
+    if fng is None:
+        return False, "no Fear & Greed reading in stats cache"
+    try:
+        fng_i = int(fng)
+    except (TypeError, ValueError):
+        return False, f"F&G unparseable: {fng!r}"
+    if BTC_FG_EXTREME_LOW <= fng_i <= BTC_FG_EXTREME_HIGH:
+        return False, (
+            f"F&G={fng_i} in calm zone "
+            f"[{BTC_FG_EXTREME_LOW}, {BTC_FG_EXTREME_HIGH}] — "
+            f"need <{BTC_FG_EXTREME_LOW} or >{BTC_FG_EXTREME_HIGH}"
+        )
+
+    momentum = econ.get("btc_24h_momentum_pct")
+    classification = econ.get("crypto_fear_greed_classification", "")
+    return True, (
+        f"F&G={fng_i}({classification}) "
+        f"yes_ask={yes_ask}c edge={edge:+.2f} "
+        f"btc_24h={momentum}%"
+    )
+
+
 def _tennis_filter_passes(
     item: dict[str, Any], pred: dict[str, Any], stats: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -1520,6 +1615,13 @@ def run() -> None:
         flush=True,
     )
     print(
+        f"[edge] btc-filter: enabled={BTC_FILTER_ENABLED} "
+        f"f&g_extreme_zone=[<{BTC_FG_EXTREME_LOW},>{BTC_FG_EXTREME_HIGH}] "
+        f"price_band=[{BTC_PRICE_MIN_CENTS},{BTC_PRICE_MAX_CENTS}]¢ "
+        f"min_edge={BTC_MIN_EDGE:+.2f}",
+        flush=True,
+    )
+    print(
         f"[edge] recalib-demote: enabled={RECALIB_DEMOTE_ENABLED} "
         f"lookback_n={RECALIB_LOOKBACK_N} "
         f"wr_threshold={RECALIB_WR_THRESHOLD:.0%} "
@@ -1814,6 +1916,36 @@ def run() -> None:
                                 else:
                                     print(
                                         f"[TENNIS-FILTER] {ticker} PASS {reason}",
+                                        flush=True,
+                                    )
+                            # BTC mispricing filter. KXBTC binary
+                            # markets only — bucket tickers already
+                            # filtered by _is_btc_bucket_ticker. Need
+                            # F&G in extreme zone + ask 30-70¢ + edge
+                            # ≥ 10%. Non-KXBTC tickers pass through.
+                            if (
+                                BTC_FILTER_ENABLED
+                                and pred["recommendation"] == "BUY"
+                                and ticker.startswith("KXBTC")
+                            ):
+                                ok, reason = _btc_filter_passes(it, pred, stats)
+                                if not ok:
+                                    pred["recommendation"] = "SKIP"
+                                    post_drops["btc_filter"] = (
+                                        post_drops.get("btc_filter", 0) + 1
+                                    )
+                                    pred["reasoning"] = (
+                                        f"[btc-filter SKIP] {reason} | "
+                                        + pred.get("reasoning", "")
+                                    )
+                                    print(
+                                        f"[BTC-FILTER] {ticker} SKIP "
+                                        f"reason={reason}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"[BTC-FILTER] {ticker} PASS {reason}",
                                         flush=True,
                                     )
                             high_ok = (

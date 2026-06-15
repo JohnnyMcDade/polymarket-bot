@@ -1047,6 +1047,86 @@ def fetch_economic_only() -> dict[str, Any] | None:
     return _extract_json("\n".join(text_parts).strip())
 
 
+def _fetch_btc_24h_stats() -> dict[str, float] | None:
+    """Fetch 24h open/last/high/low for BTC from Coinbase exchange stats.
+    Returns {open, last, momentum_pct} or None on failure.
+
+    momentum_pct = (last - open) / open × 100. The KXBTC strategy uses
+    this with the Fear & Greed reading to confirm direction: extreme
+    fear + recent upward momentum = buy YES on "BTC up" markets;
+    extreme greed + downward momentum = the opposite. Computed once
+    per macro refresh so Claude always has a fresh 24h delta.
+    """
+    try:
+        r = requests.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/stats",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(
+                f"[WARN] Coinbase 24h stats status={r.status_code} "
+                f"body: {r.text[:200]}",
+                flush=True,
+            )
+            return None
+        d = r.json() or {}
+        o = _to_float(d.get("open"))
+        last = _to_float(d.get("last"))
+        if o is None or last is None or o == 0:
+            return None
+        return {
+            "open": o,
+            "last": last,
+            "momentum_pct": round((last - o) / o * 100, 2),
+        }
+    except Exception as e:
+        print(f"[WARN] Coinbase 24h stats fetch failed: {e}", flush=True)
+        return None
+
+
+def _fetch_fear_greed() -> dict[str, Any] | None:
+    """Fetch the Crypto Fear & Greed Index from alternative.me.
+    Returns {value: int (0-100), classification: str} or None on failure.
+
+    0-25 = Extreme Fear (contrarian buy signal)
+    26-45 = Fear
+    46-55 = Neutral
+    56-75 = Greed
+    76-100 = Extreme Greed (contrarian sell signal)
+
+    Free, no auth, updated once per day. Caching for an hour at the
+    macro refresh cadence is fine — the index doesn't move intraday
+    in their data.
+    """
+    try:
+        r = requests.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=10,
+        )
+        if r.status_code != 200:
+            print(
+                f"[WARN] F&G status={r.status_code} body: {r.text[:200]}",
+                flush=True,
+            )
+            return None
+        d = (r.json() or {}).get("data") or []
+        if not d:
+            return None
+        entry = d[0]
+        val = entry.get("value")
+        try:
+            val_i = int(val)
+        except (TypeError, ValueError):
+            return None
+        return {
+            "value": val_i,
+            "classification": entry.get("value_classification", ""),
+        }
+    except Exception as e:
+        print(f"[WARN] F&G fetch failed: {e}", flush=True)
+        return None
+
+
 def _fetch_btc_spot_coinbase() -> tuple[float, str] | None:
     """Fetch BTC/USD spot directly from Coinbase. No auth needed.
     Returns (price_usd, "HH:MM" UTC) or None on failure. Used in
@@ -1083,6 +1163,18 @@ def _refresh_macro() -> None:
     btc = _fetch_btc_spot_coinbase()
     if btc:
         econ["btc_spot_usd"], econ["btc_source_time_utc"] = btc
+    # BTC 24h momentum + Fear & Greed — both feed the KXBTC filter rule.
+    # F&G updates daily but the API is fine to hit hourly. 24h stats
+    # come from Coinbase same as spot, separate endpoint.
+    btc_24h = _fetch_btc_24h_stats()
+    if btc_24h:
+        econ["btc_24h_open"] = btc_24h["open"]
+        econ["btc_24h_last"] = btc_24h["last"]
+        econ["btc_24h_momentum_pct"] = btc_24h["momentum_pct"]
+    fng = _fetch_fear_greed()
+    if fng:
+        econ["crypto_fear_greed_value"] = fng["value"]
+        econ["crypto_fear_greed_classification"] = fng["classification"]
     with _cache_lock:
         cache: dict[str, Any] = {}
         if STATS_CACHE_PATH.exists():
@@ -1096,8 +1188,16 @@ def _refresh_macro() -> None:
         save_cache(cache)
     gas = econ.get("gas_national_avg_usd_per_gal")
     btc = econ.get("btc_spot_usd")
+    btc_mom = econ.get("btc_24h_momentum_pct")
+    fng_v = econ.get("crypto_fear_greed_value")
+    fng_c = econ.get("crypto_fear_greed_classification", "")
     bn = (econ.get("breaking_news") or "").strip()
-    print(f"[macro] refreshed: gas=${gas} btc=${btc} breaking={bn!r}", flush=True)
+    print(
+        f"[macro] refreshed: gas=${gas} btc=${btc} "
+        f"btc_24h_mom={btc_mom}% f&g={fng_v}({fng_c}) "
+        f"breaking={bn!r}",
+        flush=True,
+    )
 
 
 def run_macro() -> None:
