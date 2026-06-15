@@ -186,6 +186,13 @@ MAX_LINE_MOVE_CENTS = int(os.getenv("KALSHI_MAX_LINE_MOVE_CENTS", "5"))
 # market state that actually decides the bet. Other series stay
 # sticky in seen (no evidence the same pattern helps them).
 SEEN_EVICT_T_MINUS_SECS = int(os.getenv("KALSHI_SEEN_EVICT_T_MINUS_SECS", "7200"))
+# Seen-cache TTL. Entries older than this many seconds are filtered
+# out at load AND re-filtered at the start of every cycle, so a market
+# Claude SKIPped yesterday gets a fresh look today. Default 24h. The
+# permanent-seen-cache was throttling KXMLBTOTAL throughput to ~0.6%
+# conversion (4 trades / 622 tickers) because the same ticker would
+# get SKIPped at listing time and never be reconsidered.
+SEEN_EXPIRY_SECS = int(os.getenv("KALSHI_SEEN_EXPIRY_SECS", "86400"))
 # Per-series tighter line-move thresholds. KXMLBTOTAL gets 3¢ (vs the
 # global 5¢) because total-runs markets reprice sharply on lineup
 # confirmations / weather updates that we can't see, and the few-cent
@@ -223,16 +230,48 @@ SERIES_TICKERS = [
 
 # ─── Seen-cache: skip markets we've already evaluated ───────────────────
 
-def _load_seen() -> set[str]:
+def _load_seen() -> dict[str, float]:
+    """Load the seen-cache as {ticker: unix_timestamp_added}. Drops any
+    entry older than SEEN_EXPIRY_SECS at load time.
+
+    Backward-compat: the file used to store {"tickers": [list]}; if we
+    detect that shape we migrate every entry with `now` as the timestamp
+    so they expire 24h from now (graceful — no full re-evaluation
+    avalanche, just a 24h drain). Schema-going-forward is
+    {"tickers": {ticker: ts}}."""
     if not SEEN_CACHE_PATH.exists():
-        return set()
+        return {}
     try:
         with SEEN_CACHE_PATH.open() as f:
             data = json.load(f)
-        return set(data.get("tickers", []))
     except Exception as e:
         print(f"[WARN] edge_seen.json unreadable: {e}", flush=True)
-        return set()
+        return {}
+    raw = data.get("tickers", {})
+    now = time.time()
+    if isinstance(raw, list):
+        print(
+            f"[edge] migrating edge_seen.json from list ({len(raw)} entries) "
+            f"→ dict-of-timestamps; all entries given now as ts (24h drain)",
+            flush=True,
+        )
+        return {t: now for t in raw}
+    if not isinstance(raw, dict):
+        return {}
+    cutoff = now - SEEN_EXPIRY_SECS
+    return {t: float(ts) for t, ts in raw.items() if float(ts) >= cutoff}
+
+
+def _expire_seen(seen: dict[str, float]) -> int:
+    """Drop expired entries in-place. Returns count of entries dropped.
+    Called at the start of every cycle so entries that crossed the TTL
+    boundary mid-process get cleared."""
+    now = time.time()
+    cutoff = now - SEEN_EXPIRY_SECS
+    expired = [t for t, ts in seen.items() if ts < cutoff]
+    for t in expired:
+        del seen[t]
+    return len(expired)
 
 
 # KXBTC (and KXBTCD) hourly/daily "price range on <date>?" markets are
@@ -279,15 +318,17 @@ def _save_price_history(history: dict[str, dict[str, float]]) -> None:
     tmp.replace(PRICE_HISTORY_PATH)
 
 
-def _save_seen(seen: set[str]) -> None:
+def _save_seen(seen: dict[str, float]) -> None:
+    """Persist as {"tickers": {ticker: ts}}. Cap at 20k entries; drop
+    the OLDEST by timestamp (now that we track them, the trim is no
+    longer arbitrary)."""
     if len(seen) > 20_000:
-        # Cap memory + disk. Drop oldest by simple slicing; we have no
-        # ordering signal in a set, so this is a coarse trim.
-        seen = set(list(seen)[-10_000:])
+        keep = sorted(seen.items(), key=lambda kv: -kv[1])[:10_000]
+        seen = dict(keep)
     SEEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SEEN_CACHE_PATH.with_suffix(".tmp")
     with tmp.open("w") as f:
-        json.dump({"tickers": sorted(seen)}, f)
+        json.dump({"tickers": seen}, f)
     tmp.replace(SEEN_CACHE_PATH)
 
 
@@ -581,7 +622,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             if close_dt is not None:
                 secs_to_close = (close_dt - now).total_seconds()
                 if 0 < secs_to_close < SEEN_EVICT_T_MINUS_SECS:
-                    seen.discard(ticker)
+                    seen.pop(ticker, None)
                     print(
                         f"[SEEN-EVICT] {ticker} reason=\"T-2h KXMLBTOTAL\" "
                         f"secs_to_close={int(secs_to_close)}",
@@ -592,7 +633,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             continue
         if _is_btc_bucket_ticker(ticker):
             drops["btc_bucket"] += 1
-            seen.add(ticker)
+            seen[ticker] = time.time()
             continue
         ya = float(m.get("yes_ask_dollars", 0) or 0)
         if ya <= 0.0:
@@ -1462,6 +1503,18 @@ def run() -> None:
     while True:
         cycle += 1
         cycle_start = time.time()
+        # Drop seen-cache entries that crossed the SEEN_EXPIRY_SECS TTL
+        # since the last cycle. Markets Claude SKIPped > 24h ago come
+        # back up for re-evaluation — meaningful since Kalshi often
+        # leaves the same ticker open for days while game state evolves
+        # (probable starters get scratched, lineups confirmed, etc.).
+        expired_n = _expire_seen(seen)
+        if expired_n:
+            print(
+                f"[SEEN-EXPIRED] count={expired_n} "
+                f"ttl_hours={SEEN_EXPIRY_SECS/3600:.1f}",
+                flush=True,
+            )
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(
             f"[edge-heartbeat] cycle={cycle} ts={ts} seen={len(seen)} "
@@ -1509,7 +1562,7 @@ def run() -> None:
                         preds = _ask_claude(system_prompt, batch, stats, log_raw=(start == 0))
                         for it in batch:
                             ticker = it["ticker"]
-                            seen.add(ticker)
+                            seen[ticker] = time.time()
                             pred = preds.get(ticker)
                             if not pred:
                                 skipped += 1
