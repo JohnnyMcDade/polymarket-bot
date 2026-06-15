@@ -329,19 +329,58 @@ def _dash_go_live(state: dict) -> dict:
     }
 
 
+# Default cut-off matches the calibration window in go_live_criteria.json
+# (registered 2026-06-11 with since_date 2026-06-07). Trades before that
+# pre-date the KALSHI_MAX_EDGE cap from 24ae529 + the KXBTC bucket filter
+# from 65e0aeb, so they're a historical sample for now-fixed bugs and
+# don't represent current bot performance. The dashboard defaults to the
+# windowed view; `?since=all` shows lifetime stats.
+_DASH_DEFAULT_SINCE = "2026-06-07"
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> HTMLResponse:
+def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     """Operator dashboard. Reads all source files at request time so it
     always reflects the latest disk state. <meta http-equiv=refresh>
-    pulls a fresh render every 60s without JS."""
-    trades = _dash_load_trades()
+    pulls a fresh render every 60s without JS.
+
+    `since` query param: ISO date (YYYY-MM-DD). Trades with timestamp
+    >= that date are included. Pass `?since=all` to disable the window
+    and see lifetime stats including historical disasters from
+    pre-filter-fix days."""
+    all_trades = _dash_load_trades()
+    if since and since.lower() != "all":
+        trades = [t for t in all_trades
+                  if (t.get("timestamp") or "")[:10] >= since]
+    else:
+        trades = all_trades
     overall = _dash_overall(trades)
     series_rows = _dash_compute_per_series(trades)
     recent = _dash_recent_table(trades, limit=10)
     gl = _dash_go_live(_dash_load_go_live())
     svg = _dash_render_cumulative_svg(trades)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Window controls — single bar with current scope + toggle link.
+    is_windowed = bool(since and since.lower() != "all")
+    if is_windowed:
+        window_label = f"trades since {since}"
+        toggle_href = "/dashboard?since=all"
+        toggle_label = "Show all time →"
+    else:
+        window_label = "all time"
+        toggle_href = f"/dashboard?since={_DASH_DEFAULT_SINCE}"
+        toggle_label = f"Show since {_DASH_DEFAULT_SINCE} →"
+    in_window_n = len(trades)
+    total_n = len(all_trades)
+    window_bar = (
+        f'<p class="window-bar">'
+        f'Window: <strong>{window_label}</strong> '
+        f'<span class="muted">({in_window_n} of {total_n} trades)</span> · '
+        f'<a href="{toggle_href}">{toggle_label}</a>'
+        f'</p>'
+    )
 
     pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
 
@@ -418,11 +457,16 @@ def dashboard() -> HTMLResponse:
   .muted {{ color: #888; }}
   .footer {{ margin-top: 2em; padding-top: 1em; border-top: 1px solid #eee;
              color: #999; font-size: 0.8em; }}
+  .window-bar {{ background: #eef4ff; border: 1px solid #cfdcf5;
+                 padding: 8px 14px; border-radius: 6px; margin: 0.5em 0 1em; }}
+  .window-bar a {{ margin-left: 0.5em; color: #1a4fb5; text-decoration: none; }}
+  .window-bar a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
 <h1>Polymarket Bot {is_live_badge}</h1>
 <p class="muted">Last refresh: {now_iso} UTC · Auto-refresh: 60s</p>
+{window_bar}
 
 <div class="summary">
   <div class="card">
