@@ -168,6 +168,318 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ─── Operator dashboard ──────────────────────────────────────────────────
+# Single-page HTML view of trades_log + go_live_state. Reads from /app/data/
+# at request time (cheap — JSON files are small). No auth so it's
+# load-and-go from any Railway-public URL; if you ever expose this to
+# people outside, gate with HTTPBearer like the /api/* routes.
+
+from collections import defaultdict
+from pathlib import Path
+import json
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
+GO_LIVE_STATE_PATH = Path(os.getenv("KALSHI_GO_LIVE_STATE", "/app/data/go_live_state.json"))
+STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
+
+_DASH_SERIES_PREFIXES = (
+    "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
+    "KXATPMATCH", "KXWTAMATCH", "KXBTC", "KXAAAGASD",
+    "KXNHL", "KXNBA",
+)
+
+
+def _dash_series_of(ticker: str) -> str:
+    for p in _DASH_SERIES_PREFIXES:
+        if ticker.startswith(p):
+            return p
+    return "other"
+
+
+def _dash_fmt_pnl(v: float) -> tuple[str, str]:
+    """Return (label, css-class) so positive/negative can be styled."""
+    if v > 0:
+        return f"+${v:.2f}", "pos"
+    if v < 0:
+        return f"-${abs(v):.2f}", "neg"
+    return "$0.00", "muted"
+
+
+def _dash_load_trades() -> list[dict]:
+    if not TRADES_LOG_PATH.exists():
+        return []
+    try:
+        with TRADES_LOG_PATH.open() as f:
+            d = json.load(f)
+    except Exception:
+        return []
+    return d if isinstance(d, list) else d.get("trades", [])
+
+
+def _dash_load_go_live() -> dict:
+    if not GO_LIVE_STATE_PATH.exists():
+        return {}
+    try:
+        with GO_LIVE_STATE_PATH.open() as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _dash_render_cumulative_svg(trades: list[dict], width: int = 800, height: int = 200) -> str:
+    """Inline SVG cumulative-pnl line chart. One point per settled trade
+    in chronological order. Zero-line shown in light grey for orientation."""
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    settled.sort(key=lambda t: t.get("settled_at", t.get("timestamp", "")))
+    if not settled:
+        return ('<svg width="{w}" height="{h}"><text x="{tx}" y="{ty}" '
+                'fill="#999" text-anchor="middle" font-family="system-ui">'
+                'no settled trades yet</text></svg>').format(
+            w=width, h=height, tx=width / 2, ty=height / 2)
+    cum: list[float] = []
+    s = 0.0
+    for t in settled:
+        s += float(t.get("pnl") or 0)
+        cum.append(s)
+    cmin = min(cum + [0.0])
+    cmax = max(cum + [0.0])
+    span = cmax - cmin or 1.0
+    pad = 10
+    plot_h = height - 2 * pad
+    plot_w = width - 2 * pad
+    pts = []
+    for i, v in enumerate(cum):
+        x = pad + (i / max(1, len(cum) - 1)) * plot_w
+        y = pad + plot_h - ((v - cmin) / span) * plot_h
+        pts.append(f"{x:.1f},{y:.1f}")
+    # Zero line position
+    zero_y = pad + plot_h - ((0 - cmin) / span) * plot_h
+    last = cum[-1]
+    color = "#2a9d2a" if last >= 0 else "#c0392b"
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'role="img" aria-label="Cumulative P&L line chart">'
+        f'<line x1="{pad}" y1="{zero_y:.1f}" x2="{width - pad}" y2="{zero_y:.1f}" '
+        f'stroke="#ccc" stroke-dasharray="3,3"/>'
+        f'<polyline fill="none" stroke="{color}" stroke-width="2" '
+        f'points="{" ".join(pts)}"/>'
+        f'<text x="{width - pad - 4}" y="{pad + 14}" fill="{color}" '
+        f'text-anchor="end" font-family="system-ui" font-weight="600">'
+        f'last: {("+" if last >= 0 else "")}${last:.2f}</text>'
+        f'<text x="{pad}" y="{pad + 14}" fill="#888" '
+        f'font-family="system-ui" font-size="11">'
+        f'n={len(cum)}  range: ${cmin:.0f}..${cmax:.0f}</text>'
+        f'</svg>'
+    )
+
+
+def _dash_compute_per_series(trades: list[dict]) -> list[dict]:
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    by: dict[str, list[dict]] = defaultdict(list)
+    for t in settled:
+        by[_dash_series_of(t.get("ticker", ""))].append(t)
+    rows: list[dict] = []
+    for series, group in by.items():
+        n = len(group)
+        wins = sum(1 for t in group if t["outcome"] == "won")
+        losses = n - wins
+        pnl = sum(float(t.get("pnl") or 0) for t in group)
+        preds = [float(t["our_prob"]) for t in group
+                 if isinstance(t.get("our_prob"), (int, float))]
+        mean_pred = sum(preds) / len(preds) if preds else None
+        wr = wins / n if n else 0.0
+        cal_err = (mean_pred - wr) * 100 if mean_pred is not None else None
+        rows.append({
+            "series": series, "n": n, "w": wins, "l": losses,
+            "wr": wr, "pnl": pnl, "cal_err": cal_err,
+        })
+    # Sort by trade count desc — bigger cohorts first
+    rows.sort(key=lambda r: -r["n"])
+    return rows
+
+
+def _dash_overall(trades: list[dict]) -> dict:
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    n = len(settled)
+    wins = sum(1 for t in settled if t["outcome"] == "won")
+    pnl = sum(float(t.get("pnl") or 0) for t in settled)
+    pending = sum(1 for t in trades if t.get("outcome") == "pending")
+    return {
+        "n": n, "wins": wins, "wr": wins / n if n else 0.0,
+        "pnl": pnl, "pending": pending, "total_placed": len(trades),
+    }
+
+
+def _dash_recent_table(trades: list[dict], limit: int = 10) -> list[dict]:
+    """Most recent N trades regardless of outcome. Sorted by timestamp desc."""
+    out = sorted(trades, key=lambda t: t.get("timestamp", ""), reverse=True)
+    return out[:limit]
+
+
+def _dash_go_live(state: dict) -> dict:
+    history = state.get("history") or []
+    latest = history[-1] if history else {}
+    return {
+        "is_live": bool(state.get("is_live")),
+        "consecutive_pass_count": int(state.get("consecutive_pass_count") or 0),
+        "passes": int(latest.get("passes") or 0),
+        "total": int(latest.get("total") or 4),
+        "last_report_date": state.get("last_report_date") or "—",
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    """Operator dashboard. Reads all source files at request time so it
+    always reflects the latest disk state. <meta http-equiv=refresh>
+    pulls a fresh render every 60s without JS."""
+    trades = _dash_load_trades()
+    overall = _dash_overall(trades)
+    series_rows = _dash_compute_per_series(trades)
+    recent = _dash_recent_table(trades, limit=10)
+    gl = _dash_go_live(_dash_load_go_live())
+    svg = _dash_render_cumulative_svg(trades)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
+
+    series_table_rows = []
+    for r in series_rows:
+        p_str, p_cls = _dash_fmt_pnl(r["pnl"])
+        cal_str = (f"{r['cal_err']:+.1f}pp"
+                   if r["cal_err"] is not None else "—")
+        series_table_rows.append(
+            f"<tr>"
+            f"<td>{r['series']}</td>"
+            f"<td>{r['n']}</td>"
+            f"<td>{r['w']}/{r['l']}</td>"
+            f"<td>{r['wr']*100:.1f}%</td>"
+            f"<td class='{p_cls}'>{p_str}</td>"
+            f"<td>{cal_str}</td>"
+            f"</tr>"
+        )
+
+    recent_table_rows = []
+    for t in recent:
+        ts = (t.get("timestamp") or "")[:16].replace("T", " ")
+        series = _dash_series_of(t.get("ticker", ""))
+        side = t.get("side", "?")
+        edge = t.get("edge")
+        edge_str = f"{float(edge)*100:+.1f}%" if isinstance(edge, (int, float)) else "—"
+        outcome = t.get("outcome", "—")
+        pnl_v = float(t.get("pnl") or 0)
+        pn_str, pn_cls = _dash_fmt_pnl(pnl_v)
+        oc_class = {"won": "pos", "lost": "neg"}.get(outcome, "muted")
+        paper = " 📄" if t.get("paper") else " 💰"
+        recent_table_rows.append(
+            f"<tr>"
+            f"<td>{ts}</td>"
+            f"<td>{series}{paper}</td>"
+            f"<td>{side}</td>"
+            f"<td>{edge_str}</td>"
+            f"<td class='{oc_class}'>{outcome}</td>"
+            f"<td class='{pn_cls}'>{pn_str}</td>"
+            f"</tr>"
+        )
+
+    is_live_badge = (
+        "<span style='background:#2a9d2a;color:#fff;padding:2px 8px;"
+        "border-radius:4px;font-size:0.85em;'>LIVE</span>"
+        if gl["is_live"]
+        else "<span style='background:#888;color:#fff;padding:2px 8px;"
+        "border-radius:4px;font-size:0.85em;'>PAPER</span>"
+    )
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<title>Polymarket Bot — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+          max-width: 980px; margin: 1em auto; padding: 0 1em; color: #222; }}
+  h1, h2 {{ margin: 0.5em 0; }}
+  .summary {{ display: flex; gap: 1em; flex-wrap: wrap; margin: 1em 0 1.5em; }}
+  .card {{ background: #f7f7f9; padding: 10px 16px; border-radius: 6px;
+           border: 1px solid #e5e5e9; min-width: 140px; }}
+  .card .label {{ color: #777; font-size: 0.85em; display: block; }}
+  .card .value {{ font-size: 1.5em; font-weight: 600; display: block; margin-top: 2px; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 0.5em 0 1.5em;
+           font-size: 0.95em; }}
+  th, td {{ border: 1px solid #e5e5e9; padding: 6px 10px; text-align: right; }}
+  th {{ background: #f5f5f7; font-weight: 600; }}
+  th:first-child, td:first-child {{ text-align: left; }}
+  .pos {{ color: #1e7e1e; font-weight: 500; }}
+  .neg {{ color: #b22222; font-weight: 500; }}
+  .muted {{ color: #888; }}
+  .footer {{ margin-top: 2em; padding-top: 1em; border-top: 1px solid #eee;
+             color: #999; font-size: 0.8em; }}
+</style>
+</head>
+<body>
+<h1>Polymarket Bot {is_live_badge}</h1>
+<p class="muted">Last refresh: {now_iso} UTC · Auto-refresh: 60s</p>
+
+<div class="summary">
+  <div class="card">
+    <span class="label">Settled trades</span>
+    <span class="value">{overall['n']}</span>
+  </div>
+  <div class="card">
+    <span class="label">Win rate</span>
+    <span class="value">{overall['wr']*100:.1f}%</span>
+  </div>
+  <div class="card">
+    <span class="label">Total P&amp;L</span>
+    <span class="value {pnl_cls}">{pnl_str}</span>
+  </div>
+  <div class="card">
+    <span class="label">Pending</span>
+    <span class="value">{overall['pending']}</span>
+  </div>
+  <div class="card">
+    <span class="label">Go-live criteria</span>
+    <span class="value">{gl['passes']} / {gl['total']}</span>
+  </div>
+</div>
+
+<h2>Cumulative P&amp;L</h2>
+{svg}
+
+<h2>By series</h2>
+<table>
+<thead>
+<tr><th>Series</th><th>Trades</th><th>W/L</th><th>Win%</th><th>P&amp;L</th><th>Cal err</th></tr>
+</thead>
+<tbody>
+{"".join(series_table_rows) or "<tr><td colspan='6' class='muted'>no settled trades yet</td></tr>"}
+</tbody>
+</table>
+
+<h2>Last 10 trades</h2>
+<table>
+<thead>
+<tr><th>Date</th><th>Series</th><th>Side</th><th>Edge</th><th>Result</th><th>P&amp;L</th></tr>
+</thead>
+<tbody>
+{"".join(recent_table_rows) or "<tr><td colspan='6' class='muted'>no trades yet</td></tr>"}
+</tbody>
+</table>
+
+<div class="footer">
+  Data sources: <code>{TRADES_LOG_PATH}</code>, <code>{GO_LIVE_STATE_PATH}</code>.
+  All trade counts include paper + live. Cal err = mean_pred − win_rate
+  (positive = overconfident). 📄 paper · 💰 live.
+</div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 @app.get("/api/alerts/today", response_model=list[WhaleAlert], dependencies=[Depends(_require_token)])
 def alerts_today() -> list[WhaleAlert]:
     """Top 7 whale-tracker alerts from the trailing 7 days, one per distinct
