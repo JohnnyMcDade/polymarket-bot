@@ -31,6 +31,29 @@ from kalshi_auth import KALSHI_BASE_URL, get_auth_headers
 
 WEBHOOK_KALSHI_TRADER = os.getenv("WEBHOOK_KALSHI_TRADER", "")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
+# Per-series paper-trading override. When PAPER_TRADING=false (live
+# mode), any ticker whose prefix matches an entry in this list STILL
+# paper-trades. Designed for the auto-live flip: when calibration
+# criteria pass and the system goes live, only backtest-validated
+# series (default: KXMLBTOTAL via empty override) actually hit Kalshi
+# with real money; experimental strategies (tennis, BTC) stay paper
+# until they earn their way out. When PAPER_TRADING=true (global
+# paper), this list is moot — everything is paper.
+PAPER_SERIES: tuple[str, ...] = tuple(
+    s.strip() for s in os.getenv(
+        "KALSHI_PAPER_SERIES",
+        "KXATPMATCH,KXWTAMATCH,KXBTC",
+    ).split(",") if s.strip()
+)
+
+
+def _is_paper_for_ticker(ticker: str) -> bool:
+    """Return True if the ticker should be paper-traded. Global
+    PAPER_TRADING=true forces paper for everything; otherwise the
+    ticker is paper iff its prefix matches any entry in PAPER_SERIES."""
+    if PAPER_TRADING:
+        return True
+    return any(ticker.startswith(p) for p in PAPER_SERIES)
 CHECK_INTERVAL = int(os.getenv("KALSHI_TRADER_INTERVAL", "300"))   # 5 min
 SETTLEMENT_INTERVAL = int(os.getenv("KALSHI_SETTLEMENT_INTERVAL", "3600"))  # 1 h
 BANKROLL = float(os.getenv("BANKROLL", "500"))
@@ -425,7 +448,7 @@ def _size_trade(item: dict[str, Any]) -> tuple[int, float, float, str | None]:
 def _place_order(ticker: str, side: str, contracts: int,
                  price_cents: int) -> tuple[bool, str | None, dict[str, Any] | None]:
     """Returns (placed, error, kalshi_order_dict)."""
-    if PAPER_TRADING:
+    if _is_paper_for_ticker(ticker):
         return True, None, {"paper": True}
 
     path = "/trade-api/v2/portfolio/orders"
@@ -712,7 +735,10 @@ def _placement_embed(entry: dict[str, Any], *, placed: bool, error: str | None) 
     ticker = entry.get("ticker", "")
     market_url = f"https://kalshi.com/markets/{ticker}"
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if PAPER_TRADING:
+    # Per-trade paper flag is set on the entry by _is_paper_for_ticker
+    # at placement time — read it back here so the Discord embed shows
+    # the correct mode even when PAPER_SERIES is mid-flip.
+    if entry.get("paper"):
         mode_str, color = "📄 PAPER", 0xFFAA00
     elif placed:
         mode_str, color = "✅ LIVE — PLACED", 0x2ECC71
@@ -737,7 +763,7 @@ def _placement_embed(entry: dict[str, Any], *, placed: bool, error: str | None) 
         "url": market_url,
         "color": color,
         "fields": fields,
-        "footer": {"text": f"PassivePoly Trader  •  {'PAPER' if PAPER_TRADING else 'LIVE'}  •  {now_str}"},
+        "footer": {"text": f"PassivePoly Trader  •  {'PAPER' if entry.get('paper') else 'LIVE'}  •  {now_str}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -794,6 +820,22 @@ def run() -> None:
         f"max_bet={MAX_BET_PCT:.0%}, interval={CHECK_INTERVAL}s, "
         f"daily_spent={_format_usd(_daily_spent)} (restored from {DAILY_SPENT_PATH.name})"
     )
+    # Per-series paper override visibility. If PAPER_TRADING is global
+    # then PAPER_SERIES is moot — log so the operator doesn't think
+    # the per-series list is somehow being honored when it isn't.
+    if PAPER_TRADING:
+        print(
+            f"[trader] paper-series: global PAPER_TRADING=true → "
+            f"all trades paper regardless of list "
+            f"(list={list(PAPER_SERIES) or '(empty)'})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[trader] paper-series: PAPER_TRADING=false (live) BUT "
+            f"these series stay paper: {list(PAPER_SERIES) or '(none)'}",
+            flush=True,
+        )
     # Weekly state startup banner. Surfaces a mid-cooldown lockout
     # immediately on restart so the user doesn't think the trader is
     # broken when it's just respecting the drawdown rule.
@@ -832,7 +874,7 @@ def run() -> None:
                 key=lambda it: float(it.get("edge") or 0),
                 reverse=True,
             )
-            executed = failed = rejected = 0
+            executed = failed = rejected = paper_count = live_count = 0
             for item in items:
                 try:
                     ticker = item.get("ticker", "")
@@ -895,7 +937,7 @@ def run() -> None:
                         "bet_size": round(bet_size, 2),
                         "kelly_pct": round(kelly_pct, 4),
                         "timestamp": timestamp,
-                        "paper": PAPER_TRADING,
+                        "paper": _is_paper_for_ticker(ticker),
                         "kalshi_order_id": (order or {}).get("order_id") if order else None,
                         "outcome": "pending" if placed else "rejected",
                         "pnl": 0.0,
@@ -911,6 +953,10 @@ def run() -> None:
                         _weekly_state["spent"] += float(bet_size)
                         _save_weekly_state()
                         executed += 1
+                        if entry.get("paper"):
+                            paper_count += 1
+                        else:
+                            live_count += 1
                     else:
                         failed += 1
                 except Exception as e:
@@ -918,10 +964,15 @@ def run() -> None:
                     failed += 1
 
             if items:
-                verb = "simulated" if PAPER_TRADING else "placed"
+                # Split paper/live counts so a mixed-mode session
+                # (PAPER_TRADING=false + PAPER_SERIES non-empty) is
+                # legible at a glance instead of all being lumped as
+                # one verb.
                 print(
-                    f"[trader] cycle: {executed} {verb}, {rejected} rejected, "
-                    f"{failed} failed, daily_spent={_format_usd(_daily_spent)}",
+                    f"[trader] cycle: executed={executed} "
+                    f"(paper={paper_count}, live={live_count}), "
+                    f"rejected={rejected}, failed={failed}, "
+                    f"daily_spent={_format_usd(_daily_spent)}",
                     flush=True,
                 )
 
