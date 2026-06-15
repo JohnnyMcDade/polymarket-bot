@@ -814,9 +814,20 @@ MLB DATE MATCHING (READ BEFORE EVALUATING ANY MLB MARKET)
 - If no upcoming_games entry matches the ticker date, SKIP. Do NOT fall back to team_scoring alone or to a different day's pitching matchup — yesterday's starter is rarely tomorrow's starter, and using the wrong pitcher silently breaks the edge calculation.
 
 MLB FACTS BLOCK (PER-MARKET INJECTION)
-- For MLB markets, each user-message MARKET block may include a `FACTS:` section with the matched upcoming_games entry, both teams' rs_per_game, both probable pitchers (ERA, WHIP, rolling_era_last3, vs_opponent), both bullpens, and (when parseable) CONTRACT_TEAM.
+- For MLB markets, each user-message MARKET block may include a `FACTS:` section with the matched upcoming_games entry, both teams' rs_per_game, both probable pitchers (ERA, WHIP, rolling_era_last3, vs_opponent), both bullpens, and (when parseable) CONTRACT_TEAM. Three additional KXMLBTOTAL signals when available: PARK_FACTOR, HOME_PLATE_UMP, WEATHER.
 - When FACTS is present, use it as the authoritative data source for that ticker — you do NOT need to scan STATS CONTEXT for the same matchup, and you should NOT emit "matching upcoming_games entry not found" or "team_scoring missing" when the FACTS block has the values.
 - When FACTS is absent on an MLB ticker, the cache had no matching game — SKIP per the date-matching rule.
+
+KXMLBTOTAL PARK / UMPIRE / WEATHER SIGNALS (NEW 2026-06-15)
+- PARK_FACTOR is the home stadium's run-scoring index normalized to ~1.0 league average. >1.03 = high-run park, <0.97 = pitcher's park. Multiply your baseline expected total by the park factor when projecting runs for KXMLBTOTAL / KXMLBTEAMTOTAL: a baseline 8.5-run projection at Coors (1.32) becomes ~11.2, at Petco (0.85) becomes ~7.2. Park factor effect compounds with starter quality — an elite arm at Coors still allows more runs than an average arm at Petco.
+- HOME_PLATE_UMP is the assigned home plate umpire's name when known (populates a few hours pre-game; absent at morning evaluation time). When known and the name matches a famously tight-strike-zone ump (e.g. Hunter Wendelstedt, Doug Eddings — small zones inflate K rates and walk rates simultaneously) or a famously generous zone (e.g. Joe West historically — though retired, illustrative), shade your expected total down 0.2-0.4 runs for tight zones and up 0.2-0.4 runs for generous zones. Do NOT apply this adjustment when the umpire field is absent or empty — never invent an umpire bias.
+- WEATHER carries temp_f / wind / cond at the ballpark. Apply these rules:
+    - Temp < 50°F → cold air kills carry; shade expected total DOWN 0.3-0.5 runs.
+    - Temp > 80°F → warm air boosts carry; shade UP 0.2-0.4 runs.
+    - Wind > 15mph blowing OUT (S/SW/W at most parks, but check by ballpark) → shade UP 0.5-0.8 runs. Wrigley Field is THE classic wind-aided park.
+    - Wind > 15mph blowing IN → shade DOWN 0.4-0.6 runs.
+    - Light rain or fog in cond → modest DOWN shade (0.2 runs) plus heightened postponement risk for very-near-close markets; if game_time is < 60min away and cond mentions rain, SKIP rather than guess at a delay.
+- These three signals are SUPPLEMENTARY — they tune the prediction but never override the rolling-ERA + bullpen + H2H foundation. A 2.50 rolling-ERA elite arm at Coors with strong tailwind is still your best UNDER bet at the 11.5 line, not the OVER, because the starter quality dominates the park effect over 6 innings.
 
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
@@ -937,6 +948,31 @@ def _mlb_facts_for_ticker(ticker: str, stats: dict[str, Any]) -> str | None:
         f"AWAY BULLPEN ({away}): {_fmt_bullpen(bp_map.get(away))}",
         f"HOME BULLPEN ({home}): {_fmt_bullpen(bp_map.get(home))}",
     ]
+    # KXMLBTOTAL context signals — park / umpire / weather. Park factor
+    # is always present (default 1.00 if home team is missing from the
+    # bundled table); ump populates a few hours before game-time;
+    # weather is None on fetch failure (caller may have hit a wttr.in
+    # blip — Claude just omits the signal in that case).
+    pf = game.get("park_factor")
+    if pf is not None:
+        lines.append(
+            f"PARK_FACTOR ({home}): {pf:.2f}  "
+            f"({'high-run' if pf > 1.03 else 'low-run' if pf < 0.97 else 'neutral'} venue)"
+        )
+    ump = game.get("home_plate_umpire") or ""
+    if ump:
+        lines.append(f"HOME_PLATE_UMP: {ump}")
+    w = game.get("weather") or {}
+    if w:
+        wparts = []
+        if w.get("temp_f") is not None:
+            wparts.append(f"temp={w['temp_f']:.0f}°F")
+        if w.get("wind_mph") is not None:
+            wparts.append(f"wind={w['wind_mph']:.0f}mph {w.get('wind_dir','')}".strip())
+        if w.get("condition"):
+            wparts.append(f"cond={w['condition']}")
+        if wparts:
+            lines.append(f"WEATHER: {', '.join(wparts)}")
     if contract_team:
         lines.append(f"CONTRACT_TEAM: {contract_team}")
     return "\n".join(lines)

@@ -155,6 +155,55 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 # NBA/NHL via ESPN's site.api. Both APIs are unauthenticated.
 
 _MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
+
+# ─── KXMLBTOTAL context signals (park, ump, weather) ───────────────────
+# Park factors normalized to ~1.0 = league average. >1.0 = more runs at
+# this stadium than the league average; <1.0 = pitcher's park. Approximate
+# 2026 values — refresh annually from FanGraphs/Baseball Savant if year-
+# over-year shifts matter. Keyed by home-team abbreviation; missing teams
+# default to 1.0 at the caller.
+_PARK_FACTORS: dict[str, float] = {
+    "COL": 1.32,  # Coors Field — altitude
+    "CIN": 1.13,  # Great American Ball Park — short porches
+    "NYY": 1.10,  # Yankee Stadium — short right field
+    "BOS": 1.08,  # Fenway Park — Green Monster shallow LF
+    "PHI": 1.05,  # Citizens Bank Park
+    "CHC": 1.04,  # Wrigley Field (wind-dependent)
+    "TEX": 1.04,  # Globe Life Field
+    "TOR": 1.03,  # Rogers Centre
+    "BAL": 1.02,  # Camden Yards
+    "ATL": 1.00, "LAA": 1.00, "NYM": 1.00,
+    "MIL": 0.99, "ARI": 0.99,
+    "DET": 0.98, "MIN": 0.98,
+    "WSH": 0.97,
+    "STL": 0.96, "KC":  0.96, "HOU": 0.96,
+    "CWS": 0.95, "CLE": 0.95,
+    "TB":  0.94,
+    "PIT": 0.93, "LAD": 0.93,
+    "SEA": 0.92, "MIA": 0.92,
+    "OAK": 0.90,  # Sutter Health Park (Sacramento) since 2025
+    "SF":  0.87,  # Oracle Park
+    "SD":  0.85,  # Petco Park
+}
+
+# Team → city for weather lookup. Use city, not stadium, so wttr.in's
+# location parser handles it without ambiguity. Multi-team cities
+# (NYC, Chicago) point to the same city — fine since stadium-specific
+# weather variance is smaller than city-wide.
+_TEAM_CITIES: dict[str, str] = {
+    "ARI": "Phoenix", "ATL": "Atlanta", "BAL": "Baltimore",
+    "BOS": "Boston", "CHC": "Chicago", "CWS": "Chicago",
+    "CIN": "Cincinnati", "CLE": "Cleveland", "COL": "Denver",
+    "DET": "Detroit", "HOU": "Houston", "KC": "Kansas City",
+    "LAA": "Anaheim", "LAD": "Los Angeles", "MIA": "Miami",
+    "MIL": "Milwaukee", "MIN": "Minneapolis",
+    "NYM": "New York", "NYY": "New York",
+    "OAK": "Sacramento",  # A's play in Sutter Health Park from 2025
+    "PHI": "Philadelphia", "PIT": "Pittsburgh",
+    "SD": "San Diego", "SEA": "Seattle", "SF": "San Francisco",
+    "STL": "St. Louis", "TB": "St. Petersburg",
+    "TEX": "Arlington", "TOR": "Toronto", "WSH": "Washington",
+}
 _ESPN_NBA_STANDINGS = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
 _ESPN_NHL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/hockey/nhl/standings"
 _ESPN_ATP_RANKINGS = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/rankings"
@@ -356,10 +405,47 @@ def _fetch_mlb_team_scoring(meta: dict[int, dict]) -> dict[str, dict]:
     return out
 
 
+def _fetch_weather(city: str) -> dict | None:
+    """Fetch current weather from wttr.in for one MLB city.
+    Returns {temp_f, wind_mph, wind_dir, condition} or None on failure.
+
+    Used for KXMLBTOTAL context: temperature affects ball-flight distance
+    (carry drops sharply below ~50°F and rises above ~75°F), wind speed
+    + direction can shift a Wrigley/Yankee/Fenway game by 1-2 runs, and
+    precipitation can lead to rain-shortened games or postponements.
+
+    wttr.in is free and no-auth. Daily refresh at 06:00 UTC = ~30 calls
+    well within their soft rate limit. On failure (network blip, parser
+    error) we return None so the caller can omit the weather signal
+    rather than block the rest of the MLB fetch."""
+    if not city:
+        return None
+    try:
+        url = f"https://wttr.in/{city.replace(' ', '+')}?format=j1"
+        d = _http_get_json(url)
+    except Exception:
+        return None
+    if not d:
+        return None
+    cur = (d.get("current_condition") or [{}])[0]
+    if not cur:
+        return None
+    cond_list = cur.get("weatherDesc") or []
+    return {
+        "temp_f": _to_float(cur.get("temp_F")),
+        "wind_mph": _to_float(cur.get("windspeedMiles")),
+        "wind_dir": cur.get("winddir16Point", ""),
+        "condition": (cond_list[0] or {}).get("value", "") if cond_list else "",
+    }
+
+
 def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
-    """Today's MLB schedule with probable pitchers and their season ERA/WHIP."""
+    """Today's MLB schedule with probable pitchers and their season
+    ERA/WHIP, plus KXMLBTOTAL context signals: park factor, home plate
+    umpire, and current weather at the ballpark."""
     sched = _http_get_json(
-        f"{_MLB_STATSAPI}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,team"
+        f"{_MLB_STATSAPI}/schedule?sportId=1&date={date_str}"
+        f"&hydrate=probablePitcher,team,officials"
     )
     games_raw: list[dict] = []
     for d in (sched or {}).get("dates", []):
@@ -402,6 +488,21 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
     # same gameLog feed also drives the new vs-opponent H2H stats below.
     gamelogs = _fetch_pitcher_gamelogs(pitcher_ids)
 
+    # Weather fetch is deduped per city so doubleheaders + the two NYC
+    # teams + the two Chicago teams don't double-call wttr.in.
+    cities_needed: set[str] = set()
+    for g in games_raw:
+        ht = (g.get("teams", {}).get("home", {}) or {}).get("team", {}) or {}
+        abbr = ht.get("abbreviation") or meta.get(ht.get("id"), {}).get("abbr", "")
+        city = _TEAM_CITIES.get(abbr)
+        if city:
+            cities_needed.add(city)
+    weather_by_city: dict[str, dict] = {}
+    for city in sorted(cities_needed):
+        w = _fetch_weather(city)
+        if w:
+            weather_by_city[city] = w
+
     out: list[dict] = []
     for g in games_raw:
         teams = g.get("teams", {})
@@ -419,10 +520,23 @@ def _fetch_mlb_todays_games(date_str: str, meta: dict[int, dict]) -> list[dict]:
         hp = (teams.get("home", {}) or {}).get("probablePitcher") or {}
         ap_log = gamelogs.get(ap.get("id"), [])
         hp_log = gamelogs.get(hp.get("id"), [])
+        # Home plate umpire from the schedule hydrate=officials payload.
+        # The officials array only populates on game-day (typically a
+        # few hours pre-first-pitch); empty earlier in the day is fine.
+        hp_umpire = ""
+        for o in (g.get("officials") or []):
+            if (o.get("officialType") or "") == "Home Plate":
+                hp_umpire = (o.get("official") or {}).get("fullName", "")
+                break
+        park_factor = _PARK_FACTORS.get(home_abbr, 1.00)
+        weather = weather_by_city.get(_TEAM_CITIES.get(home_abbr, ""))
         out.append({
             "away": away_abbr,
             "home": home_abbr,
             "start_time_utc": start_t,
+            "park_factor": park_factor,
+            "home_plate_umpire": hp_umpire,
+            "weather": weather,
             "away_pitcher": {
                 "player": ap.get("fullName", ""),
                 "rolling_era_last3": _rolling_era_last(ap_log),
