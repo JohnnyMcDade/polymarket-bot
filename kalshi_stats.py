@@ -966,6 +966,19 @@ def _do_fetch_and_save() -> None:
     btc = _fetch_btc_spot_coinbase()
     if btc:
         econ["btc_spot_usd"], econ["btc_source_time_utc"] = btc
+    # KXBTC filter inputs — same fetchers as _refresh_macro(). Without
+    # this the daily refresh nukes the F&G + 24h fields the KXBTC
+    # filter (and the /dashboard BTC status card) depend on, until the
+    # next hourly macro fires up to ~60 min later.
+    btc_24h = _fetch_btc_24h_stats()
+    if btc_24h:
+        econ["btc_24h_open"] = btc_24h["open"]
+        econ["btc_24h_last"] = btc_24h["last"]
+        econ["btc_24h_momentum_pct"] = btc_24h["momentum_pct"]
+    fng = _fetch_fear_greed()
+    if fng:
+        econ["crypto_fear_greed_value"] = fng["value"]
+        econ["crypto_fear_greed_classification"] = fng["classification"]
     stats["economic"] = econ
     elapsed = time.time() - t0
     mlb_n = len(stats["mlb"].get("standings", {}))
