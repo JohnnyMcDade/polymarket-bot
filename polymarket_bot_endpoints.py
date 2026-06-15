@@ -337,6 +337,12 @@ def _dash_go_live(state: dict) -> dict:
 # windowed view; `?since=all` shows lifetime stats.
 _DASH_DEFAULT_SINCE = "2026-06-07"
 _DASH_COHORT_ERA_CAP = 3.50  # mirrors kalshi_edge.BACKTEST_FILTER_ERA_CAP
+# BTC filter F&G thresholds — read from env so the dashboard always
+# reflects whatever the production edge agent is using. Defaults to 20
+# (matching kalshi_edge.py's code default); env override KALSHI_BTC_FG_
+# EXTREME_LOW currently set to 21 in Railway, making F&G=20 a PASS.
+_DASH_BTC_FG_LOW = int(os.getenv("KALSHI_BTC_FG_EXTREME_LOW", "20"))
+_DASH_BTC_FG_HIGH = int(os.getenv("KALSHI_BTC_FG_EXTREME_HIGH", "80"))
 
 
 def _dash_load_stats_cache() -> dict:
@@ -387,6 +393,38 @@ def _dash_qualifying_games(stats: dict, max_rows: int = 5) -> list[dict]:
         })
     rows.sort(key=lambda r: (r["date"], r["avg_era"]))
     return rows[:max_rows]
+
+
+def _dash_btc_status(stats: dict) -> dict:
+    """Snapshot of the macro signals that gate KXBTC trading. Returns:
+      fng_value (int|None), fng_class (str), momentum_pct (float|None),
+      filter_pass (bool), reason (str — empty if PASS).
+
+    Matches the live filter check in kalshi_edge._btc_filter_passes:
+    PASS iff F&G < BTC_FG_LOW or F&G > BTC_FG_HIGH. (Per-market price
+    and edge gates also apply at production time — this just answers
+    "could the F&G gate let anything through right now?".)"""
+    econ = (stats.get("economic") or {})
+    fng_value = econ.get("crypto_fear_greed_value")
+    fng_class = econ.get("crypto_fear_greed_classification", "") or ""
+    momentum = econ.get("btc_24h_momentum_pct")
+    if not isinstance(fng_value, (int, float)):
+        return {"fng_value": None, "fng_class": fng_class,
+                "momentum_pct": momentum, "filter_pass": False,
+                "reason": "no F&G reading in stats cache"}
+    fng_int = int(fng_value)
+    if _DASH_BTC_FG_LOW <= fng_int <= _DASH_BTC_FG_HIGH:
+        reason = (
+            f"F&G={fng_int} in calm zone "
+            f"[{_DASH_BTC_FG_LOW}, {_DASH_BTC_FG_HIGH}]"
+        )
+        return {"fng_value": fng_int, "fng_class": fng_class,
+                "momentum_pct": momentum, "filter_pass": False,
+                "reason": reason}
+    zone = "extreme fear" if fng_int < _DASH_BTC_FG_LOW else "extreme greed"
+    return {"fng_value": fng_int, "fng_class": fng_class,
+            "momentum_pct": momentum, "filter_pass": True,
+            "reason": f"F&G={fng_int} in {zone} zone"}
 
 
 def _dash_render_frequency_svg(trades: list[dict], days: int = 14,
@@ -486,6 +524,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     freq_svg = _dash_render_frequency_svg(all_trades, days=14)
     stats_cache = _dash_load_stats_cache()
     qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
+    btc_status = _dash_btc_status(stats_cache)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Window controls — single bar with current scope + toggle link.
@@ -507,6 +546,71 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         f'<a href="{toggle_href}">{toggle_label}</a>'
         f'</p>'
     )
+
+    # Best-game highlight. Picks the first row from qualifying_games (the
+    # list is pre-sorted by date asc, avg_era asc — so the head is the
+    # nearest qualifying game with the lowest avg ERA). Label depends on
+    # whether it's today vs. a future date.
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    if qualifying_games:
+        bg = qualifying_games[0]
+        prefix = "Best game today" if bg["date"] == today_iso else (
+            f"Best upcoming ({bg['date']})"
+        )
+        pf = bg.get("park_factor")
+        pf_str = f"park {pf:.2f}" if isinstance(pf, (int, float)) else "park —"
+        w = bg.get("weather") or {}
+        wstr = ""
+        if w.get("temp_f") is not None and w.get("wind_mph") is not None:
+            wstr = f", {w['temp_f']:.0f}°F {w['wind_mph']:.0f}mph {w.get('wind_dir','')}"
+        best_game_html = (
+            f'<div class="highlight highlight-green">'
+            f'🎯 <strong>{prefix}:</strong> {bg["matchup"]} — '
+            f'<strong>{bg["tier"]}</strong> tier ({bg["avg_era"]:.2f} avg ERA), '
+            f'{bg["start_time_utc"]}Z, {pf_str}{wstr}'
+            f'</div>'
+        )
+    else:
+        best_game_html = (
+            '<div class="highlight highlight-muted">'
+            '🎯 No qualifying KXMLBTOTAL games in upcoming_games — '
+            'expect no trades on this series until lineups confirm '
+            'or tomorrow’s slate hydrates.'
+            '</div>'
+        )
+
+    # BTC market-status highlight. Color tracks filter_pass: green when
+    # the F&G gate is in extreme zone, yellow/muted when calm.
+    bs = btc_status
+    if bs["fng_value"] is None:
+        btc_html = (
+            f'<div class="highlight highlight-muted">'
+            f'🟡 BTC: F&amp;G data not in cache yet — '
+            f'next macro refresh will populate it.'
+            f'</div>'
+        )
+    else:
+        icon = "🟢" if bs["filter_pass"] else "🟡"
+        verdict = "PASS" if bs["filter_pass"] else "SKIP"
+        mom = bs["momentum_pct"]
+        mom_str = (
+            f"{mom:+.2f}% 24h" if isinstance(mom, (int, float)) else "no 24h data"
+        )
+        if bs["filter_pass"]:
+            reason_tail = f"({bs['reason']})"
+        else:
+            reason_tail = (
+                f"(need F&amp;G &lt; {_DASH_BTC_FG_LOW} "
+                f"or &gt; {_DASH_BTC_FG_HIGH})"
+            )
+        cls = "highlight-green" if bs["filter_pass"] else "highlight-muted"
+        btc_html = (
+            f'<div class="highlight {cls}">'
+            f'{icon} <strong>BTC:</strong> F&amp;G={bs["fng_value"]} '
+            f'({bs["fng_class"]}) {mom_str} → filter <strong>{verdict}</strong> '
+            f'{reason_tail}'
+            f'</div>'
+        )
 
     pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
 
@@ -641,12 +745,20 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
                  padding: 8px 14px; border-radius: 6px; margin: 0.5em 0 1em; }}
   .window-bar a {{ margin-left: 0.5em; color: #1a4fb5; text-decoration: none; }}
   .window-bar a:hover {{ text-decoration: underline; }}
+  .highlight {{ padding: 10px 14px; border-radius: 6px; margin: 0.4em 0;
+                font-size: 0.95em; }}
+  .highlight-green {{ background: #e6f6e6; border: 1px solid #b6e0b6;
+                       color: #1b4d1b; }}
+  .highlight-muted {{ background: #fff8e0; border: 1px solid #f0d97a;
+                       color: #6b5712; }}
 </style>
 </head>
 <body>
 <h1>Polymarket Bot {is_live_badge}</h1>
 <p class="muted">Last refresh: {now_iso} UTC · Auto-refresh: 60s</p>
 {window_bar}
+{best_game_html}
+{btc_html}
 
 <div class="summary">
   <div class="card">
