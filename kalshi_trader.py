@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,14 @@ TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json
 DAILY_SPENT_PATH = Path(os.getenv("KALSHI_DAILY_SPENT", "/app/data/daily_spent.json"))
 CALIBRATION_RUNNING_PATH = Path(os.getenv(
     "KALSHI_CALIBRATION_RUNNING", "/app/data/calibration_running.json"
+))
+# Weekly drawdown circuit-breaker. Distinct from MAX_DAILY_LOSS — the
+# daily cap blocks new spend mid-day but resets fresh tomorrow. The
+# weekly limit blocks ALL trades for the rest of the week once the
+# threshold trips, and only resumes when Monday rolls over UTC.
+WEEKLY_DRAWDOWN_PCT = float(os.getenv("KALSHI_WEEKLY_DRAWDOWN_PCT", "0.30"))
+WEEKLY_STATE_PATH = Path(os.getenv(
+    "KALSHI_WEEKLY_STATE", "/app/data/weekly_state.json"
 ))
 
 # Daily-spend tracking. Resets at UTC midnight. Persisted to disk so the
@@ -72,6 +80,127 @@ def _check_daily_reset() -> None:
         _last_reset = today
         _save_daily_spent()
         print("[trader] daily spend reset", flush=True)
+
+
+# ─── Weekly drawdown circuit-breaker ──────────────────────────────────
+# State machine: track running pnl + spent for the calendar week
+# (Monday 00:00 UTC → next Monday 00:00 UTC). If pnl drops below
+# -WEEKLY_DRAWDOWN_PCT × BANKROLL, flip paused=true and refuse all
+# trades until the week rolls. State persists to disk so a process
+# restart mid-pause preserves the lockout.
+_weekly_state: dict[str, Any] = {
+    "week_start": "",
+    "spent": 0.0,
+    "pnl": 0.0,
+    "paused": False,
+    "paused_at": None,
+}
+
+
+def _current_week_monday() -> date:
+    """Monday 00:00 UTC of current week. weekday(): Mon=0, Sun=6."""
+    today = datetime.now(timezone.utc).date()
+    return today - timedelta(days=today.weekday())
+
+
+def _load_weekly_state() -> dict[str, Any]:
+    """Return persisted weekly state; reset to fresh if week has rolled."""
+    today_monday = _current_week_monday()
+    default = {
+        "week_start": today_monday.isoformat(),
+        "spent": 0.0, "pnl": 0.0,
+        "paused": False, "paused_at": None,
+    }
+    if not WEEKLY_STATE_PATH.exists():
+        return default
+    try:
+        with WEEKLY_STATE_PATH.open() as f:
+            data = json.load(f)
+        saved_monday = date.fromisoformat(str(data.get("week_start", "")))
+    except Exception as e:
+        print(f"[WARN] weekly_state unreadable: {e} — resetting", flush=True)
+        return default
+    if saved_monday != today_monday:
+        return default
+    return {
+        "week_start": saved_monday.isoformat(),
+        "spent": float(data.get("spent", 0.0)),
+        "pnl": float(data.get("pnl", 0.0)),
+        "paused": bool(data.get("paused", False)),
+        "paused_at": data.get("paused_at"),
+    }
+
+
+def _save_weekly_state() -> None:
+    WEEKLY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WEEKLY_STATE_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(_weekly_state, f, indent=2)
+    tmp.replace(WEEKLY_STATE_PATH)
+
+
+def _check_weekly_reset() -> None:
+    """If Monday UTC has rolled since last save, full reset. Logs
+    [WEEKLY-RESET] with last week's final pnl as a closing line."""
+    global _weekly_state
+    today_monday = _current_week_monday().isoformat()
+    if _weekly_state["week_start"] != today_monday:
+        print(
+            f"[WEEKLY-RESET] prev_week={_weekly_state['week_start']} "
+            f"final_pnl={_format_usd(_weekly_state['pnl'])} "
+            f"spent={_format_usd(_weekly_state['spent'])} "
+            f"paused_was={_weekly_state['paused']} "
+            f"new_week={today_monday}",
+            flush=True,
+        )
+        _weekly_state = {
+            "week_start": today_monday,
+            "spent": 0.0, "pnl": 0.0,
+            "paused": False, "paused_at": None,
+        }
+        _save_weekly_state()
+
+
+def _weekly_pause_embed() -> dict[str, Any]:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return {
+        "title": "⚠️ WEEKLY DRAWDOWN HIT — pausing until Monday",
+        "color": 0xE74C3C,
+        "fields": [
+            {"name": "Week start (Mon UTC)",
+             "value": _weekly_state["week_start"], "inline": True},
+            {"name": "Weekly P&L",
+             "value": _format_usd(_weekly_state["pnl"]), "inline": True},
+            {"name": "Weekly Spent",
+             "value": _format_usd(_weekly_state["spent"]), "inline": True},
+            {"name": "Drawdown threshold",
+             "value": f"-{WEEKLY_DRAWDOWN_PCT:.0%} of "
+                      f"{_format_usd(BANKROLL)} = "
+                      f"{_format_usd(-BANKROLL * WEEKLY_DRAWDOWN_PCT)}",
+             "inline": False},
+            {"name": "Resumes",
+             "value": "Monday 00:00 UTC (auto)", "inline": False},
+        ],
+        "footer": {"text": f"PassivePoly Trader  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _check_weekly_drawdown() -> bool:
+    """Compare current weekly pnl against the loss threshold. If it
+    crosses, flip the paused flag, save state, and return True so the
+    caller can log + Discord-alert. Idempotent — already-paused state
+    returns False so we don't double-alert each cycle."""
+    global _weekly_state
+    if _weekly_state["paused"]:
+        return False
+    threshold = -BANKROLL * WEEKLY_DRAWDOWN_PCT
+    if _weekly_state["pnl"] <= threshold:
+        _weekly_state["paused"] = True
+        _weekly_state["paused_at"] = datetime.now(timezone.utc).isoformat()
+        _save_weekly_state()
+        return True
+    return False
 
 
 def _load_daily_spent() -> tuple[date, float]:
@@ -281,6 +410,12 @@ def _size_trade(item: dict[str, Any]) -> tuple[int, float, float, str | None]:
             f"would exceed daily cap "
             f"({_format_usd(_daily_spent)} + {_format_usd(bet_size)} "
             f"> {MAX_DAILY_LOSS:.0%} bankroll)"
+        )
+    if _weekly_state.get("paused"):
+        return contracts, bet_size, kelly_pct, (
+            f"weekly drawdown lockout active "
+            f"(pnl={_format_usd(_weekly_state['pnl'])} since "
+            f"{_weekly_state['week_start']})"
         )
     return contracts, bet_size, kelly_pct, None
 
@@ -506,6 +641,32 @@ def _check_settlements() -> None:
         entry["pnl"] = _compute_pnl(entry, resolved)
         entry["settled_at"] = datetime.now(timezone.utc).isoformat()
         entry["resolved_side"] = resolved
+        # Roll this settlement into the weekly P&L tracker. We only
+        # count trades placed THIS week — trades from a prior week
+        # that settled today carry their pnl to that week's stats,
+        # not this week's drawdown calculation.
+        ts_str = entry.get("timestamp", "")
+        try:
+            placed_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            placed_monday = (placed_dt.date()
+                             - timedelta(days=placed_dt.weekday())).isoformat()
+        except (ValueError, AttributeError):
+            placed_monday = ""
+        if placed_monday == _weekly_state["week_start"]:
+            _weekly_state["pnl"] += float(entry["pnl"])
+            _save_weekly_state()
+            if _check_weekly_drawdown():
+                print(
+                    f"[WEEKLY-PAUSE] triggered: pnl="
+                    f"{_format_usd(_weekly_state['pnl'])} "
+                    f"<= -{WEEKLY_DRAWDOWN_PCT:.0%}*bankroll "
+                    f"({_format_usd(-BANKROLL * WEEKLY_DRAWDOWN_PCT)}); "
+                    f"trades paused until "
+                    f"{(_current_week_monday() + timedelta(days=7)).isoformat()} "
+                    f"00:00 UTC",
+                    flush=True,
+                )
+                send_discord(_weekly_pause_embed())
         # Per-trade Brier: (our_prob − outcome)^2, outcome ∈ {0, 1}.
         # Lower is better; random = 0.25. Logged immediately so settlement-
         # time calibration is visible without parsing the JSON file.
@@ -624,13 +785,26 @@ def send_discord(embed: dict[str, Any]) -> None:
 # ─── Main loop ─────────────────────────────────────────────────────────
 
 def run() -> None:
-    global _daily_spent, _last_reset
+    global _daily_spent, _last_reset, _weekly_state
     _last_reset, _daily_spent = _load_daily_spent()
+    _weekly_state = _load_weekly_state()
     mode = "PAPER TRADING" if PAPER_TRADING else "LIVE TRADING"
     print(
         f"Kalshi Trader Agent starting — {mode}, bankroll={_format_usd(BANKROLL)}, "
         f"max_bet={MAX_BET_PCT:.0%}, interval={CHECK_INTERVAL}s, "
         f"daily_spent={_format_usd(_daily_spent)} (restored from {DAILY_SPENT_PATH.name})"
+    )
+    # Weekly state startup banner. Surfaces a mid-cooldown lockout
+    # immediately on restart so the user doesn't think the trader is
+    # broken when it's just respecting the drawdown rule.
+    print(
+        f"[trader] weekly: week_start={_weekly_state['week_start']} "
+        f"pnl={_format_usd(_weekly_state['pnl'])} "
+        f"spent={_format_usd(_weekly_state['spent'])} "
+        f"paused={_weekly_state['paused']} "
+        f"drawdown_threshold="
+        f"{_format_usd(-BANKROLL * WEEKLY_DRAWDOWN_PCT)}",
+        flush=True,
     )
     # Per-series daily caps: visible at startup so a Railway env flip
     # like KALSHI_KXMLBTOTAL_DAILY_CAP=3 is immediately verifiable
@@ -645,6 +819,7 @@ def run() -> None:
     while True:
         cycle_start = time.time()
         _check_daily_reset()
+        _check_weekly_reset()
 
         try:
             items = kalshi_queue.drain_fresh("risk")
@@ -733,6 +908,8 @@ def run() -> None:
                     if placed:
                         _daily_spent += bet_size
                         _save_daily_spent()
+                        _weekly_state["spent"] += float(bet_size)
+                        _save_weekly_state()
                         executed += 1
                     else:
                         failed += 1
