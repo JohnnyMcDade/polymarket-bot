@@ -632,6 +632,14 @@ def run() -> None:
         f"max_bet={MAX_BET_PCT:.0%}, interval={CHECK_INTERVAL}s, "
         f"daily_spent={_format_usd(_daily_spent)} (restored from {DAILY_SPENT_PATH.name})"
     )
+    # Per-series daily caps: visible at startup so a Railway env flip
+    # like KALSHI_KXMLBTOTAL_DAILY_CAP=3 is immediately verifiable
+    # from the logs instead of requiring an SSH into the container to
+    # read os.environ. Empty dict prints as `{}` — no caps configured.
+    print(
+        f"[trader] series daily caps: {SERIES_DAILY_CAPS}",
+        flush=True,
+    )
     last_settlement_check = 0.0
 
     while True:
