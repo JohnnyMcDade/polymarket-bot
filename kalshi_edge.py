@@ -285,16 +285,15 @@ def _load_seen() -> dict[str, float]:
     return {t: float(ts) for t, ts in raw.items() if float(ts) >= cutoff}
 
 
-def _expire_seen(seen: dict[str, float]) -> int:
-    """Drop expired entries in-place. Returns count of entries dropped.
-    Called at the start of every cycle so entries that crossed the TTL
-    boundary mid-process get cleared."""
-    now = time.time()
-    cutoff = now - SEEN_EXPIRY_SECS
-    expired = [t for t, ts in seen.items() if ts < cutoff]
-    for t in expired:
-        del seen[t]
-    return len(expired)
+# _expire_seen() removed 2026-06-15. Previously it filtered the in-
+# memory seen dict at cycle start, but this meant out-of-band evictions
+# (operator running an SSH eviction script while the agent was alive)
+# survived for less than one cycle — the agent's next _save_seen()
+# would overwrite the disk with its still-bloated in-memory copy. The
+# replacement pattern, implemented in run(), reloads the seen-cache
+# fresh from disk at the start of every cycle. _load_seen() already
+# handles TTL filtering, so the per-cycle reload covers both expiry
+# AND out-of-band changes with one round-trip.
 
 
 # KXBTC (and KXBTCD) hourly/daily "price range on <date>?" markets are
@@ -1642,15 +1641,20 @@ def run() -> None:
         cycle += 1
         cycle_start = time.time()
         # Drop seen-cache entries that crossed the SEEN_EXPIRY_SECS TTL
-        # since the last cycle. Markets Claude SKIPped > 24h ago come
-        # back up for re-evaluation — meaningful since Kalshi often
-        # leaves the same ticker open for days while game state evolves
-        # (probable starters get scratched, lineups confirmed, etc.).
-        expired_n = _expire_seen(seen)
-        if expired_n:
+        # Reload seen-cache from disk EVERY cycle. _load_seen()
+        # filters out entries past the SEEN_EXPIRY_SECS TTL, so the
+        # reload covers both natural expiry AND any out-of-band
+        # eviction someone ran via SSH between cycles. The delta
+        # against the prior in-memory count is the [SEEN-EXPIRED]
+        # signal — includes both TTL expiries and external evictions.
+        prev_seen_count = len(seen)
+        seen = _load_seen()
+        delta = prev_seen_count - len(seen)
+        if delta > 0:
             print(
-                f"[SEEN-EXPIRED] count={expired_n} "
-                f"ttl_hours={SEEN_EXPIRY_SECS/3600:.1f}",
+                f"[SEEN-EXPIRED] count={delta} "
+                f"ttl_hours={SEEN_EXPIRY_SECS/3600:.1f} "
+                f"(TTL expiries + external evictions since last cycle)",
                 flush=True,
             )
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
