@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-14T23:01:21.517956+00:00",
+  "generated_at": "2026-06-15T00:05:46.981437+00:00",
   "window_years": [
     2024,
     2025,
@@ -8,580 +8,6 @@
   "min_grass_matches": 10,
   "min_total_matches": 50,
   "players": {
-    "Jordan Thompson": {
-      "delta_pp": 7.8,
-      "grass_wr": 0.636,
-      "overall_wr": 0.558,
-      "grass_n": 11,
-      "all_n": 86
-    },
-    "James Duckworth": {
-      "delta_pp": 6.7,
-      "grass_wr": 0.4,
-      "overall_wr": 0.333,
-      "grass_n": 10,
-      "all_n": 54
-    },
-    "Rinky Hijikata": {
-      "delta_pp": -9.4,
-      "grass_wr": 0.273,
-      "overall_wr": 0.367,
-      "grass_n": 11,
-      "all_n": 79
-    },
-    "Alexei Popyrin": {
-      "delta_pp": -5.9,
-      "grass_wr": 0.4,
-      "overall_wr": 0.459,
-      "grass_n": 10,
-      "all_n": 109
-    },
-    "Sebastian Korda": {
-      "delta_pp": 9.8,
-      "grass_wr": 0.7,
-      "overall_wr": 0.602,
-      "grass_n": 10,
-      "all_n": 103
-    },
-    "Ben Shelton": {
-      "delta_pp": -7.0,
-      "grass_wr": 0.556,
-      "overall_wr": 0.626,
-      "grass_n": 18,
-      "all_n": 155
-    },
-    "Aleksandar Vukic": {
-      "delta_pp": 12.9,
-      "grass_wr": 0.529,
-      "overall_wr": 0.4,
-      "grass_n": 17,
-      "all_n": 100
-    },
-    "Ugo Humbert": {
-      "delta_pp": -5.4,
-      "grass_wr": 0.529,
-      "overall_wr": 0.583,
-      "grass_n": 17,
-      "all_n": 132
-    },
-    "Alex Michelsen": {
-      "delta_pp": 0.9,
-      "grass_wr": 0.526,
-      "overall_wr": 0.517,
-      "grass_n": 19,
-      "all_n": 143
-    },
-    "Tomas Martin Etcheverry": {
-      "delta_pp": -21.4,
-      "grass_wr": 0.3,
-      "overall_wr": 0.514,
-      "grass_n": 10,
-      "all_n": 144
-    },
-    "Alexander Zverev": {
-      "delta_pp": -3.5,
-      "grass_wr": 0.706,
-      "overall_wr": 0.741,
-      "grass_n": 17,
-      "all_n": 212
-    },
-    "Adrian Mannarino": {
-      "delta_pp": 2.0,
-      "grass_wr": 0.364,
-      "overall_wr": 0.344,
-      "grass_n": 11,
-      "all_n": 93
-    },
-    "Alex De Minaur": {
-      "delta_pp": 9.5,
-      "grass_wr": 0.769,
-      "overall_wr": 0.674,
-      "grass_n": 13,
-      "all_n": 172
-    },
-    "Novak Djokovic": {
-      "delta_pp": 5.2,
-      "grass_wr": 0.833,
-      "overall_wr": 0.781,
-      "grass_n": 12,
-      "all_n": 105
-    },
-    "Taylor Fritz": {
-      "delta_pp": 17.6,
-      "grass_wr": 0.846,
-      "overall_wr": 0.671,
-      "grass_n": 26,
-      "all_n": 170
-    },
-    "Cameron Norrie": {
-      "delta_pp": -4.1,
-      "grass_wr": 0.5,
-      "overall_wr": 0.541,
-      "grass_n": 12,
-      "all_n": 122
-    },
-    "Lorenzo Sonego": {
-      "delta_pp": 10.4,
-      "grass_wr": 0.533,
-      "overall_wr": 0.43,
-      "grass_n": 15,
-      "all_n": 114
-    },
-    "Jiri Lehecka": {
-      "delta_pp": 6.9,
-      "grass_wr": 0.7,
-      "overall_wr": 0.631,
-      "grass_n": 10,
-      "all_n": 130
-    },
-    "Tallon Griekspoor": {
-      "delta_pp": 15.5,
-      "grass_wr": 0.667,
-      "overall_wr": 0.511,
-      "grass_n": 12,
-      "all_n": 131
-    },
-    "Sebastian Ofner": {
-      "delta_pp": 7.2,
-      "grass_wr": 0.455,
-      "overall_wr": 0.382,
-      "grass_n": 11,
-      "all_n": 68
-    },
-    "Roberto Bautista Agut": {
-      "delta_pp": 16.3,
-      "grass_wr": 0.611,
-      "overall_wr": 0.448,
-      "grass_n": 18,
-      "all_n": 96
-    },
-    "Miomir Kecmanovic": {
-      "delta_pp": 2.1,
-      "grass_wr": 0.462,
-      "overall_wr": 0.441,
-      "grass_n": 13,
-      "all_n": 127
-    },
-    "Jan Lennard Struff": {
-      "delta_pp": 17.2,
-      "grass_wr": 0.643,
-      "overall_wr": 0.471,
-      "grass_n": 14,
-      "all_n": 102
-    },
-    "Lorenzo Musetti": {
-      "delta_pp": 9.4,
-      "grass_wr": 0.733,
-      "overall_wr": 0.639,
-      "grass_n": 15,
-      "all_n": 147
-    },
-    "Karen Khachanov": {
-      "delta_pp": -0.8,
-      "grass_wr": 0.571,
-      "overall_wr": 0.58,
-      "grass_n": 14,
-      "all_n": 138
-    },
-    "Mackenzie Mcdonald": {
-      "delta_pp": 12.1,
-      "grass_wr": 0.455,
-      "overall_wr": 0.333,
-      "grass_n": 11,
-      "all_n": 51
-    },
-    "Fabian Marozsan": {
-      "delta_pp": -16.4,
-      "grass_wr": 0.3,
-      "overall_wr": 0.464,
-      "grass_n": 10,
-      "all_n": 125
-    },
-    "Nuno Borges": {
-      "delta_pp": -10.3,
-      "grass_wr": 0.364,
-      "overall_wr": 0.466,
-      "grass_n": 11,
-      "all_n": 133
-    },
-    "Jack Draper": {
-      "delta_pp": 3.7,
-      "grass_wr": 0.733,
-      "overall_wr": 0.696,
-      "grass_n": 15,
-      "all_n": 102
-    },
-    "Alexander Bublik": {
-      "delta_pp": 11.3,
-      "grass_wr": 0.692,
-      "overall_wr": 0.579,
-      "grass_n": 13,
-      "all_n": 133
-    },
-    "Tommy Paul": {
-      "delta_pp": 3.3,
-      "grass_wr": 0.733,
-      "overall_wr": 0.7,
-      "grass_n": 15,
-      "all_n": 140
-    },
-    "Arthur Rinderknech": {
-      "delta_pp": 4.7,
-      "grass_wr": 0.529,
-      "overall_wr": 0.483,
-      "grass_n": 17,
-      "all_n": 116
-    },
-    "Felix Auger Aliassime": {
-      "delta_pp": -9.6,
-      "grass_wr": 0.545,
-      "overall_wr": 0.641,
-      "grass_n": 11,
-      "all_n": 156
-    },
-    "Gael Monfils": {
-      "delta_pp": 1.7,
-      "grass_wr": 0.545,
-      "overall_wr": 0.529,
-      "grass_n": 11,
-      "all_n": 87
-    },
-    "Marcos Giron": {
-      "delta_pp": 16.1,
-      "grass_wr": 0.632,
-      "overall_wr": 0.471,
-      "grass_n": 19,
-      "all_n": 121
-    },
-    "Zizou Bergs": {
-      "delta_pp": -8.6,
-      "grass_wr": 0.4,
-      "overall_wr": 0.486,
-      "grass_n": 10,
-      "all_n": 111
-    },
-    "Jannik Sinner": {
-      "delta_pp": -3.8,
-      "grass_wr": 0.889,
-      "overall_wr": 0.927,
-      "grass_n": 18,
-      "all_n": 178
-    },
-    "Flavio Cobolli": {
-      "delta_pp": -2.2,
-      "grass_wr": 0.562,
-      "overall_wr": 0.584,
-      "grass_n": 16,
-      "all_n": 154
-    },
-    "Jakub Mensik": {
-      "delta_pp": -17.6,
-      "grass_wr": 0.462,
-      "overall_wr": 0.638,
-      "grass_n": 13,
-      "all_n": 127
-    },
-    "Carlos Alcaraz": {
-      "delta_pp": 4.9,
-      "grass_wr": 0.905,
-      "overall_wr": 0.855,
-      "grass_n": 21,
-      "all_n": 166
-    },
-    "Daniil Medvedev": {
-      "delta_pp": -1.5,
-      "grass_wr": 0.667,
-      "overall_wr": 0.682,
-      "grass_n": 15,
-      "all_n": 157
-    },
-    "Luciano Darderi": {
-      "delta_pp": -17.7,
-      "grass_wr": 0.364,
-      "overall_wr": 0.541,
-      "grass_n": 11,
-      "all_n": 135
-    },
-    "Gabriel Diallo": {
-      "delta_pp": 19.2,
-      "grass_wr": 0.692,
-      "overall_wr": 0.5,
-      "grass_n": 13,
-      "all_n": 84
-    },
-    "Corentin Moutet": {
-      "delta_pp": 16.6,
-      "grass_wr": 0.636,
-      "overall_wr": 0.471,
-      "grass_n": 11,
-      "all_n": 102
-    },
-    "Brandon Nakashima": {
-      "delta_pp": 8.5,
-      "grass_wr": 0.611,
-      "overall_wr": 0.526,
-      "grass_n": 18,
-      "all_n": 135
-    },
-    "Matteo Berrettini": {
-      "delta_pp": -5.0,
-      "grass_wr": 0.6,
-      "overall_wr": 0.65,
-      "grass_n": 10,
-      "all_n": 100
-    },
-    "Giovanni Mpetshi Perricard": {
-      "delta_pp": 1.8,
-      "grass_wr": 0.455,
-      "overall_wr": 0.437,
-      "grass_n": 11,
-      "all_n": 87
-    },
-    "Reilly Opelka": {
-      "delta_pp": 14.3,
-      "grass_wr": 0.643,
-      "overall_wr": 0.5,
-      "grass_n": 14,
-      "all_n": 76
-    },
-    "Iga Swiatek": {
-      "delta_pp": 5.4,
-      "grass_wr": 0.857,
-      "overall_wr": 0.803,
-      "grass_n": 14,
-      "all_n": 178
-    },
-    "Beatriz Haddad Maia": {
-      "delta_pp": -0.3,
-      "grass_wr": 0.462,
-      "overall_wr": 0.465,
-      "grass_n": 13,
-      "all_n": 114
-    },
-    "Maria Sakkari": {
-      "delta_pp": -4.1,
-      "grass_wr": 0.455,
-      "overall_wr": 0.495,
-      "grass_n": 11,
-      "all_n": 103
-    },
-    "Leylah Fernandez": {
-      "delta_pp": 7.4,
-      "grass_wr": 0.611,
-      "overall_wr": 0.537,
-      "grass_n": 18,
-      "all_n": 134
-    },
-    "Katie Boulter": {
-      "delta_pp": 16.5,
-      "grass_wr": 0.706,
-      "overall_wr": 0.541,
-      "grass_n": 17,
-      "all_n": 109
-    },
-    "Jessica Pegula": {
-      "delta_pp": -4.8,
-      "grass_wr": 0.667,
-      "overall_wr": 0.714,
-      "grass_n": 15,
-      "all_n": 161
-    },
-    "Jasmine Paolini": {
-      "delta_pp": 0.3,
-      "grass_wr": 0.643,
-      "overall_wr": 0.639,
-      "grass_n": 14,
-      "all_n": 147
-    },
-    "Donna Vekic": {
-      "delta_pp": 10.0,
-      "grass_wr": 0.6,
-      "overall_wr": 0.5,
-      "grass_n": 20,
-      "all_n": 100
-    },
-    "Elena Rybakina": {
-      "delta_pp": -6.6,
-      "grass_wr": 0.714,
-      "overall_wr": 0.78,
-      "grass_n": 14,
-      "all_n": 164
-    },
-    "Aryna Sabalenka": {
-      "delta_pp": -3.6,
-      "grass_wr": 0.8,
-      "overall_wr": 0.836,
-      "grass_n": 10,
-      "all_n": 177
-    },
-    "Linda Noskova": {
-      "delta_pp": 6.2,
-      "grass_wr": 0.647,
-      "overall_wr": 0.585,
-      "grass_n": 17,
-      "all_n": 130
-    },
-    "Daria Kasatkina": {
-      "delta_pp": 8.7,
-      "grass_wr": 0.625,
-      "overall_wr": 0.538,
-      "grass_n": 16,
-      "all_n": 119
-    },
-    "Jelena Ostapenko": {
-      "delta_pp": 3.1,
-      "grass_wr": 0.6,
-      "overall_wr": 0.569,
-      "grass_n": 10,
-      "all_n": 109
-    },
-    "Mirra Andreeva": {
-      "delta_pp": -22.1,
-      "grass_wr": 0.5,
-      "overall_wr": 0.721,
-      "grass_n": 10,
-      "all_n": 147
-    },
-    "Magda Linette": {
-      "delta_pp": -11.2,
-      "grass_wr": 0.4,
-      "overall_wr": 0.512,
-      "grass_n": 10,
-      "all_n": 123
-    },
-    "Veronika Kudermetova": {
-      "delta_pp": -1.1,
-      "grass_wr": 0.462,
-      "overall_wr": 0.473,
-      "grass_n": 13,
-      "all_n": 91
-    },
-    "Elise Mertens": {
-      "delta_pp": 13.6,
-      "grass_wr": 0.733,
-      "overall_wr": 0.597,
-      "grass_n": 15,
-      "all_n": 129
-    },
-    "Ekaterina Alexandrova": {
-      "delta_pp": 12.7,
-      "grass_wr": 0.684,
-      "overall_wr": 0.557,
-      "grass_n": 19,
-      "all_n": 140
-    },
-    "Liudmila Samsonova": {
-      "delta_pp": 18.9,
-      "grass_wr": 0.714,
-      "overall_wr": 0.525,
-      "grass_n": 21,
-      "all_n": 120
-    },
-    "Diana Shnaider": {
-      "delta_pp": 5.6,
-      "grass_wr": 0.65,
-      "overall_wr": 0.594,
-      "grass_n": 20,
-      "all_n": 143
-    },
-    "Dayana Yastremska": {
-      "delta_pp": 16.2,
-      "grass_wr": 0.667,
-      "overall_wr": 0.505,
-      "grass_n": 15,
-      "all_n": 105
-    },
-    "Katerina Siniakova": {
-      "delta_pp": 6.7,
-      "grass_wr": 0.571,
-      "overall_wr": 0.505,
-      "grass_n": 14,
-      "all_n": 105
-    },
-    "Elina Svitolina": {
-      "delta_pp": -7.2,
-      "grass_wr": 0.636,
-      "overall_wr": 0.708,
-      "grass_n": 11,
-      "all_n": 137
-    },
-    "Emma Navarro": {
-      "delta_pp": 4.9,
-      "grass_wr": 0.65,
-      "overall_wr": 0.601,
-      "grass_n": 20,
-      "all_n": 143
-    },
-    "Lulu Sun": {
-      "delta_pp": 13.9,
-      "grass_wr": 0.545,
-      "overall_wr": 0.407,
-      "grass_n": 11,
-      "all_n": 59
-    },
-    "Xin Yu Wang": {
-      "delta_pp": 6.4,
-      "grass_wr": 0.538,
-      "overall_wr": 0.475,
-      "grass_n": 13,
-      "all_n": 118
-    },
-    "Amanda Anisimova": {
-      "delta_pp": 10.5,
-      "grass_wr": 0.8,
-      "overall_wr": 0.695,
-      "grass_n": 15,
-      "all_n": 105
-    },
-    "Emma Raducanu": {
-      "delta_pp": 8.9,
-      "grass_wr": 0.667,
-      "overall_wr": 0.577,
-      "grass_n": 18,
-      "all_n": 97
-    },
-    "Anna Blinkova": {
-      "delta_pp": 3.5,
-      "grass_wr": 0.429,
-      "overall_wr": 0.394,
-      "grass_n": 14,
-      "all_n": 94
-    },
-    "Yulia Putintseva": {
-      "delta_pp": 11.3,
-      "grass_wr": 0.643,
-      "overall_wr": 0.529,
-      "grass_n": 14,
-      "all_n": 119
-    },
-    "Magdalena Frech": {
-      "delta_pp": -13.4,
-      "grass_wr": 0.3,
-      "overall_wr": 0.434,
-      "grass_n": 10,
-      "all_n": 113
-    },
-    "Anastasia Pavlyuchenkova": {
-      "delta_pp": 16.0,
-      "grass_wr": 0.667,
-      "overall_wr": 0.507,
-      "grass_n": 12,
-      "all_n": 75
-    },
-    "Barbora Krejcikova": {
-      "delta_pp": 16.8,
-      "grass_wr": 0.75,
-      "overall_wr": 0.582,
-      "grass_n": 16,
-      "all_n": 67
-    },
-    "Paula Badosa": {
-      "delta_pp": 7.6,
-      "grass_wr": 0.7,
-      "overall_wr": 0.624,
-      "grass_n": 10,
-      "all_n": 93
-    },
     "Tatjana Maria": {
       "delta_pp": 20.5,
       "grass_wr": 0.545,
@@ -596,19 +22,131 @@
       "grass_n": 12,
       "all_n": 102
     },
-    "Clara Tauson": {
-      "delta_pp": -0.4,
-      "grass_wr": 0.545,
-      "overall_wr": 0.549,
+    "Gabriel Diallo": {
+      "delta_pp": 19.2,
+      "grass_wr": 0.692,
+      "overall_wr": 0.5,
+      "grass_n": 13,
+      "all_n": 84
+    },
+    "Liudmila Samsonova": {
+      "delta_pp": 18.9,
+      "grass_wr": 0.714,
+      "overall_wr": 0.525,
+      "grass_n": 21,
+      "all_n": 120
+    },
+    "Taylor Fritz": {
+      "delta_pp": 17.6,
+      "grass_wr": 0.846,
+      "overall_wr": 0.671,
+      "grass_n": 26,
+      "all_n": 170
+    },
+    "Jan Lennard Struff": {
+      "delta_pp": 17.2,
+      "grass_wr": 0.643,
+      "overall_wr": 0.471,
+      "grass_n": 14,
+      "all_n": 102
+    },
+    "Barbora Krejcikova": {
+      "delta_pp": 16.8,
+      "grass_wr": 0.75,
+      "overall_wr": 0.582,
+      "grass_n": 16,
+      "all_n": 67
+    },
+    "Corentin Moutet": {
+      "delta_pp": 16.6,
+      "grass_wr": 0.636,
+      "overall_wr": 0.471,
       "grass_n": 11,
       "all_n": 102
     },
-    "Naomi Osaka": {
-      "delta_pp": -14.6,
-      "grass_wr": 0.5,
-      "overall_wr": 0.646,
-      "grass_n": 12,
+    "Katie Boulter": {
+      "delta_pp": 16.5,
+      "grass_wr": 0.706,
+      "overall_wr": 0.541,
+      "grass_n": 17,
+      "all_n": 109
+    },
+    "Roberto Bautista Agut": {
+      "delta_pp": 16.3,
+      "grass_wr": 0.611,
+      "overall_wr": 0.448,
+      "grass_n": 18,
       "all_n": 96
+    },
+    "Dayana Yastremska": {
+      "delta_pp": 16.2,
+      "grass_wr": 0.667,
+      "overall_wr": 0.505,
+      "grass_n": 15,
+      "all_n": 105
+    },
+    "Marcos Giron": {
+      "delta_pp": 16.1,
+      "grass_wr": 0.632,
+      "overall_wr": 0.471,
+      "grass_n": 19,
+      "all_n": 121
+    },
+    "Anastasia Pavlyuchenkova": {
+      "delta_pp": 16.0,
+      "grass_wr": 0.667,
+      "overall_wr": 0.507,
+      "grass_n": 12,
+      "all_n": 75
+    },
+    "Tallon Griekspoor": {
+      "delta_pp": 15.5,
+      "grass_wr": 0.667,
+      "overall_wr": 0.511,
+      "grass_n": 12,
+      "all_n": 131
+    },
+    "Reilly Opelka": {
+      "delta_pp": 14.3,
+      "grass_wr": 0.643,
+      "overall_wr": 0.5,
+      "grass_n": 14,
+      "all_n": 76
+    },
+    "Lulu Sun": {
+      "delta_pp": 13.9,
+      "grass_wr": 0.545,
+      "overall_wr": 0.407,
+      "grass_n": 11,
+      "all_n": 59
+    },
+    "Elise Mertens": {
+      "delta_pp": 13.6,
+      "grass_wr": 0.733,
+      "overall_wr": 0.597,
+      "grass_n": 15,
+      "all_n": 129
+    },
+    "Aleksandar Vukic": {
+      "delta_pp": 12.9,
+      "grass_wr": 0.529,
+      "overall_wr": 0.4,
+      "grass_n": 17,
+      "all_n": 100
+    },
+    "Ekaterina Alexandrova": {
+      "delta_pp": 12.7,
+      "grass_wr": 0.684,
+      "overall_wr": 0.557,
+      "grass_n": 19,
+      "all_n": 140
+    },
+    "Mackenzie Mcdonald": {
+      "delta_pp": 12.1,
+      "grass_wr": 0.455,
+      "overall_wr": 0.333,
+      "grass_n": 11,
+      "all_n": 51
     },
     "Ons Jabeur": {
       "delta_pp": 12.1,
@@ -617,12 +155,306 @@
       "grass_n": 12,
       "all_n": 55
     },
-    "Madison Keys": {
-      "delta_pp": -2.8,
+    "Alexander Bublik": {
+      "delta_pp": 11.3,
+      "grass_wr": 0.692,
+      "overall_wr": 0.579,
+      "grass_n": 13,
+      "all_n": 133
+    },
+    "Yulia Putintseva": {
+      "delta_pp": 11.3,
+      "grass_wr": 0.643,
+      "overall_wr": 0.529,
+      "grass_n": 14,
+      "all_n": 119
+    },
+    "Amanda Anisimova": {
+      "delta_pp": 10.5,
+      "grass_wr": 0.8,
+      "overall_wr": 0.695,
+      "grass_n": 15,
+      "all_n": 105
+    },
+    "Lorenzo Sonego": {
+      "delta_pp": 10.4,
+      "grass_wr": 0.533,
+      "overall_wr": 0.43,
+      "grass_n": 15,
+      "all_n": 114
+    },
+    "Donna Vekic": {
+      "delta_pp": 10.0,
+      "grass_wr": 0.6,
+      "overall_wr": 0.5,
+      "grass_n": 20,
+      "all_n": 100
+    },
+    "Sebastian Korda": {
+      "delta_pp": 9.8,
+      "grass_wr": 0.7,
+      "overall_wr": 0.602,
+      "grass_n": 10,
+      "all_n": 103
+    },
+    "Alex De Minaur": {
+      "delta_pp": 9.5,
+      "grass_wr": 0.769,
+      "overall_wr": 0.674,
+      "grass_n": 13,
+      "all_n": 172
+    },
+    "Lorenzo Musetti": {
+      "delta_pp": 9.4,
+      "grass_wr": 0.733,
+      "overall_wr": 0.639,
+      "grass_n": 15,
+      "all_n": 147
+    },
+    "Emma Raducanu": {
+      "delta_pp": 8.9,
       "grass_wr": 0.667,
-      "overall_wr": 0.694,
+      "overall_wr": 0.577,
+      "grass_n": 18,
+      "all_n": 97
+    },
+    "Daria Kasatkina": {
+      "delta_pp": 8.7,
+      "grass_wr": 0.625,
+      "overall_wr": 0.538,
+      "grass_n": 16,
+      "all_n": 119
+    },
+    "Brandon Nakashima": {
+      "delta_pp": 8.5,
+      "grass_wr": 0.611,
+      "overall_wr": 0.526,
+      "grass_n": 18,
+      "all_n": 135
+    },
+    "Jordan Thompson": {
+      "delta_pp": 7.8,
+      "grass_wr": 0.636,
+      "overall_wr": 0.558,
+      "grass_n": 11,
+      "all_n": 86
+    },
+    "Paula Badosa": {
+      "delta_pp": 7.6,
+      "grass_wr": 0.7,
+      "overall_wr": 0.624,
+      "grass_n": 10,
+      "all_n": 93
+    },
+    "Leylah Fernandez": {
+      "delta_pp": 7.4,
+      "grass_wr": 0.611,
+      "overall_wr": 0.537,
+      "grass_n": 18,
+      "all_n": 134
+    },
+    "Sebastian Ofner": {
+      "delta_pp": 7.2,
+      "grass_wr": 0.455,
+      "overall_wr": 0.382,
+      "grass_n": 11,
+      "all_n": 68
+    },
+    "Jiri Lehecka": {
+      "delta_pp": 6.9,
+      "grass_wr": 0.7,
+      "overall_wr": 0.631,
+      "grass_n": 10,
+      "all_n": 130
+    },
+    "James Duckworth": {
+      "delta_pp": 6.7,
+      "grass_wr": 0.4,
+      "overall_wr": 0.333,
+      "grass_n": 10,
+      "all_n": 54
+    },
+    "Katerina Siniakova": {
+      "delta_pp": 6.7,
+      "grass_wr": 0.571,
+      "overall_wr": 0.505,
+      "grass_n": 14,
+      "all_n": 105
+    },
+    "Xin Yu Wang": {
+      "delta_pp": 6.4,
+      "grass_wr": 0.538,
+      "overall_wr": 0.475,
+      "grass_n": 13,
+      "all_n": 118
+    },
+    "Linda Noskova": {
+      "delta_pp": 6.2,
+      "grass_wr": 0.647,
+      "overall_wr": 0.585,
+      "grass_n": 17,
+      "all_n": 130
+    },
+    "Diana Shnaider": {
+      "delta_pp": 5.6,
+      "grass_wr": 0.65,
+      "overall_wr": 0.594,
+      "grass_n": 20,
+      "all_n": 143
+    },
+    "Iga Swiatek": {
+      "delta_pp": 5.4,
+      "grass_wr": 0.857,
+      "overall_wr": 0.803,
+      "grass_n": 14,
+      "all_n": 178
+    },
+    "Novak Djokovic": {
+      "delta_pp": 5.2,
+      "grass_wr": 0.833,
+      "overall_wr": 0.781,
       "grass_n": 12,
-      "all_n": 108
+      "all_n": 105
+    },
+    "Carlos Alcaraz": {
+      "delta_pp": 4.9,
+      "grass_wr": 0.905,
+      "overall_wr": 0.855,
+      "grass_n": 21,
+      "all_n": 166
+    },
+    "Emma Navarro": {
+      "delta_pp": 4.9,
+      "grass_wr": 0.65,
+      "overall_wr": 0.601,
+      "grass_n": 20,
+      "all_n": 143
+    },
+    "Arthur Rinderknech": {
+      "delta_pp": 4.7,
+      "grass_wr": 0.529,
+      "overall_wr": 0.483,
+      "grass_n": 17,
+      "all_n": 116
+    },
+    "Jack Draper": {
+      "delta_pp": 3.7,
+      "grass_wr": 0.733,
+      "overall_wr": 0.696,
+      "grass_n": 15,
+      "all_n": 102
+    },
+    "Anna Blinkova": {
+      "delta_pp": 3.5,
+      "grass_wr": 0.429,
+      "overall_wr": 0.394,
+      "grass_n": 14,
+      "all_n": 94
+    },
+    "Tommy Paul": {
+      "delta_pp": 3.3,
+      "grass_wr": 0.733,
+      "overall_wr": 0.7,
+      "grass_n": 15,
+      "all_n": 140
+    },
+    "Jelena Ostapenko": {
+      "delta_pp": 3.1,
+      "grass_wr": 0.6,
+      "overall_wr": 0.569,
+      "grass_n": 10,
+      "all_n": 109
+    },
+    "Miomir Kecmanovic": {
+      "delta_pp": 2.1,
+      "grass_wr": 0.462,
+      "overall_wr": 0.441,
+      "grass_n": 13,
+      "all_n": 127
+    },
+    "Adrian Mannarino": {
+      "delta_pp": 2.0,
+      "grass_wr": 0.364,
+      "overall_wr": 0.344,
+      "grass_n": 11,
+      "all_n": 93
+    },
+    "Giovanni Mpetshi Perricard": {
+      "delta_pp": 1.8,
+      "grass_wr": 0.455,
+      "overall_wr": 0.437,
+      "grass_n": 11,
+      "all_n": 87
+    },
+    "Gael Monfils": {
+      "delta_pp": 1.7,
+      "grass_wr": 0.545,
+      "overall_wr": 0.529,
+      "grass_n": 11,
+      "all_n": 87
+    },
+    "Alex Michelsen": {
+      "delta_pp": 0.9,
+      "grass_wr": 0.526,
+      "overall_wr": 0.517,
+      "grass_n": 19,
+      "all_n": 143
+    },
+    "Jasmine Paolini": {
+      "delta_pp": 0.3,
+      "grass_wr": 0.643,
+      "overall_wr": 0.639,
+      "grass_n": 14,
+      "all_n": 147
+    },
+    "Beatriz Haddad Maia": {
+      "delta_pp": -0.3,
+      "grass_wr": 0.462,
+      "overall_wr": 0.465,
+      "grass_n": 13,
+      "all_n": 114
+    },
+    "Clara Tauson": {
+      "delta_pp": -0.4,
+      "grass_wr": 0.545,
+      "overall_wr": 0.549,
+      "grass_n": 11,
+      "all_n": 102
+    },
+    "Karen Khachanov": {
+      "delta_pp": -0.8,
+      "grass_wr": 0.571,
+      "overall_wr": 0.58,
+      "grass_n": 14,
+      "all_n": 138
+    },
+    "Veronika Kudermetova": {
+      "delta_pp": -1.1,
+      "grass_wr": 0.462,
+      "overall_wr": 0.473,
+      "grass_n": 13,
+      "all_n": 91
+    },
+    "Sonay Kartal": {
+      "delta_pp": -1.3,
+      "grass_wr": 0.583,
+      "overall_wr": 0.596,
+      "grass_n": 12,
+      "all_n": 52
+    },
+    "Daniil Medvedev": {
+      "delta_pp": -1.5,
+      "grass_wr": 0.667,
+      "overall_wr": 0.682,
+      "grass_n": 15,
+      "all_n": 157
+    },
+    "Flavio Cobolli": {
+      "delta_pp": -2.2,
+      "grass_wr": 0.562,
+      "overall_wr": 0.584,
+      "grass_n": 16,
+      "all_n": 154
     },
     "Rebecca Sramkova": {
       "delta_pp": -2.2,
@@ -631,12 +463,180 @@
       "grass_n": 10,
       "all_n": 92
     },
-    "Sonay Kartal": {
-      "delta_pp": -1.3,
-      "grass_wr": 0.583,
-      "overall_wr": 0.596,
+    "Madison Keys": {
+      "delta_pp": -2.8,
+      "grass_wr": 0.667,
+      "overall_wr": 0.694,
       "grass_n": 12,
-      "all_n": 52
+      "all_n": 108
+    },
+    "Alexander Zverev": {
+      "delta_pp": -3.5,
+      "grass_wr": 0.706,
+      "overall_wr": 0.741,
+      "grass_n": 17,
+      "all_n": 212
+    },
+    "Aryna Sabalenka": {
+      "delta_pp": -3.6,
+      "grass_wr": 0.8,
+      "overall_wr": 0.836,
+      "grass_n": 10,
+      "all_n": 177
+    },
+    "Jannik Sinner": {
+      "delta_pp": -3.8,
+      "grass_wr": 0.889,
+      "overall_wr": 0.927,
+      "grass_n": 18,
+      "all_n": 178
+    },
+    "Cameron Norrie": {
+      "delta_pp": -4.1,
+      "grass_wr": 0.5,
+      "overall_wr": 0.541,
+      "grass_n": 12,
+      "all_n": 122
+    },
+    "Maria Sakkari": {
+      "delta_pp": -4.1,
+      "grass_wr": 0.455,
+      "overall_wr": 0.495,
+      "grass_n": 11,
+      "all_n": 103
+    },
+    "Jessica Pegula": {
+      "delta_pp": -4.8,
+      "grass_wr": 0.667,
+      "overall_wr": 0.714,
+      "grass_n": 15,
+      "all_n": 161
+    },
+    "Matteo Berrettini": {
+      "delta_pp": -5.0,
+      "grass_wr": 0.6,
+      "overall_wr": 0.65,
+      "grass_n": 10,
+      "all_n": 100
+    },
+    "Ugo Humbert": {
+      "delta_pp": -5.4,
+      "grass_wr": 0.529,
+      "overall_wr": 0.583,
+      "grass_n": 17,
+      "all_n": 132
+    },
+    "Alexei Popyrin": {
+      "delta_pp": -5.9,
+      "grass_wr": 0.4,
+      "overall_wr": 0.459,
+      "grass_n": 10,
+      "all_n": 109
+    },
+    "Elena Rybakina": {
+      "delta_pp": -6.6,
+      "grass_wr": 0.714,
+      "overall_wr": 0.78,
+      "grass_n": 14,
+      "all_n": 164
+    },
+    "Ben Shelton": {
+      "delta_pp": -7.0,
+      "grass_wr": 0.556,
+      "overall_wr": 0.626,
+      "grass_n": 18,
+      "all_n": 155
+    },
+    "Elina Svitolina": {
+      "delta_pp": -7.2,
+      "grass_wr": 0.636,
+      "overall_wr": 0.708,
+      "grass_n": 11,
+      "all_n": 137
+    },
+    "Zizou Bergs": {
+      "delta_pp": -8.6,
+      "grass_wr": 0.4,
+      "overall_wr": 0.486,
+      "grass_n": 10,
+      "all_n": 111
+    },
+    "Rinky Hijikata": {
+      "delta_pp": -9.4,
+      "grass_wr": 0.273,
+      "overall_wr": 0.367,
+      "grass_n": 11,
+      "all_n": 79
+    },
+    "Felix Auger Aliassime": {
+      "delta_pp": -9.6,
+      "grass_wr": 0.545,
+      "overall_wr": 0.641,
+      "grass_n": 11,
+      "all_n": 156
+    },
+    "Nuno Borges": {
+      "delta_pp": -10.3,
+      "grass_wr": 0.364,
+      "overall_wr": 0.466,
+      "grass_n": 11,
+      "all_n": 133
+    },
+    "Magda Linette": {
+      "delta_pp": -11.2,
+      "grass_wr": 0.4,
+      "overall_wr": 0.512,
+      "grass_n": 10,
+      "all_n": 123
+    },
+    "Magdalena Frech": {
+      "delta_pp": -13.4,
+      "grass_wr": 0.3,
+      "overall_wr": 0.434,
+      "grass_n": 10,
+      "all_n": 113
+    },
+    "Naomi Osaka": {
+      "delta_pp": -14.6,
+      "grass_wr": 0.5,
+      "overall_wr": 0.646,
+      "grass_n": 12,
+      "all_n": 96
+    },
+    "Fabian Marozsan": {
+      "delta_pp": -16.4,
+      "grass_wr": 0.3,
+      "overall_wr": 0.464,
+      "grass_n": 10,
+      "all_n": 125
+    },
+    "Jakub Mensik": {
+      "delta_pp": -17.6,
+      "grass_wr": 0.462,
+      "overall_wr": 0.638,
+      "grass_n": 13,
+      "all_n": 127
+    },
+    "Luciano Darderi": {
+      "delta_pp": -17.7,
+      "grass_wr": 0.364,
+      "overall_wr": 0.541,
+      "grass_n": 11,
+      "all_n": 135
+    },
+    "Tomas Martin Etcheverry": {
+      "delta_pp": -21.4,
+      "grass_wr": 0.3,
+      "overall_wr": 0.514,
+      "grass_n": 10,
+      "all_n": 144
+    },
+    "Mirra Andreeva": {
+      "delta_pp": -22.1,
+      "grass_wr": 0.5,
+      "overall_wr": 0.721,
+      "grass_n": 10,
+      "all_n": 147
     }
   }
 }
