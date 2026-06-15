@@ -34,6 +34,13 @@ import requests
 
 WEBHOOK_KALSHI_WINRATE = os.getenv("WEBHOOK_KALSHI_WINRATE", "")
 WINRATE_HOUR = int(os.getenv("KALSHI_WINRATE_HOUR", "7"))
+# Public dashboard URL surfaced in the daily Discord embed so anyone
+# subscribed to the channel can one-click into the live HTML view.
+# Override via env if the Railway public domain ever changes.
+DASHBOARD_URL = os.getenv(
+    "KALSHI_DASHBOARD_URL",
+    "https://worker-production-0858.up.railway.app/dashboard",
+)
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 CSV_HISTORY_PATH = Path(os.getenv("KALSHI_WINRATE_CSV", "/app/data/winrate_history.csv"))
 
@@ -249,6 +256,18 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
             "inline": False,
         })
 
+    # Clickable dashboard link as the last field. The /dashboard route
+    # mirrors most of this report (overall + per-series tables + last
+    # 10 trades) and adds an SVG cumulative-P&L chart that doesn't fit
+    # in a Discord embed.
+    fields.append({
+        "name": "📊 View Dashboard",
+        "value": (
+            "[Open live dashboard]"
+            f"({DASHBOARD_URL})"
+        ),
+        "inline": False,
+    })
     return {
         "title": "📊 KALSHI WIN-RATE — daily report",
         "color": color,
@@ -406,6 +425,9 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
          "inline": False},
         {"name": "📈 Cumulative PnL (last 5)",
          "value": f"`{path_str}`",
+         "inline": False},
+        {"name": "📊 View Dashboard",
+         "value": f"[Open live dashboard]({DASHBOARD_URL})",
          "inline": False},
     ]
 
