@@ -175,6 +175,17 @@ PRICE_HISTORY_PATH = Path(os.getenv("KALSHI_EDGE_PRICE_HISTORY", "/app/data/edge
 # many cents since we last saw it, someone with information we don't have
 # has been trading — skip the cycle for this ticker and let it stabilize.
 MAX_LINE_MOVE_CENTS = int(os.getenv("KALSHI_MAX_LINE_MOVE_CENTS", "5"))
+# T-2h seen-cache eviction for KXMLBTOTAL. Once Claude SKIPs a market,
+# its ticker is permanently in seen until a redeploy clears state. For
+# KXMLBTOTAL specifically that's a known throughput problem (life-of-
+# log 2026-06-15: 4 trades vs 622 unique tickers evaluated = 0.6%
+# conversion), because Kalshi lists the contracts 24+h before close
+# and conditions change between morning-evaluation and game-time:
+# starting lineups confirm, weather updates, late scratches. Re-
+# evaluating in the final 2h gives Claude a second look with the
+# market state that actually decides the bet. Other series stay
+# sticky in seen (no evidence the same pattern helps them).
+SEEN_EVICT_T_MINUS_SECS = int(os.getenv("KALSHI_SEEN_EVICT_T_MINUS_SECS", "7200"))
 # Per-series tighter line-move thresholds. KXMLBTOTAL gets 3¢ (vs the
 # global 5¢) because total-runs markets reprice sharply on lineup
 # confirmations / weather updates that we can't see, and the few-cent
@@ -556,6 +567,26 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         ticker = m.get("ticker") or ""
         if not ticker:
             continue
+        # T-2h eviction: KXMLBTOTAL markets within SEEN_EVICT_T_MINUS_SECS
+        # of close get pulled OUT of the seen-cache so Claude re-evaluates
+        # them with whatever lineup / weather updates have landed since
+        # the prior cycle's SKIP. Other series fall through unchanged.
+        if ticker in seen and ticker.startswith("KXMLBTOTAL"):
+            game_time = (
+                m.get("expected_expiration_time")
+                or m.get("occurrence_datetime")
+                or m.get("close_time", "")
+            )
+            close_dt = _parse_iso(game_time)
+            if close_dt is not None:
+                secs_to_close = (close_dt - now).total_seconds()
+                if 0 < secs_to_close < SEEN_EVICT_T_MINUS_SECS:
+                    seen.discard(ticker)
+                    print(
+                        f"[SEEN-EVICT] {ticker} reason=\"T-2h KXMLBTOTAL\" "
+                        f"secs_to_close={int(secs_to_close)}",
+                        flush=True,
+                    )
         if ticker in seen:
             drops["seen"] += 1
             continue
