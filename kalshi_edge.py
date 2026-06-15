@@ -145,8 +145,16 @@ GRASS_SPECIALISTS_PATH = Path(os.getenv(
     "KALSHI_GRASS_SPECIALISTS_JSON", "resources/grass_specialists.json"
 ))
 GRASS_TOURNAMENTS = (
-    "wimbledon", "halle", "boss open", "queen's club", "queens club",
-    "queen's", "eastbourne", "s-hertogenbosch", "hertogenbosch",
+    "wimbledon",
+    # Halle: official name is "Terra Wortmann Open"; older title is "Gerry
+    # Weber Open". Adding both because Kalshi titles may use either.
+    "halle", "terra wortmann", "gerry weber",
+    # Queens: "Cinch Championships" and historically "HSBC Championships";
+    # Kalshi commonly says "Queen's" or "Queens".
+    "boss open", "queen's club", "queens club", "queen's",
+    "cinch championships", "hsbc championships",
+    # s-Hertogenbosch: official "Libéma Open".
+    "eastbourne", "s-hertogenbosch", "hertogenbosch", "libema", "libéma",
     "stuttgart open", "mallorca", "newport",
 )
 
