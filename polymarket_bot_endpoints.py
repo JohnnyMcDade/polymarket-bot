@@ -582,16 +582,20 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 
     # Window controls — single bar with current scope + toggle link.
     is_windowed = bool(since and since.lower() != "all")
-    if is_windowed:
-        window_label = f"trades since {since}"
-        toggle_href = "/dashboard?since=all"
-        toggle_label = "Show all time →"
-    else:
-        window_label = "all time"
-        toggle_href = f"/dashboard?since={_DASH_DEFAULT_SINCE}"
-        toggle_label = f"Show since {_DASH_DEFAULT_SINCE} →"
     in_window_n = len(trades)
     total_n = len(all_trades)
+    hidden_n = total_n - in_window_n
+    if is_windowed:
+        window_label = f"Since {since} (post-fix baseline)"
+        toggle_href = "/dashboard?since=all"
+        toggle_label = (
+            f"click to show all {total_n} trades including "
+            f"{hidden_n} pre-fix losses →"
+        )
+    else:
+        window_label = "All time"
+        toggle_href = f"/dashboard?since={_DASH_DEFAULT_SINCE}"
+        toggle_label = f"click to show post-fix baseline (since {_DASH_DEFAULT_SINCE}) →"
     window_bar = (
         f'<p class="window-bar">'
         f'Window: <strong>{window_label}</strong> '

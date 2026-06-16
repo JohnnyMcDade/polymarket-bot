@@ -206,6 +206,16 @@ MAX_LINE_MOVE_CENTS = int(os.getenv("KALSHI_MAX_LINE_MOVE_CENTS", "5"))
 # market state that actually decides the bet. Other series stay
 # sticky in seen (no evidence the same pattern helps them).
 SEEN_EVICT_T_MINUS_SECS = int(os.getenv("KALSHI_SEEN_EVICT_T_MINUS_SECS", "7200"))
+# T-30min-to-start eviction for KXMLBTOTAL. The close-time trigger above
+# fires at game_end - 2h, which for ~3h games is ~game_start + 1h —
+# i.e. AFTER first pitch on West Coast night games (e.g. BAL@SEA
+# 2026-06-15: bot saw strikes at 20:14 UTC, game start 01:40 UTC, but
+# close-trigger eviction wouldn't fire until ~02:30 UTC, 50 min past
+# first pitch). Adding a start-time trigger gives one re-evaluation
+# window with confirmed lineups while the pre-game model is still valid.
+SEEN_EVICT_T_MINUS_START_SECS = int(
+    os.getenv("KALSHI_SEEN_EVICT_T_MINUS_START_SECS", "1800")
+)
 # Seen-cache TTL. Entries older than this many seconds are filtered
 # out at load AND re-filtered at the start of every cycle, so a market
 # Claude SKIPped yesterday gets a fresh look today. Default 24h. The
@@ -630,26 +640,39 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
         ticker = m.get("ticker") or ""
         if not ticker:
             continue
-        # T-2h eviction: KXMLBTOTAL markets within SEEN_EVICT_T_MINUS_SECS
-        # of close get pulled OUT of the seen-cache so Claude re-evaluates
-        # them with whatever lineup / weather updates have landed since
-        # the prior cycle's SKIP. Other series fall through unchanged.
+        # KXMLBTOTAL re-eval eviction. Two triggers, either can fire:
+        #   1. T-2h-to-close (SEEN_EVICT_T_MINUS_SECS) — works for
+        #      day/afternoon games where close-2h is still pre-pitch.
+        #   2. T-30min-to-start (SEEN_EVICT_T_MINUS_START_SECS) — covers
+        #      West Coast night games where T-2h-to-close lands after
+        #      first pitch (see comment at SEEN_EVICT_T_MINUS_START_SECS).
+        # Other series fall through unchanged.
         if ticker in seen and ticker.startswith("KXMLBTOTAL"):
-            game_time = (
+            close_dt = _parse_iso(
                 m.get("expected_expiration_time")
                 or m.get("occurrence_datetime")
                 or m.get("close_time", "")
             )
-            close_dt = _parse_iso(game_time)
+            start_dt = _parse_iso(m.get("occurrence_datetime", ""))
+            evict_reason = None
+            evict_secs = None
             if close_dt is not None:
                 secs_to_close = (close_dt - now).total_seconds()
                 if 0 < secs_to_close < SEEN_EVICT_T_MINUS_SECS:
-                    seen.pop(ticker, None)
-                    print(
-                        f"[SEEN-EVICT] {ticker} reason=\"T-2h KXMLBTOTAL\" "
-                        f"secs_to_close={int(secs_to_close)}",
-                        flush=True,
-                    )
+                    evict_reason = "T-2h-close KXMLBTOTAL"
+                    evict_secs = int(secs_to_close)
+            if evict_reason is None and start_dt is not None:
+                secs_to_start = (start_dt - now).total_seconds()
+                if 0 < secs_to_start < SEEN_EVICT_T_MINUS_START_SECS:
+                    evict_reason = "T-30min-start KXMLBTOTAL"
+                    evict_secs = int(secs_to_start)
+            if evict_reason is not None:
+                seen.pop(ticker, None)
+                print(
+                    f"[SEEN-EVICT] {ticker} reason=\"{evict_reason}\" "
+                    f"secs={evict_secs}",
+                    flush=True,
+                )
         if ticker in seen:
             drops["seen"] += 1
             continue
