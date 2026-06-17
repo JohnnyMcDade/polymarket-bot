@@ -825,6 +825,44 @@ def _sweep_at_line(
     return wins, losses, skipped
 
 
+def _sweep_at_line_by_direction(
+    rows: list[dict[str, Any]],
+    line_T: float,
+    delta: float,
+    pred_key: str,
+    actual_key: str,
+) -> dict[str, Any]:
+    """Same gate as _sweep_at_line, split by bet direction. OVER bets are
+    fired when p >= T+δ; UNDER bets when p <= T-δ. On KXMLBTOTAL, OVER on
+    line N-0.5 ≡ BUY YES on the -N ticker, and UNDER ≡ BUY NO. The
+    production code only enables BUY YES; this split answers 'would
+    enabling BUY NO help' without rerunning the predictor."""
+    over_w = over_l = under_w = under_l = skipped = 0
+    for r in rows:
+        p = r[pred_key]
+        a = r[actual_key]
+        if a == line_T:
+            continue
+        actual_over = a > line_T
+        if p >= line_T + delta:
+            if actual_over:
+                over_w += 1
+            else:
+                over_l += 1
+        elif p <= line_T - delta:
+            if not actual_over:
+                under_w += 1
+            else:
+                under_l += 1
+        else:
+            skipped += 1
+    return {
+        "over": (over_w, over_l),
+        "under": (under_w, under_l),
+        "skipped": skipped,
+    }
+
+
 def _report_totals_like(
     rows: list[dict[str, Any]],
     skipped: dict[str, int],
@@ -925,6 +963,99 @@ def _report_totals_like(
                 f"  line={T:<5.1f} δ={d:<4.2f} n={n:>4} win_rate={wr:>5.1%} "
                 f"baseline={base:>5.1%} lift={lift:+5.1%} wilson_lo={wlo:>5.1%}"
             )
+
+    # ── BET-DIRECTION SPLIT (OVER ≡ BUY YES, UNDER ≡ BUY NO) ──────────
+    # Production today only places BUY YES bets (kalshi_edge.py:783).
+    # This split shows each direction's WR vs its own trivial baseline so
+    # we can decide whether enabling BUY NO has positive expected lift.
+    # A direction whose Wilson_lo > its baseline is the only one safe to
+    # turn on in production at that line × δ cell.
+    print("\n--- BET-DIRECTION SPLIT (OVER ≡ BUY YES, UNDER ≡ BUY NO) ---")
+    print("  Compares the predictor's OVER and UNDER decisions separately to")
+    print("  the always-one-side trivial baseline at that line. ★ on a")
+    print("  direction = Wilson_lo > baseline AND lift ≥ +2% (safe to enable).")
+    over_total_w = over_total_l = under_total_w = under_total_l = 0
+    over_stars = under_stars = 0
+    for T in lines:
+        base_over, base_under = baselines.get(T, (0.5, 0.5))
+        for d in EDGE_DELTAS:
+            split = _sweep_at_line_by_direction(
+                rows, T, d, pred_key, actual_key
+            )
+            ow, ol = split["over"]
+            uw, ul = split["under"]
+            over_n = ow + ol
+            under_n = uw + ul
+            if over_n < 15 and under_n < 15:
+                continue
+            if over_n >= 15:
+                over_wr = ow / over_n
+                over_wlo = _wilson_lower(ow, over_n)
+                over_lift = over_wr - base_over
+                over_safe = over_wlo > base_over and over_lift >= 0.02
+                over_marker = " ★" if over_safe else "  "
+                over_total_w += ow
+                over_total_l += ol
+                if over_safe:
+                    over_stars += 1
+                over_cell = (
+                    f"OVER n={over_n:>4} wr={over_wr:>5.1%} "
+                    f"base={base_over:>5.1%} lift={over_lift:+5.1%} "
+                    f"wlo={over_wlo:>5.1%}{over_marker}"
+                )
+            else:
+                over_cell = f"OVER n={over_n:>4} (insufficient)            "
+            if under_n >= 15:
+                under_wr = uw / under_n
+                under_wlo = _wilson_lower(uw, under_n)
+                under_lift = under_wr - base_under
+                under_safe = under_wlo > base_under and under_lift >= 0.02
+                under_marker = " ★" if under_safe else "  "
+                under_total_w += uw
+                under_total_l += ul
+                if under_safe:
+                    under_stars += 1
+                under_cell = (
+                    f"UNDER n={under_n:>4} wr={under_wr:>5.1%} "
+                    f"base={base_under:>5.1%} lift={under_lift:+5.1%} "
+                    f"wlo={under_wlo:>5.1%}{under_marker}"
+                )
+            else:
+                under_cell = f"UNDER n={under_n:>4} (insufficient)         "
+            print(f"  T={T:<5.1f} δ={d:<4.2f}  {over_cell}  |  {under_cell}")
+
+    # Aggregate verdict — collapse every line × δ cell into a single
+    # roll-up per direction so the headline answer to 'should we enable
+    # BUY NO' is one block, not a table the reader has to scan.
+    print("\n--- DIRECTION ROLL-UP (all line × δ cells with n>=15 pooled) ---")
+    over_n_tot = over_total_w + over_total_l
+    under_n_tot = under_total_w + under_total_l
+    if over_n_tot:
+        wr = over_total_w / over_n_tot
+        wlo = _wilson_lower(over_total_w, over_n_tot)
+        print(
+            f"  OVER  (≡ BUY YES, currently enabled):  n={over_n_tot:>5} "
+            f"wr={wr:>5.1%}  Wilson_lo={wlo:>5.1%}  "
+            f"stars={over_stars}/cells"
+        )
+    if under_n_tot:
+        wr = under_total_w / under_n_tot
+        wlo = _wilson_lower(under_total_w, under_n_tot)
+        print(
+            f"  UNDER (≡ BUY NO,  currently BLOCKED):  n={under_n_tot:>5} "
+            f"wr={wr:>5.1%}  Wilson_lo={wlo:>5.1%}  "
+            f"stars={under_stars}/cells"
+        )
+    print(
+        "  Interpretation: if UNDER stars >= OVER stars AND UNDER pooled WR"
+    )
+    print(
+        "  >= OVER pooled WR, enabling BUY NO is supported by the same"
+    )
+    print(
+        "  evidence that supports BUY YES today. If UNDER stars = 0, do not"
+    )
+    print("  enable — the predictor adds no signal on the NO side here.")
 
     print(
         f"\n--- {cohort_label} cohort at line={default_line}, δ={default_delta} ---"
