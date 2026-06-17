@@ -318,6 +318,39 @@ def _dash_compute_per_series(trades: list[dict]) -> list[dict]:
     return rows
 
 
+def _dash_compute_per_confidence(trades: list[dict]) -> list[dict]:
+    """Aggregate by Claude's emitted CONFIDENCE tier (HIGH/MEDIUM/etc).
+    Mirror of _dash_compute_per_series so the dashboard can surface the
+    'HIGH inversion' calibration check — if HIGH-conf bets are losing
+    money while MEDIUM is winning, the model's self-confidence is
+    inverted and the auto-go-live criteria need investigation."""
+    settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    by: dict[str, list[dict]] = defaultdict(list)
+    for t in settled:
+        by[(t.get("confidence") or "UNKNOWN").upper()].append(t)
+    rows: list[dict] = []
+    for conf, group in by.items():
+        n = len(group)
+        wins = sum(1 for t in group if t["outcome"] == "won")
+        losses = n - wins
+        pnl = sum(float(t.get("pnl") or 0) for t in group)
+        preds = [float(t["our_prob"]) for t in group
+                 if isinstance(t.get("our_prob"), (int, float))]
+        mean_pred = sum(preds) / len(preds) if preds else None
+        wr = wins / n if n else 0.0
+        cal_err = (mean_pred - wr) * 100 if mean_pred is not None else None
+        rows.append({
+            "confidence": conf, "n": n, "w": wins, "l": losses,
+            "wr": wr, "pnl": pnl, "cal_err": cal_err,
+        })
+    # Fixed display order — HIGH first, then MEDIUM, then anything else
+    # (LOW would be a Claude SKIP that somehow placed; UNKNOWN is a data
+    # bug). Stable order makes the row scan repeatable across reloads.
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    rows.sort(key=lambda r: (order.get(r["confidence"], 9), r["confidence"]))
+    return rows
+
+
 def _dash_overall(trades: list[dict]) -> dict:
     settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
     n = len(settled)
@@ -588,6 +621,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         trades = all_trades
     overall = _dash_overall(trades)
     series_rows = _dash_compute_per_series(trades)
+    confidence_rows = _dash_compute_per_confidence(trades)
     recent = _dash_recent_table(trades, limit=10)
     gl = _dash_go_live(_dash_load_go_live())
     svg = _dash_render_cumulative_svg(trades)
@@ -774,6 +808,42 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f"</tr>"
         )
 
+    # Confidence-breakdown rows. The "HIGH inversion" check: if HIGH WR
+    # < MEDIUM WR despite HIGH being the model's own self-confident bets,
+    # something is miscalibrated — either the prompt rewards over-claiming
+    # HIGH, or the edge gate is letting bad HIGH bets through. Flagging
+    # visually with red on HIGH when MEDIUM beats it (both n >= 5).
+    medium_row = next((r for r in confidence_rows if r["confidence"] == "MEDIUM"), None)
+    high_inverted = (
+        medium_row is not None
+        and medium_row["n"] >= 5
+        and any(
+            r["confidence"] == "HIGH" and r["n"] >= 5 and r["wr"] < medium_row["wr"]
+            for r in confidence_rows
+        )
+    )
+    confidence_table_rows = []
+    for r in confidence_rows:
+        p_str, p_cls = _dash_fmt_pnl(r["pnl"])
+        cal_str = (f"{r['cal_err']:+.1f}pp"
+                   if r["cal_err"] is not None else "—")
+        row_class = ""
+        if (
+            r["confidence"] == "HIGH" and high_inverted
+            and r["n"] >= 5 and medium_row and r["wr"] < medium_row["wr"]
+        ):
+            row_class = " class='conf-inverted'"
+        confidence_table_rows.append(
+            f"<tr{row_class}>"
+            f"<td>{r['confidence']}</td>"
+            f"<td>{r['n']}</td>"
+            f"<td>{r['w']}/{r['l']}</td>"
+            f"<td>{r['wr']*100:.1f}%</td>"
+            f"<td class='{p_cls}'>{p_str}</td>"
+            f"<td>{cal_str}</td>"
+            f"</tr>"
+        )
+
     recent_table_rows = []
     for t in recent:
         ts = (t.get("timestamp") or "")[:16].replace("T", " ")
@@ -855,6 +925,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
   .side-unknown {{ background: #efefef; color: #888; }}
   .side-no-row {{ background: #fff4ea; }}
   .side-no-row td:first-child {{ color: #8a4416; font-weight: 600; }}
+  .conf-inverted {{ background: #fdecea; }}
+  .conf-inverted td:first-child {{ color: #b22222; font-weight: 700; }}
 </style>
 </head>
 <body>
@@ -914,6 +986,21 @@ the production cohort filter. If empty, expect KXMLBTOTAL to SKIP today.
 </thead>
 <tbody>
 {"".join(series_table_rows) or "<tr><td colspan='6' class='muted'>no settled trades yet</td></tr>"}
+</tbody>
+</table>
+
+<h2>By confidence</h2>
+<p class="muted" style="margin-top:0;">
+HIGH-conf bets should out-perform MEDIUM (the model picked them with
+less uncertainty). If HIGH win-rate sits below MEDIUM with n &gt;= 5 on
+both, the row is flagged red — that's a HIGH-inversion signal.
+</p>
+<table>
+<thead>
+<tr><th>Confidence</th><th>Trades</th><th>W/L</th><th>Win%</th><th>P&amp;L</th><th>Cal err</th></tr>
+</thead>
+<tbody>
+{"".join(confidence_table_rows) or "<tr><td colspan='6' class='muted'>no settled trades yet</td></tr>"}
 </tbody>
 </table>
 
