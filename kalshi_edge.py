@@ -637,10 +637,25 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
     now = datetime.now(timezone.utc)
     now_ts = now.timestamp()
     kept: list[dict[str, Any]] = []
+    # Price observations for the time-series log. We record EVERY ticker
+    # in this fetch with a real yes_ask, regardless of whether it
+    # survives the filter into `kept` — seen/dead markets still produce
+    # informative price points for the future Kalshi-price backtest
+    # (a SKIP at price X is itself a data point). One batched write at
+    # end-of-function. The kept-only restriction we had before only
+    # captured prices on cycles where seen-eviction freed something,
+    # which gave 0-coverage hours despite an active fetch.
+    price_samples: list[tuple[str, int]] = []
     for m in markets:
         ticker = m.get("ticker") or ""
         if not ticker:
             continue
+        # Record the price observation as early as possible, before any
+        # filter can skip the ticker. Reads yes_ask_dollars once here;
+        # the existing logic below re-reads it as part of its own flow.
+        _ya_obs = float(m.get("yes_ask_dollars", 0) or 0)
+        if _ya_obs > 0:
+            price_samples.append((ticker, int(round(_ya_obs * 100))))
         # KXMLBTOTAL re-eval eviction. Two triggers, either can fire:
         #   1. T-2h-to-close (SEEN_EVICT_T_MINUS_SECS) — works for
         #      day/afternoon games where close-2h is still pre-pitch.
@@ -769,14 +784,13 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
     combined_drops = dict(drops)
     for k, v in timing_drops.items():
         combined_drops[f"timing_{k}"] = v
-    # Persist every kept market's yes_ask snapshot to the price history
-    # log. Single batched write per cycle. Feeds a future Kalshi-price
-    # backtest — the dataset needed to test "would BUY_NO have earned
-    # at actual market prices" once 30 days of data accumulate.
-    if kept:
-        kalshi_stats.record_market_prices(
-            [(it["ticker"], it["yes_ask_cents"]) for it in kept]
-        )
+    # Persist every observed yes_ask snapshot to the price history log.
+    # `price_samples` was collected at the top of the loop before any
+    # filter check, so it includes seen/dead markets too — the richest
+    # possible dataset for the future Kalshi-price backtest. Single
+    # batched write per cycle, ~hundreds of samples typical.
+    if price_samples:
+        kalshi_stats.record_market_prices(price_samples)
     return kept, combined_drops
 
 
