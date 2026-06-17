@@ -500,6 +500,49 @@ def _dash_qualifying_games(stats: dict, max_rows: int = 5) -> list[dict]:
     return rows[:max_rows]
 
 
+RECALIB_STATE_PATH = Path(os.getenv(
+    "KALSHI_RECALIB_STATE", "/app/data/recalibration_demote.json"
+))
+
+
+def _dash_recalib_status() -> dict:
+    """Snapshot of the HIGH→MEDIUM recalibration cooldown state. Returns:
+      active (bool), demote_until_iso (str|None), reason (str),
+      hours_left (float|None).
+
+    Mirrors kalshi_edge._is_recalib_demoting's persistence model: the
+    state file lingers after the cooldown expires, so "active" means
+    demote_until_ts > now, not just "file exists." When inactive, the
+    file is either absent or carries an expired window."""
+    if not RECALIB_STATE_PATH.exists():
+        return {"active": False, "demote_until_iso": None,
+                "reason": "no demote state file — never triggered",
+                "hours_left": None}
+    try:
+        state = json.loads(RECALIB_STATE_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        return {"active": False, "demote_until_iso": None,
+                "reason": f"state unreadable: {e}", "hours_left": None}
+    demote_until = float(state.get("demote_until_ts") or 0)
+    now = datetime.now(timezone.utc).timestamp()
+    if demote_until <= now:
+        return {
+            "active": False,
+            "demote_until_iso": state.get("demote_until_iso"),
+            "reason": (
+                f"window expired — last trigger: "
+                f"{state.get('trigger_reason', 'unknown')}"
+            ),
+            "hours_left": None,
+        }
+    return {
+        "active": True,
+        "demote_until_iso": state.get("demote_until_iso"),
+        "reason": state.get("trigger_reason", "unknown"),
+        "hours_left": (demote_until - now) / 3600.0,
+    }
+
+
 def _dash_btc_status(stats: dict) -> dict:
     """Snapshot of the macro signals that gate KXBTC trading. Returns:
       fng_value (int|None), fng_class (str), momentum_pct (float|None),
@@ -631,6 +674,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     stats_cache = _dash_load_stats_cache()
     qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
     btc_status = _dash_btc_status(stats_cache)
+    recalib_status = _dash_recalib_status()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Window controls — single bar with current scope + toggle link.
@@ -729,6 +773,32 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'{icon} <strong>BTC:</strong> F&amp;G={bs["fng_value"]} '
             f'({bs["fng_class"]}) {mom_str} → filter <strong>{verdict}</strong> '
             f'{reason_tail}'
+            f'</div>'
+        )
+
+    # Recalibration cooldown badge. Active = current Discord-level
+    # warning; healthy = quiet confirmation. Renders as a one-line
+    # highlight matching the BTC status block above.
+    rs = recalib_status
+    if rs["active"]:
+        hours_left = rs.get("hours_left") or 0.0
+        until_iso = rs.get("demote_until_iso") or "?"
+        # Trim ISO to minute precision for readability — full microsecond
+        # precision is noise here.
+        until_short = until_iso[:16].replace("T", " ") + " UTC"
+        recalib_html = (
+            f'<div class="highlight highlight-muted">'
+            f'🟡 <strong>Recalibration cooldown: ACTIVE</strong> — '
+            f'demoting HIGH→MEDIUM until {until_short} '
+            f'({hours_left:.1f}h left). Trigger: {rs["reason"]}'
+            f'</div>'
+        )
+    else:
+        recalib_html = (
+            f'<div class="highlight highlight-green">'
+            f'🟢 <strong>Recalibration: healthy</strong> — '
+            f'no active HIGH→MEDIUM cooldown. '
+            f'<span class="muted">({rs["reason"]})</span>'
             f'</div>'
         )
 
@@ -935,6 +1005,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 {window_bar}
 {best_game_html}
 {btc_html}
+{recalib_html}
 
 <div class="summary">
   <div class="card">
