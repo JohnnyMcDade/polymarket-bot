@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -34,6 +35,11 @@ import requests
 
 WEBHOOK_KALSHI_WINRATE = os.getenv("WEBHOOK_KALSHI_WINRATE", "")
 WINRATE_HOUR = int(os.getenv("KALSHI_WINRATE_HOUR", "7"))
+# Weekly summary fires every Monday at WEEKLY_HOUR UTC. Reuses the same
+# webhook as the daily — it's the same audience and channel; the embed
+# title makes the cadence obvious.
+WEEKLY_HOUR = int(os.getenv("KALSHI_WEEKLY_HOUR", "8"))
+WEEKLY_DOW = int(os.getenv("KALSHI_WEEKLY_DOW", "0"))  # 0 = Monday
 # Public dashboard URL surfaced in the daily Discord embed so anyone
 # subscribed to the channel can one-click into the live HTML view.
 # Override via env if the Railway public domain ever changes.
@@ -791,6 +797,190 @@ def _seconds_until_next_hour(target_hour: int) -> float:
     return (target - now).total_seconds()
 
 
+def _seconds_until_next_weekly(target_dow: int, target_hour: int) -> float:
+    """Seconds until the next occurrence of weekday `target_dow` at
+    `target_hour` UTC. weekday: 0 = Monday, 6 = Sunday. If today is
+    target_dow but we're past target_hour, schedules for next week."""
+    now = datetime.now(timezone.utc)
+    days_ahead = (target_dow - now.weekday()) % 7
+    target = now.replace(
+        hour=target_hour, minute=0, second=0, microsecond=0
+    ) + timedelta(days=days_ahead)
+    if target <= now:
+        target += timedelta(days=7)
+    return (target - now).total_seconds()
+
+
+# ─── Weekly summary (2026-06-17) ──────────────────────────────────────
+# Fires Mondays at 08:00 UTC on a separate daemon thread. Uses the same
+# _compute_stats path as the daily, just with trades pre-filtered to a
+# 7-day window. Posts to the same WEBHOOK_KALSHI_WINRATE channel — same
+# audience, different cadence, distinct title so the embed is obvious.
+
+def _filter_trades_to_last_week(
+    trades: list[dict[str, Any]], now: datetime | None = None
+) -> tuple[list[dict[str, Any]], datetime, datetime]:
+    """Return (trades_in_window, week_start, week_end). Window is the
+    7 days ending at `now`, by placement timestamp. We use placement
+    rather than settlement so "this week's bot activity" includes
+    trades placed Sunday that will only resolve Monday — those still
+    represent decisions made in the window."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    cutoff_iso = cutoff.isoformat()
+    in_window = [
+        t for t in trades
+        if (t.get("timestamp") or "") >= cutoff_iso
+    ]
+    return in_window, cutoff, now
+
+
+def _top_series_by_pnl(
+    by_series: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Pick the series with the highest PnL among decided trades. Returns
+    None when the breakdown is empty. PnL wins over WR because high WR
+    on a 1-trade series is noise; PnL is the dollar-weighted answer to
+    'which series carried this week.' Returns the series stats with a
+    `key` field added so the caller can render the name."""
+    if not by_series:
+        return None
+    name, stats = max(
+        by_series.items(),
+        key=lambda kv: (
+            float(kv[1].get("total_pnl", 0)),
+            int(kv[1].get("decided", 0)),
+        ),
+    )
+    return {**stats, "key": name}
+
+
+def _build_weekly_embed(
+    s: dict[str, Any],
+    week_start: datetime,
+    week_end: datetime,
+    gl: dict[str, Any],
+) -> dict[str, Any]:
+    color = 0x2ECC71 if s["total_pnl"] >= 0 else 0xE74C3C
+    week_label = (
+        f"{week_start.strftime('%b %d')} → {week_end.strftime('%b %d')}"
+    )
+
+    def _trade_line(t: dict[str, Any] | None) -> str:
+        if not t:
+            return "—"
+        title = (t.get("title") or t.get("ticker") or "?")[:60]
+        side = (t.get("side") or "").upper()
+        side_tag = f" [{side}]" if side in ("YES", "NO") else ""
+        return f"{title}{side_tag} → {_format_usd(float(t.get('pnl', 0)))}"
+
+    top_series = _top_series_by_pnl(s.get("by_series") or [])
+    if top_series:
+        ts_str = (
+            f"**{top_series['key']}** — {top_series['decided']} trades, "
+            f"{top_series['win_rate']:.0%} WR, "
+            f"{_format_usd(top_series['total_pnl'])}"
+        )
+    else:
+        ts_str = "—  (no decided trades this week)"
+
+    # Go-live progress: status badge + most-recent passes/total.
+    gl_passes = gl.get("passes", 0)
+    gl_total = gl.get("total", 4)
+    gl_streak = gl.get("consecutive_pass_count", 0)
+    if gl.get("is_live"):
+        gl_str = (
+            f"✅ **LIVE** since {gl.get('last_report_date', '?')} — "
+            f"latest day {gl_passes}/{gl_total} criteria"
+        )
+    else:
+        gl_str = (
+            f"📋 {gl_passes}/{gl_total} criteria passing · "
+            f"consecutive-pass streak: {gl_streak}"
+        )
+
+    fields = [
+        {"name": "📅 Window", "value": week_label, "inline": True},
+        {"name": "🏆 Win Rate",
+         "value": f"{s['win_rate']:.1%} ({s['wins']}W / {s['losses']}L)",
+         "inline": True},
+        {"name": "💰 PnL", "value": _format_usd(s["total_pnl"]), "inline": True},
+        {"name": "📊 Decided", "value": str(s["decided"]), "inline": True},
+        {"name": "⏳ Pending", "value": str(s["pending"]), "inline": True},
+        {"name": "📈 ROI", "value": f"{s['roi']*100:+.1f}%", "inline": True},
+        {"name": "🥇 Best Trade", "value": _trade_line(s.get("best")), "inline": False},
+        {"name": "🥶 Worst Trade", "value": _trade_line(s.get("worst")), "inline": False},
+        {"name": "🏅 Top Series (by PnL)", "value": ts_str, "inline": False},
+        {"name": "🎯 Go-Live Progress", "value": gl_str, "inline": False},
+        {"name": "📊 View Dashboard",
+         "value": f"[Open live dashboard]({DASHBOARD_URL})", "inline": False},
+    ]
+
+    if s["decided"] == 0:
+        fields.insert(1, {
+            "name": "Status",
+            "value": (
+                "No decided trades in the 7-day window — either a quiet "
+                "week or everything is still pending."
+            ),
+            "inline": False,
+        })
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return {
+        "title": f"📅 KALSHI WEEKLY SUMMARY — {week_label}",
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"PassivePoly Kalshi Weekly  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _do_weekly_report() -> None:
+    trades = _load_trades()
+    in_window, week_start, week_end = _filter_trades_to_last_week(trades)
+    stats = _compute_stats(in_window)
+    try:
+        gl_state = _load_go_live_state()
+    except Exception as e:
+        print(f"[WARN] weekly: go-live state load failed: {e}", flush=True)
+        gl_state = {}
+    history = gl_state.get("history") or []
+    latest = history[-1] if history else {}
+    gl_view = {
+        "is_live": bool(gl_state.get("is_live")),
+        "consecutive_pass_count": int(gl_state.get("consecutive_pass_count") or 0),
+        "passes": int(latest.get("passes") or 0),
+        "total": int(latest.get("total") or 4),
+        "last_report_date": gl_state.get("last_report_date") or "—",
+    }
+    print(
+        f"[weekly] window={week_start.date()}..{week_end.date()} "
+        f"in_window={len(in_window)} decided={stats['decided']} "
+        f"wr={stats['win_rate']:.1%} pnl={_format_usd(stats['total_pnl'])} "
+        f"gl={gl_view['passes']}/{gl_view['total']}",
+        flush=True,
+    )
+    send_discord(_build_weekly_embed(stats, week_start, week_end, gl_view))
+
+
+def _run_weekly_loop() -> None:
+    print(
+        f"[weekly] Kalshi weekly summary armed — fires "
+        f"weekday={WEEKLY_DOW} at {WEEKLY_HOUR:02d}:00 UTC",
+        flush=True,
+    )
+    while True:
+        wait_s = _seconds_until_next_weekly(WEEKLY_DOW, WEEKLY_HOUR)
+        print(f"[weekly] next report in {wait_s/3600:.1f}h", flush=True)
+        time.sleep(wait_s)
+        try:
+            _do_weekly_report()
+        except Exception as e:
+            print(f"[WARN] weekly cycle crashed: {e}", flush=True)
+            time.sleep(60)
+
+
 def _do_report() -> None:
     trades = _load_trades()
     stats = _compute_stats(trades)
@@ -863,7 +1053,17 @@ def _should_catch_up_now() -> bool:
 
 
 def run() -> None:
-    print(f"Kalshi Win-Rate Agent starting — fires daily at {WINRATE_HOUR:02d}:00 UTC")
+    print(
+        f"Kalshi Win-Rate Agent starting — daily at {WINRATE_HOUR:02d}:00 UTC, "
+        f"weekly summary Mondays at {WEEKLY_HOUR:02d}:00 UTC"
+    )
+    # Weekly summary runs in its own daemon thread so launcher.py needs
+    # no change. No catch-up on weekly — a missed Monday post is mildly
+    # annoying but not data-losing (unlike the daily, which feeds
+    # calibration and auto-go-live state).
+    threading.Thread(
+        target=_run_weekly_loop, name="kalshi-weekly", daemon=True
+    ).start()
     # Catch-up fire on startup. Without this, a deploy/restart anywhere in
     # the 07:01-23:59 UTC window puts the sleep loop on tomorrow's clock
     # and silently skips today's calibration report — exactly what happened
