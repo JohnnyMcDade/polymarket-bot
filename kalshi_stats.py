@@ -48,6 +48,95 @@ MACRO_ENABLED = os.getenv("KALSHI_STATS_MACRO_ENABLED", "true").lower() in ("1",
 # macro Haiku fetch so one doesn't clobber the other.
 _cache_lock = threading.Lock()
 
+# ─── Historical Kalshi price recorder (2026-06-17) ────────────────────
+# Time-series log of every yes_ask observation the edge agent makes,
+# keyed by ticker. Built so a future Kalshi-price backtest can answer
+# "what would BUY_NO have earned at the actual market prices we saw"
+# — the existing edge_price_history.json only stores the latest price
+# per ticker (for the line-movement guard), not a series.
+#
+# Format on disk: {ticker: [{ts: float epoch seconds, ask: int cents}, ...]}
+# Retention: 30 days per ticker; entries older than that are pruned on
+# every write. File-size cap: if the JSON exceeds PRICE_HISTORY_MAX_BYTES,
+# drop the oldest 25% of all entries across all tickers.
+PRICE_HISTORY_PATH = Path(os.getenv(
+    "KALSHI_PRICE_HISTORY", "/app/data/price_history.json"
+))
+PRICE_HISTORY_TTL_SECS = int(os.getenv(
+    "KALSHI_PRICE_HISTORY_TTL_SECS", str(30 * 86400)
+))
+PRICE_HISTORY_MAX_BYTES = int(os.getenv(
+    "KALSHI_PRICE_HISTORY_MAX_BYTES", str(10 * 1024 * 1024)
+))
+_price_history_lock = threading.Lock()
+
+
+def record_market_prices(samples: list[tuple[str, int]]) -> None:
+    """Append observed (ticker, yes_ask_cents) samples to the on-disk
+    price history. Idempotent on empty input. Safe to call from the edge
+    agent's per-cycle hot path — batched I/O, single file rewrite per
+    call regardless of how many samples come in.
+
+    Caller responsibility: pass a deduped list of (ticker, ask) tuples;
+    duplicates within one call will produce duplicate ts entries (cheap,
+    but noise — the edge agent's _filter_markets emits one entry per
+    kept ticker per cycle, so dupes don't arise in practice)."""
+    if not samples:
+        return
+    now = time.time()
+    cutoff = now - PRICE_HISTORY_TTL_SECS
+    with _price_history_lock:
+        try:
+            data = json.loads(PRICE_HISTORY_PATH.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        for ticker, ask in samples:
+            if not ticker or ask is None:
+                continue
+            data.setdefault(ticker, []).append({"ts": now, "ask": int(ask)})
+        # Per-ticker TTL prune across the WHOLE file, not just the
+        # tickers in this batch — otherwise stale tickers that never
+        # re-appear in samples would linger past their retention window.
+        for t in list(data.keys()):
+            data[t] = [
+                s for s in data[t]
+                if float(s.get("ts", 0)) >= cutoff
+            ]
+            if not data[t]:
+                del data[t]
+        text = json.dumps(data, separators=(",", ":"))
+        # Global size cap. Drop the oldest 25% of all entries per pass
+        # and re-check — one pass isn't always enough if the file is
+        # already 2x+ over cap. Safety break prevents an infinite loop
+        # in pathological edge cases.
+        passes = 0
+        while len(text.encode()) > PRICE_HISTORY_MAX_BYTES and passes < 10:
+            all_samples = []
+            for t, series in data.items():
+                for s in series:
+                    all_samples.append((float(s["ts"]), t, int(s.get("ask", 0))))
+            if len(all_samples) <= 1:
+                break
+            all_samples.sort(key=lambda x: x[0])
+            keep_n = max(1, len(all_samples) - len(all_samples) // 4)
+            kept = all_samples[-keep_n:]
+            data = {}
+            for ts, t, ask in kept:
+                data.setdefault(t, []).append({"ts": ts, "ask": ask})
+            text = json.dumps(data, separators=(",", ":"))
+            passes += 1
+            print(
+                f"[price-history] global prune pass {passes}: kept "
+                f"{keep_n} of {len(all_samples)} entries "
+                f"(file now {len(text.encode())}B / cap "
+                f"{PRICE_HISTORY_MAX_BYTES}B)",
+                flush=True,
+            )
+        PRICE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PRICE_HISTORY_PATH.write_text(text)
+
 # (Removed: the old Sonnet+web_search system prompt for sports data.
 # Sports stats now come from direct statsapi.mlb.com and ESPN endpoints
 # below — web_search was returning structurally-correct JSON with every

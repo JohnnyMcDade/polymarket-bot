@@ -35,6 +35,7 @@ from typing import Any
 import requests
 
 import kalshi_queue
+import kalshi_stats
 import whale_signals
 from kalshi_auth import KALSHI_BASE_URL, get_auth_headers
 
@@ -768,6 +769,14 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
     combined_drops = dict(drops)
     for k, v in timing_drops.items():
         combined_drops[f"timing_{k}"] = v
+    # Persist every kept market's yes_ask snapshot to the price history
+    # log. Single batched write per cycle. Feeds a future Kalshi-price
+    # backtest — the dataset needed to test "would BUY_NO have earned
+    # at actual market prices" once 30 days of data accumulate.
+    if kept:
+        kalshi_stats.record_market_prices(
+            [(it["ticker"], it["yes_ask_cents"]) for it in kept]
+        )
     return kept, combined_drops
 
 
