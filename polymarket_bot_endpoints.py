@@ -564,6 +564,73 @@ RECALIB_STATE_PATH = Path(os.getenv(
     "KALSHI_RECALIB_STATE", "/app/data/recalibration_demote.json"
 ))
 
+# Wimbledon countdown — surfaced in a dashboard highlight so the
+# operator sees the slam ramp-up coming. Override via env when the
+# 2027 draw publishes.
+WIMBLEDON_START_ISO = os.getenv("KALSHI_WIMBLEDON_START", "2026-06-30")
+SEEN_CACHE_PATH = Path(os.getenv(
+    "KALSHI_EDGE_SEEN_CACHE", "/app/data/edge_seen.json"
+))
+
+
+def _dash_tennis_market_count(window_secs: int = 7200) -> int:
+    """Count distinct KXATPMATCH + KXWTAMATCH tickers stamped in
+    edge_seen.json within the last `window_secs` seconds. The edge
+    agent stamps every fetched market into seen, so a recent stamp =
+    market still being fetched from Kalshi = market still open. 2h
+    window gives ~4 edge cycles of coverage without including stale
+    tickers from completed matches earlier in the day."""
+    if not SEEN_CACHE_PATH.exists():
+        return 0
+    try:
+        seen = json.loads(SEEN_CACHE_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return 0
+    if not isinstance(seen, dict):
+        return 0
+    now = datetime.now(timezone.utc).timestamp()
+    cutoff = now - window_secs
+    count = 0
+    for ticker, ts in seen.items():
+        if not isinstance(ts, (int, float)):
+            continue
+        if ts < cutoff:
+            continue
+        if ticker.startswith("KXATPMATCH") or ticker.startswith("KXWTAMATCH"):
+            count += 1
+    return count
+
+
+def _dash_wimbledon_countdown() -> dict:
+    """Days until Wimbledon start + currently-open ATP/WTA market count.
+    Negative days means Wimbledon is already in progress or past.
+    Color tier:
+      'green'  — < 7 days (final ramp-up; Wimbledon backtest cohort
+                 with the +6.5pp slam favorite lift is live very soon)
+      'yellow' — 7-30 days
+      'muted'  — > 30 days or already past"""
+    today = datetime.now(timezone.utc).date()
+    try:
+        start = datetime.fromisoformat(WIMBLEDON_START_ISO).date()
+    except ValueError:
+        return {"days": None, "tier": "muted", "tennis_open": 0,
+                "start_iso": WIMBLEDON_START_ISO}
+    delta = (start - today).days
+    if delta < 0:
+        tier = "muted"
+    elif delta < 7:
+        tier = "green"
+    elif delta <= 30:
+        tier = "yellow"
+    else:
+        tier = "muted"
+    return {
+        "days": delta,
+        "tier": tier,
+        "tennis_open": _dash_tennis_market_count(),
+        "start_iso": WIMBLEDON_START_ISO,
+    }
+
 
 def _dash_recalib_status() -> dict:
     """Snapshot of the HIGH→MEDIUM recalibration cooldown state. Returns:
@@ -736,6 +803,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
+    wimbledon = _dash_wimbledon_countdown()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Window controls — single bar with current scope + toggle link.
@@ -917,6 +985,36 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'🟢 <strong>Recalibration: healthy</strong> — '
             f'no active HIGH→MEDIUM cooldown. '
             f'<span class="muted">({rs["reason"]})</span>'
+            f'</div>'
+        )
+
+    # Wimbledon countdown — green when < 7 days out (final ramp-up where
+    # the slam favorite-lift backtest cohort kicks in). When < 0 the slam
+    # is in-progress or past and we just say so.
+    w = wimbledon
+    if w["days"] is None:
+        wimbledon_html = ""  # malformed env config — skip block
+    else:
+        days = w["days"]
+        if days < 0:
+            stage_msg = f"in progress or past ({-days}d ago start)"
+        elif days == 0:
+            stage_msg = "**starts today**"
+        elif days == 1:
+            stage_msg = "**starts tomorrow**"
+        else:
+            stage_msg = f"starts in <strong>{days} days</strong>"
+        tennis_n = w["tennis_open"]
+        cls = {
+            "green": "highlight-green",
+            "yellow": "highlight-muted",
+            "muted": "highlight-muted",
+        }[w["tier"]]
+        wimbledon_html = (
+            f'<div class="highlight {cls}">'
+            f'🎾 <strong>Wimbledon</strong> {stage_msg} '
+            f'(start: {w["start_iso"]}) · '
+            f'<strong>{tennis_n}</strong> ATP/WTA markets currently open'
             f'</div>'
         )
 
@@ -1136,6 +1234,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 {best_game_html}
 {btc_html}
 {recalib_html}
+{wimbledon_html}
 
 <div class="summary">
   <div class="card">
