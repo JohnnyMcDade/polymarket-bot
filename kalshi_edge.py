@@ -884,6 +884,12 @@ KXMLBTOTAL PARK / UMPIRE / WEATHER SIGNALS (NEW 2026-06-15)
     - Light rain or fog in cond → modest DOWN shade (0.2 runs) plus heightened postponement risk for very-near-close markets; if game_time is < 60min away and cond mentions rain, SKIP rather than guess at a delay.
 - These three signals are SUPPLEMENTARY — they tune the prediction but never override the rolling-ERA + bullpen + H2H foundation. A 2.50 rolling-ERA elite arm at Coors with strong tailwind is still your best UNDER bet at the 11.5 line, not the OVER, because the starter quality dominates the park effect over 6 innings.
 
+KXMLBTOTAL UNDER-LEAN ROUTING (NEW 2026-06-17)
+- This build is YES-only (see RECOMMENDATION RULES above — BUY_NO is disabled). When your projected total comes in BELOW the line family of available tickers, the previously observed failure mode was to claim a "value tail" BUY YES on a high-line ticker (e.g. projected 8.7 runs, ticker -11, claim our_prob=0.42 vs ask=0.28 → BUY YES). 180-day directional backtest shows the predictor adds NO positive lift on high-line OVER picks (line 10.5 and 11.5 OVER lift is at or below zero), so these cheap-tail YES bets lose at a measurable rate.
+- RULE 1 (per-ticker projected-vs-threshold floor): for any KXMLBTOTAL ticker `-N`, if your projected_total < (N - 0.5), set RECOMMENDATION: SKIP regardless of computed edge. The "value tail on a longshot" reasoning is the contradiction this rule blocks.
+- RULE 2 (UNDER-favoring overlay): if your reasoning concludes the matchup is UNDER-favoring — any of: elite-duel (both starters rolling_era_last3 < 3.00), both bullpens bullpen_era_15d ≤ 3.00, both starters with vs_opponent.avg_runs_last3_vs ≤ 3.0 across starts ≥ 2, or projected_total at or below the lowest available threshold in the family — do NOT BUY YES on any -11 or higher ticker. Either BUY YES on the LOWEST available line N where projected_total ≥ N + 0.5, or SKIP every ticker in the family.
+- Worked example: projected 8.7 runs, tickers -8, -9, -10, -11, -12 available. -8 passes (8.7 ≥ 8.5). -9, -10, -11, -12 all fail Rule 1 and Rule 2. → Evaluate BUY YES on -8 only (subject to the usual edge-tier gate); SKIP -9 through -12.
+
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
 - Always emit --- after every block including the last.
