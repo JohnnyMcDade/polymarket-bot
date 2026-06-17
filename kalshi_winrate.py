@@ -40,6 +40,13 @@ WINRATE_HOUR = int(os.getenv("KALSHI_WINRATE_HOUR", "7"))
 # title makes the cadence obvious.
 WEEKLY_HOUR = int(os.getenv("KALSHI_WEEKLY_HOUR", "8"))
 WEEKLY_DOW = int(os.getenv("KALSHI_WEEKLY_DOW", "0"))  # 0 = Monday
+# Nightly BUY_NO watchdog: fires at BUY_NO_WATCH_HOUR UTC to report
+# whether any side=no trade fired in the last 24h. Default 23:00 UTC =
+# right as US evening MLB games start (T-30min-start eviction has just
+# fired for tonight's elite-pitching matchups). Designed for the first
+# 30 days of the BUY_NO staged rollout (2026-06-17) — surfaces silent
+# non-firing as well as actual fires.
+BUY_NO_WATCH_HOUR = int(os.getenv("KALSHI_BUY_NO_WATCH_HOUR", "23"))
 # Public dashboard URL surfaced in the daily Discord embed so anyone
 # subscribed to the channel can one-click into the live HTML view.
 # Override via env if the Railway public domain ever changes.
@@ -981,6 +988,140 @@ def _run_weekly_loop() -> None:
             time.sleep(60)
 
 
+# ─── BUY_NO nightly watchdog (2026-06-17) ─────────────────────────────
+# Posts a daily status to Discord answering: "Did any BUY_NO fire in
+# the last 24h? If not, why might that be?" Designed for the first 30
+# days of the BUY_NO staged rollout — silent non-firing is the failure
+# mode we most want to catch (the prompt could be too restrictive, the
+# eligibility code could be force-dropping every attempt, or the cohort
+# could just be too narrow).
+
+def _build_buy_no_watch_embed(
+    trades_24h: list[dict[str, Any]],
+    no_trades_24h: list[dict[str, Any]],
+    pending_no: list[dict[str, Any]],
+    lifetime_no_count: int,
+) -> dict[str, Any]:
+    n_24h = len(trades_24h)
+    n_no_24h = len(no_trades_24h)
+    n_yes_24h = sum(1 for t in trades_24h if t.get("side") == "yes")
+    fired = n_no_24h > 0
+
+    if fired:
+        title = f"✅ KALSHI BUY_NO WATCH — {n_no_24h} fired in last 24h"
+        color = 0xE67E22  # orange to match Discord BUY_NO embeds
+    elif n_24h == 0:
+        title = "⚠️ KALSHI BUY_NO WATCH — no trades at all in last 24h"
+        color = 0x95A5A6  # muted grey
+    else:
+        title = "⚠️ KALSHI BUY_NO WATCH — no BUY_NO in last 24h"
+        color = 0xF1C40F  # yellow
+
+    fields = [
+        {"name": "📊 Last 24h", "value": f"{n_24h} trades total", "inline": True},
+        {"name": "🟢 YES bets", "value": str(n_yes_24h), "inline": True},
+        {"name": "🟠 NO bets", "value": str(n_no_24h), "inline": True},
+    ]
+
+    if no_trades_24h:
+        lines = []
+        for t in no_trades_24h[:5]:
+            ticker = t.get("ticker", "?")
+            tail = ticker.rsplit("-", 1)[-1] if "-" in ticker else "?"
+            our_p = t.get("our_prob")
+            paid = t.get("market_price_cents")
+            edge = t.get("edge")
+            outcome = t.get("outcome", "?")
+            our_str = f"{our_p:.2f}" if isinstance(our_p, (int, float)) else "?"
+            edge_str = f"{edge*100:+.0f}%" if isinstance(edge, (int, float)) else "?"
+            lines.append(
+                f"`-{tail}` paid={paid}¢ our={our_str} edge={edge_str} → {outcome}"
+            )
+        fields.append({
+            "name": "🟠 NO trades placed",
+            "value": "\n".join(lines),
+            "inline": False,
+        })
+    else:
+        # Diagnostic: explain *what might be missing* when nothing fired
+        diag = (
+            "Either Claude didn't find a qualifying setup tonight, or the "
+            "eligibility gate (KXMLBTOTAL `-9`/`-10` only, MEDIUM-only, "
+            "both starters ERA < 3.50, projected_total below the line) "
+            "blocked every attempt. Check Railway logs for "
+            "`[BUY-NO-INELIGIBLE]` to distinguish — silence on both = no "
+            "attempt; ineligible lines present = Claude tried + got dropped."
+        )
+        fields.append({"name": "🔍 Diagnostic", "value": diag, "inline": False})
+
+    if pending_no:
+        fields.append({
+            "name": "⏳ Pending NO trades",
+            "value": str(len(pending_no)),
+            "inline": True,
+        })
+
+    fields.append({
+        "name": "📚 Lifetime NO total",
+        "value": str(lifetime_no_count),
+        "inline": True,
+    })
+
+    fields.append({
+        "name": "📊 View Dashboard",
+        "value": f"[Open live dashboard]({DASHBOARD_URL})",
+        "inline": False,
+    })
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"PassivePoly BUY_NO Watch  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _do_buy_no_watch_report() -> None:
+    trades = _load_trades()
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=24)).isoformat()
+    trades_24h = [t for t in trades if (t.get("timestamp") or "") >= cutoff]
+    no_trades_24h = [t for t in trades_24h if t.get("side") == "no"]
+    pending_no = [
+        t for t in trades
+        if t.get("side") == "no" and t.get("outcome") == "pending"
+    ]
+    lifetime_no_count = sum(1 for t in trades if t.get("side") == "no")
+    print(
+        f"[buy_no_watch] 24h_total={len(trades_24h)} "
+        f"24h_no={len(no_trades_24h)} pending_no={len(pending_no)} "
+        f"lifetime_no={lifetime_no_count}",
+        flush=True,
+    )
+    send_discord(_build_buy_no_watch_embed(
+        trades_24h, no_trades_24h, pending_no, lifetime_no_count,
+    ))
+
+
+def _run_buy_no_watch_loop() -> None:
+    print(
+        f"[buy_no_watch] BUY_NO watchdog armed — fires daily at "
+        f"{BUY_NO_WATCH_HOUR:02d}:00 UTC",
+        flush=True,
+    )
+    while True:
+        wait_s = _seconds_until_next_hour(BUY_NO_WATCH_HOUR)
+        print(f"[buy_no_watch] next report in {wait_s/3600:.1f}h", flush=True)
+        time.sleep(wait_s)
+        try:
+            _do_buy_no_watch_report()
+        except Exception as e:
+            print(f"[WARN] buy_no_watch cycle crashed: {e}", flush=True)
+            time.sleep(60)
+
+
 def _do_report() -> None:
     trades = _load_trades()
     stats = _compute_stats(trades)
@@ -1055,7 +1196,8 @@ def _should_catch_up_now() -> bool:
 def run() -> None:
     print(
         f"Kalshi Win-Rate Agent starting — daily at {WINRATE_HOUR:02d}:00 UTC, "
-        f"weekly summary Mondays at {WEEKLY_HOUR:02d}:00 UTC"
+        f"weekly summary Mondays at {WEEKLY_HOUR:02d}:00 UTC, "
+        f"BUY_NO watchdog daily at {BUY_NO_WATCH_HOUR:02d}:00 UTC"
     )
     # Weekly summary runs in its own daemon thread so launcher.py needs
     # no change. No catch-up on weekly — a missed Monday post is mildly
@@ -1063,6 +1205,13 @@ def run() -> None:
     # calibration and auto-go-live state).
     threading.Thread(
         target=_run_weekly_loop, name="kalshi-weekly", daemon=True
+    ).start()
+    # BUY_NO nightly watchdog. Same daemon-thread pattern, posts to the
+    # same webhook with a distinct title. Designed for the first 30 days
+    # of the BUY_NO staged rollout (deployed 2026-06-17) — surfaces
+    # silent non-firing as well as actual fires.
+    threading.Thread(
+        target=_run_buy_no_watch_loop, name="kalshi-buy-no-watch", daemon=True
     ).start()
     # Catch-up fire on startup. Without this, a deploy/restart anywhere in
     # the 07:01-23:59 UTC window puts the sleep loop on tomorrow's clock
