@@ -811,7 +811,7 @@ RECOMMENDATION RULES
   The MEDIUM tier requires a larger edge because MEDIUM means you are admitting uncertainty — the extra margin compensates for that uncertainty. Required data:
     - for sports: the named team or player appears in SPORTS STATS
     - for economic: the current value of the macro variable is in ECONOMIC DATA and resolution is close enough that the variable is unlikely to swing materially
-- SKIP in every other case. BUY_NO is DISABLED in this build EXCEPT for a narrow KXMLBTOTAL cohort defined in the KXMLBTOTAL BUY_NO ELIGIBILITY section below — for every other ticker, emit BUY (= BUY_YES) or SKIP.
+- SKIP in every other case. BUY_NO is allowed only on the narrow KXMLBTOTAL -9/-10 cohort defined in the KXMLBTOTAL BUY_NO ELIGIBILITY section below — every other ticker is YES-only; emit BUY (= BUY_YES) or SKIP.
 - SKIP if the market's resolution depends on something not covered by either block (politics, weather, awards, esports, etc.).
 
 CONFIDENCE GUIDANCE
@@ -916,10 +916,10 @@ KXMLBTOTAL PARK / UMPIRE / WEATHER SIGNALS (NEW 2026-06-15)
 - These three signals are SUPPLEMENTARY — they tune the prediction but never override the rolling-ERA + bullpen + H2H foundation. A 2.50 rolling-ERA elite arm at Coors with strong tailwind is still your best UNDER bet at the 11.5 line, not the OVER, because the starter quality dominates the park effect over 6 innings.
 
 KXMLBTOTAL UNDER-LEAN ROUTING (NEW 2026-06-17)
-- This build is YES-only (see RECOMMENDATION RULES above — BUY_NO is disabled). When your projected total comes in BELOW the line family of available tickers, the previously observed failure mode was to claim a "value tail" BUY YES on a high-line ticker (e.g. projected 8.7 runs, ticker -11, claim our_prob=0.42 vs ask=0.28 → BUY YES). 180-day directional backtest shows the predictor adds NO positive lift on high-line OVER picks (line 10.5 and 11.5 OVER lift is at or below zero), so these cheap-tail YES bets lose at a measurable rate.
+- BUY_NO is allowed ONLY on -9/-10 tickers in the specific cohort below (see KXMLBTOTAL BUY_NO ELIGIBILITY). Every other KXMLBTOTAL ticker is YES-only. When your projected total comes in BELOW the line family of available tickers, the previously observed failure mode was to claim a "value tail" BUY YES on a high-line ticker (e.g. projected 8.7 runs, ticker -11, claim our_prob=0.42 vs ask=0.28 → BUY YES). 180-day directional backtest shows the predictor adds NO positive lift on high-line OVER picks (line 10.5 and 11.5 OVER lift is at or below zero), so these cheap-tail YES bets lose at a measurable rate.
 - RULE 1 (per-ticker projected-vs-threshold floor): for any KXMLBTOTAL ticker `-N`, if your projected_total < (N - 0.5), set RECOMMENDATION: SKIP regardless of computed edge. The "value tail on a longshot" reasoning is the contradiction this rule blocks.
 - RULE 2 (UNDER-favoring overlay): if your reasoning concludes the matchup is UNDER-favoring — any of: elite-duel (both starters rolling_era_last3 < 3.00), both bullpens bullpen_era_15d ≤ 3.00, both starters with vs_opponent.avg_runs_last3_vs ≤ 3.0 across starts ≥ 2, or projected_total at or below the lowest available threshold in the family — do NOT BUY YES on any -11 or higher ticker. Either BUY YES on the LOWEST available line N where projected_total ≥ N + 0.5, or SKIP every ticker in the family.
-- Worked example: projected 8.7 runs, tickers -8, -9, -10, -11, -12 available. -8 passes (8.7 ≥ 8.5). -9, -10, -11, -12 all fail Rule 1 and Rule 2. → Evaluate BUY YES on -8 only (subject to the usual edge-tier gate); SKIP -9 through -12.
+- Worked example: projected 8.7 runs, tickers -8, -9, -10, -11, -12 available, both starter ERAs < 3.50. -8 passes (8.7 ≥ 8.5). -9, -10, -11, -12 all fail Rule 1 and Rule 2 for BUY YES. → Evaluate BUY YES on -8 (subject to the usual edge-tier gate); evaluate BUY_NO on -9 and -10 (subject to the BUY_NO ELIGIBILITY gates and MEDIUM edge floor); SKIP -11 and -12.
 
 KXMLBTOTAL BUY_NO ELIGIBILITY (NEW 2026-06-17, narrow staged rollout)
 - BUY_NO is allowed ONLY on KXMLBTOTAL tickers ending in `-9` or `-10` (the T=8.5 and T=9.5 lines). On every other KXMLBTOTAL ticker — and on every other series — the build is YES-only; emit BUY or SKIP, never BUY_NO. Out-of-cohort BUY_NO recommendations are dropped post-Claude by the code.
