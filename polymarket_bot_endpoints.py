@@ -460,6 +460,66 @@ def _dash_load_stats_cache() -> dict:
         return {}
 
 
+def _dash_next_buy_no_candidate(stats: dict) -> dict | None:
+    """The nearest upcoming game that would satisfy the production
+    BUY_NO eligibility cohort: both starters' SEASON ERA < 3.50. Production
+    also requires a `-9` or `-10` ticker on Kalshi (we assume those always
+    list for KXMLBTOTAL — typical) plus the projection floor (Claude's
+    runtime call, can't know from stats). So this answers "which game
+    is the next plausible BUY_NO fire candidate" — not a guarantee, but
+    the right next-thing-to-watch row.
+
+    Returns the same shape as _dash_qualifying_games rows so the
+    template can reuse the formatting, plus extra fields:
+      a_era, h_era — both starters' season ERAs
+      buy_no_t_minus_30_iso — UTC ISO of game_start - 30min (the T-30min
+        eviction trigger time)
+    """
+    games = (stats.get("mlb", {}) or {}).get("upcoming_games", []) or []
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    candidates: list[dict] = []
+    for g in games:
+        gd = str(g.get("game_date", ""))
+        if gd < today_iso:
+            continue
+        aw = g.get("away_pitcher") or {}
+        hp = g.get("home_pitcher") or {}
+        ae = aw.get("era")  # season ERA, matches production BUY_NO rule
+        he = hp.get("era")
+        if not isinstance(ae, (int, float)) or not isinstance(he, (int, float)):
+            continue
+        if not (float(ae) < 3.50 and float(he) < 3.50):
+            continue
+        candidates.append({
+            "date": gd,
+            "matchup": f"{g.get('away','?')}@{g.get('home','?')}",
+            "away_pitcher": aw.get("player", ""),
+            "home_pitcher": hp.get("player", ""),
+            "a_era": float(ae),
+            "h_era": float(he),
+            "avg_era": (float(ae) + float(he)) / 2.0,
+            "park_factor": g.get("park_factor"),
+            "weather": g.get("weather") or {},
+            "start_time_utc": g.get("start_time_utc", "?"),
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: (r["date"], r["start_time_utc"]))
+    return candidates[0]
+
+
+def _dash_t_minus_30_iso(game_date: str, start_time_utc: str) -> str | None:
+    """Compute the T-30min-start eviction UTC ISO from game date + UTC
+    start time (HH:MM format from the stats cache). Returns None on
+    parse failure so the caller can render '—' instead of crashing."""
+    try:
+        h, m = start_time_utc.split(":")
+        start = datetime.fromisoformat(f"{game_date}T{int(h):02d}:{int(m):02d}:00+00:00")
+        return (start - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, AttributeError):
+        return None
+
+
 def _dash_qualifying_games(stats: dict, max_rows: int = 5) -> list[dict]:
     """Return today/tomorrow's MLB games that pass the KXMLBTOTAL
     cohort filter (avg starter rolling_era_last3 ≤ _DASH_COHORT_ERA_CAP).
@@ -673,6 +733,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     freq_svg = _dash_render_frequency_svg(all_trades, days=14)
     stats_cache = _dash_load_stats_cache()
     qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
+    next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -775,6 +836,63 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'{reason_tail}'
             f'</div>'
         )
+
+    # Next-expected-trade block. Two side-by-side cards (BUY YES + BUY
+    # NO) showing the nearest qualifying game with its T-30min-start
+    # eviction time — when the bot will re-evaluate after seen-cache
+    # eviction releases the ticker. Helps the operator know "is the
+    # quiet hour normal or stuck."
+    def _trade_card(label: str, color_class: str, row: dict | None,
+                    is_buy_no: bool) -> str:
+        if not row:
+            return (
+                f'<div class="trade-card {color_class}">'
+                f'<div class="trade-card-label">{label}</div>'
+                f'<div class="trade-card-empty">No qualifying game on the slate.</div>'
+                f'</div>'
+            )
+        evict_utc = _dash_t_minus_30_iso(row["date"], row["start_time_utc"])
+        evict_str = evict_utc or "—"
+        az_time = _dash_utc_to_az_str(row["start_time_utc"])
+        if is_buy_no:
+            era_line = (
+                f'{row["away_pitcher"][:18]} ({row.get("a_era", 0):.2f}) vs '
+                f'{row["home_pitcher"][:18]} ({row.get("h_era", 0):.2f})'
+            )
+        else:
+            era_line = (
+                f'{row["away_pitcher"][:18]} vs {row["home_pitcher"][:18]} '
+                f'— avg ERA {row["avg_era"]:.2f}'
+            )
+        return (
+            f'<div class="trade-card {color_class}">'
+            f'<div class="trade-card-label">{label}</div>'
+            f'<div class="trade-card-game">'
+            f'<strong>{row["matchup"]}</strong> · {row["date"]} · {az_time}'
+            f'</div>'
+            f'<div class="trade-card-pitchers">{era_line}</div>'
+            f'<div class="trade-card-evict">'
+            f'Earliest re-eval: <strong>{evict_str}</strong> '
+            f'<span class="muted">(T-30min-start eviction)</span>'
+            f'</div>'
+            f'</div>'
+        )
+
+    buy_yes_card = _trade_card(
+        "🟢 Next BUY YES candidate",
+        "trade-card-yes",
+        qualifying_games[0] if qualifying_games else None,
+        is_buy_no=False,
+    )
+    buy_no_card = _trade_card(
+        "🟠 Next BUY NO candidate",
+        "trade-card-no",
+        next_buy_no,
+        is_buy_no=True,
+    )
+    next_trade_html = (
+        f'<div class="trade-cards">{buy_yes_card}{buy_no_card}</div>'
+    )
 
     # Recalibration cooldown badge. Active = current Discord-level
     # warning; healthy = quiet confirmation. Renders as a one-line
@@ -997,6 +1115,18 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
   .side-no-row td:first-child {{ color: #8a4416; font-weight: 600; }}
   .conf-inverted {{ background: #fdecea; }}
   .conf-inverted td:first-child {{ color: #b22222; font-weight: 700; }}
+  .trade-cards {{ display: flex; gap: 1em; flex-wrap: wrap; margin: 0.5em 0 1.5em; }}
+  .trade-card {{ flex: 1 1 0; min-width: 280px; padding: 12px 16px;
+                 border-radius: 6px; border: 1px solid #e5e5e9;
+                 background: #f7f7f9; font-size: 0.92em; line-height: 1.5; }}
+  .trade-card-yes {{ background: #e6f6e6; border-color: #b6e0b6; }}
+  .trade-card-no {{ background: #fbe5d0; border-color: #f0c89c; }}
+  .trade-card-label {{ font-size: 0.85em; font-weight: 600;
+                       color: #555; margin-bottom: 4px; }}
+  .trade-card-game {{ font-size: 1.05em; margin-bottom: 4px; }}
+  .trade-card-pitchers {{ color: #444; font-size: 0.88em; margin-bottom: 4px; }}
+  .trade-card-evict {{ font-size: 0.88em; color: #333; }}
+  .trade-card-empty {{ color: #888; font-style: italic; }}
 </style>
 </head>
 <body>
@@ -1035,6 +1165,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 
 <h2>Trade frequency — last 14 days</h2>
 {freq_svg}
+
+<h2>Next expected trade</h2>
+{next_trade_html}
 
 <h2>Next qualifying KXMLBTOTAL games</h2>
 <p class="muted" style="margin-top:0;">
