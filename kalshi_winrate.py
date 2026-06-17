@@ -56,6 +56,11 @@ DASHBOARD_URL = os.getenv(
 )
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 CSV_HISTORY_PATH = Path(os.getenv("KALSHI_WINRATE_CSV", "/app/data/winrate_history.csv"))
+# Macro signals (F&G + BTC spot) surfaced in the daily 7AM embed so the
+# operator sees today's gating posture without opening the dashboard.
+# Path mirrors kalshi_stats.STATS_CACHE_PATH default — using the env
+# var (not a direct import) so the two modules stay loosely coupled.
+STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 
 # Auto-go-live: flip PAPER_TRADING=false via Railway API when all 4 calibration
 # criteria pass on N consecutive daily reports. Disabled by default — user must
@@ -100,6 +105,35 @@ def _load_trades() -> list[dict[str, Any]]:
     except Exception as e:
         print(f"[WARN] trades_log unreadable: {e}", flush=True)
         return []
+
+
+def _load_macro_snapshot() -> dict[str, Any]:
+    """Pull F&G + BTC spot + 24h momentum from the stats cache for the
+    daily embed. Returns a dict with formatted strings ready for Discord
+    field values, plus an `ok` flag — False when the cache is missing
+    or the macro block is empty (so the embed renders a graceful '—'
+    rather than blank fields)."""
+    if not STATS_CACHE_PATH.exists():
+        return {"ok": False, "reason": "no stats_cache.json"}
+    try:
+        with STATS_CACHE_PATH.open() as f:
+            stats = json.load(f)
+    except Exception as e:
+        return {"ok": False, "reason": f"stats_cache unreadable: {e}"}
+    econ = stats.get("economic") or {}
+    fng = econ.get("crypto_fear_greed_value")
+    fng_class = econ.get("crypto_fear_greed_classification") or ""
+    momentum = econ.get("btc_24h_momentum_pct")
+    btc_spot = econ.get("btc_spot_usd")
+    if fng is None and btc_spot is None:
+        return {"ok": False, "reason": "macro block empty"}
+    return {
+        "ok": True,
+        "fng": fng,
+        "fng_class": fng_class,
+        "momentum_pct": momentum,
+        "btc_spot": btc_spot,
+    }
 
 
 def _series_of(ticker: str) -> str:
@@ -266,6 +300,46 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
         fields.insert(0, {
             "name": "Status",
             "value": "No decided trades yet — report will populate as markets settle.",
+            "inline": False,
+        })
+
+    # Macro snapshot — F&G + BTC. Sits right above the dashboard link so
+    # it's the last thing scanned before the operator decides whether to
+    # open the dashboard. Same source as the dashboard's BTC highlight
+    # (stats_cache.json economic block) so the two never disagree.
+    macro = _load_macro_snapshot()
+    if macro.get("ok"):
+        fng = macro["fng"]
+        fng_class = macro["fng_class"]
+        mom = macro["momentum_pct"]
+        btc = macro["btc_spot"]
+        if isinstance(fng, (int, float)):
+            fng_int = int(fng)
+            if fng_int < 21:
+                fng_emoji = "🟢"  # extreme fear → contrarian bounce signal
+            elif fng_int > 80:
+                fng_emoji = "🔴"  # extreme greed → contrarian reversal signal
+            else:
+                fng_emoji = "🟡"  # calm zone → KXBTC filter blocks
+            fng_str = f"{fng_emoji} {fng_int} ({fng_class})" if fng_class else f"{fng_emoji} {fng_int}"
+        else:
+            fng_str = "—"
+        if isinstance(btc, (int, float)):
+            btc_str = f"${btc:,.0f}"
+        else:
+            btc_str = "—"
+        if isinstance(mom, (int, float)):
+            arrow = "📈" if mom >= 0 else "📉"
+            mom_str = f"{arrow} {mom:+.2f}% 24h"
+        else:
+            mom_str = "—"
+        fields.append({"name": "😨 Fear & Greed", "value": fng_str, "inline": True})
+        fields.append({"name": "₿ BTC spot", "value": btc_str, "inline": True})
+        fields.append({"name": "📊 BTC 24h", "value": mom_str, "inline": True})
+    else:
+        fields.append({
+            "name": "📊 Macro",
+            "value": f"—  ({macro.get('reason', 'unavailable')})",
             "inline": False,
         })
 
