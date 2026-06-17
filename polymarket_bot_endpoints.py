@@ -279,8 +279,8 @@ def _dash_compute_per_series(trades: list[dict]) -> list[dict]:
     by: dict[str, list[dict]] = defaultdict(list)
     for t in settled:
         by[_dash_series_of(t.get("ticker", ""))].append(t)
-    rows: list[dict] = []
-    for series, group in by.items():
+
+    def _aggregate(label: str, group: list[dict], side: str | None = None) -> dict:
         n = len(group)
         wins = sum(1 for t in group if t["outcome"] == "won")
         losses = n - wins
@@ -290,12 +290,31 @@ def _dash_compute_per_series(trades: list[dict]) -> list[dict]:
         mean_pred = sum(preds) / len(preds) if preds else None
         wr = wins / n if n else 0.0
         cal_err = (mean_pred - wr) * 100 if mean_pred is not None else None
-        rows.append({
-            "series": series, "n": n, "w": wins, "l": losses,
-            "wr": wr, "pnl": pnl, "cal_err": cal_err,
-        })
-    # Sort by trade count desc — bigger cohorts first
-    rows.sort(key=lambda r: -r["n"])
+        return {
+            "series": label, "n": n, "w": wins, "l": losses,
+            "wr": wr, "pnl": pnl, "cal_err": cal_err, "side": side,
+        }
+
+    rows: list[dict] = []
+    for series, group in by.items():
+        parent_n = len(group)
+        parent = _aggregate(series, group)
+        # KXMLBTOTAL BUY_NO staged rollout (2026-06-17) — surface NO bets
+        # as a separate row when any have settled, so the cohort's WR is
+        # visible without conflating it with the YES baseline. Sort key
+        # pins the sub-row to its parent so the table reads cleanly even
+        # when another series has more trades.
+        parent["_sort"] = (-parent_n, 0)
+        rows.append(parent)
+        if series == "KXMLBTOTAL":
+            no_group = [t for t in group if t.get("side") == "no"]
+            if no_group:
+                child = _aggregate("KXMLBTOTAL (NO)", no_group, side="no")
+                child["_sort"] = (-parent_n, 1)
+                rows.append(child)
+    rows.sort(key=lambda r: r["_sort"])
+    for r in rows:
+        r.pop("_sort", None)
     return rows
 
 
@@ -740,8 +759,12 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         p_str, p_cls = _dash_fmt_pnl(r["pnl"])
         cal_str = (f"{r['cal_err']:+.1f}pp"
                    if r["cal_err"] is not None else "—")
+        # Orange-tint the BUY_NO sub-row to match the Discord embed color
+        # and signal at a glance that it's a side-stratified cohort, not
+        # a different series.
+        row_class = " class='side-no-row'" if r.get("side") == "no" else ""
         series_table_rows.append(
-            f"<tr>"
+            f"<tr{row_class}>"
             f"<td>{r['series']}</td>"
             f"<td>{r['n']}</td>"
             f"<td>{r['w']}/{r['l']}</td>"
@@ -756,6 +779,13 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         ts = (t.get("timestamp") or "")[:16].replace("T", " ")
         series = _dash_series_of(t.get("ticker", ""))
         side = t.get("side", "?")
+        # Orange-tinted badge for NO bets, neutral badge for YES — matches
+        # the Discord embed color (#E67E22) so side-stratified rows read
+        # the same in both UIs.
+        side_class = "side-no" if side == "no" else (
+            "side-yes" if side == "yes" else "side-unknown"
+        )
+        side_html = f"<span class='side-badge {side_class}'>{side.upper()}</span>"
         edge = t.get("edge")
         edge_str = f"{float(edge)*100:+.1f}%" if isinstance(edge, (int, float)) else "—"
         outcome = t.get("outcome", "—")
@@ -767,7 +797,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f"<tr>"
             f"<td>{ts}</td>"
             f"<td>{series}{paper}</td>"
-            f"<td>{side}</td>"
+            f"<td>{side_html}</td>"
             f"<td>{edge_str}</td>"
             f"<td class='{oc_class}'>{outcome}</td>"
             f"<td class='{pn_cls}'>{pn_str}</td>"
@@ -818,6 +848,13 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
                        color: #1b4d1b; }}
   .highlight-muted {{ background: #fff8e0; border: 1px solid #f0d97a;
                        color: #6b5712; }}
+  .side-badge {{ display: inline-block; padding: 1px 7px; border-radius: 4px;
+                  font-size: 0.78em; font-weight: 600; letter-spacing: 0.03em; }}
+  .side-yes {{ background: #e6f6e6; color: #1b4d1b; }}
+  .side-no {{ background: #fbe5d0; color: #8a4416; }}
+  .side-unknown {{ background: #efefef; color: #888; }}
+  .side-no-row {{ background: #fff4ea; }}
+  .side-no-row td:first-child {{ color: #8a4416; font-weight: 600; }}
 </style>
 </head>
 <body>
