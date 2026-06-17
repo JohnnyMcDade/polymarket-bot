@@ -700,6 +700,13 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             continue
 
         yes_cents = int(round(ya * 100))
+        # NO ask is the price we pay for a BUY_NO. Fall back to the
+        # 1-yes_ask proxy when Kalshi doesn't return no_ask_dollars (rare;
+        # mirror field on the same response). The proxy ignores spread —
+        # acceptable for the narrow KXMLBTOTAL -9/-10 BUY_NO rollout where
+        # we only place at MEDIUM with a comfortable edge cushion.
+        na = float(m.get("no_ask_dollars", 0) or 0)
+        no_cents = int(round(na * 100)) if na > 0 else max(1, 100 - yes_cents)
 
         # Line-movement guard. Use the persisted price for this ticker;
         # if the YES price has shifted more than the per-series threshold
@@ -731,6 +738,7 @@ def _filter_markets(markets: list[dict[str, Any]], stats: dict[str, Any],
             "ticker": ticker,
             "title": title,
             "yes_ask_cents": yes_cents,
+            "no_ask_cents": no_cents,
             "hours_left": round(secs_to_close / 3600, 1),
             "close_time": m.get("close_time", ""),
             "open_time": m.get("open_time", ""),
@@ -780,7 +788,7 @@ RECOMMENDATION RULES
   The MEDIUM tier requires a larger edge because MEDIUM means you are admitting uncertainty — the extra margin compensates for that uncertainty. Required data:
     - for sports: the named team or player appears in SPORTS STATS
     - for economic: the current value of the macro variable is in ECONOMIC DATA and resolution is close enough that the variable is unlikely to swing materially
-- SKIP in every other case — including BUY_NO opportunities. We only act on positive-edge BUY_YES bets in this build.
+- SKIP in every other case. BUY_NO is DISABLED in this build EXCEPT for a narrow KXMLBTOTAL cohort defined in the KXMLBTOTAL BUY_NO ELIGIBILITY section below — for every other ticker, emit BUY (= BUY_YES) or SKIP.
 - SKIP if the market's resolution depends on something not covered by either block (politics, weather, awards, esports, etc.).
 
 CONFIDENCE GUIDANCE
@@ -795,7 +803,7 @@ TICKER: <ticker echoed from input>
 TRUE_PROBABILITY: <float 0.0-1.0>
 EDGE: <float -1.0-1.0>
 CONFIDENCE: <LOW|MEDIUM|HIGH>
-RECOMMENDATION: <BUY|SKIP>
+RECOMMENDATION: <BUY|BUY_NO|SKIP>   (BUY = BUY_YES; BUY_NO only on the narrow KXMLBTOTAL cohort below)
 REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
 
@@ -889,6 +897,14 @@ KXMLBTOTAL UNDER-LEAN ROUTING (NEW 2026-06-17)
 - RULE 1 (per-ticker projected-vs-threshold floor): for any KXMLBTOTAL ticker `-N`, if your projected_total < (N - 0.5), set RECOMMENDATION: SKIP regardless of computed edge. The "value tail on a longshot" reasoning is the contradiction this rule blocks.
 - RULE 2 (UNDER-favoring overlay): if your reasoning concludes the matchup is UNDER-favoring — any of: elite-duel (both starters rolling_era_last3 < 3.00), both bullpens bullpen_era_15d ≤ 3.00, both starters with vs_opponent.avg_runs_last3_vs ≤ 3.0 across starts ≥ 2, or projected_total at or below the lowest available threshold in the family — do NOT BUY YES on any -11 or higher ticker. Either BUY YES on the LOWEST available line N where projected_total ≥ N + 0.5, or SKIP every ticker in the family.
 - Worked example: projected 8.7 runs, tickers -8, -9, -10, -11, -12 available. -8 passes (8.7 ≥ 8.5). -9, -10, -11, -12 all fail Rule 1 and Rule 2. → Evaluate BUY YES on -8 only (subject to the usual edge-tier gate); SKIP -9 through -12.
+
+KXMLBTOTAL BUY_NO ELIGIBILITY (NEW 2026-06-17, narrow staged rollout)
+- BUY_NO is allowed ONLY on KXMLBTOTAL tickers ending in `-9` or `-10` (the T=8.5 and T=9.5 lines). On every other KXMLBTOTAL ticker — and on every other series — the build is YES-only; emit BUY or SKIP, never BUY_NO. Out-of-cohort BUY_NO recommendations are dropped post-Claude by the code.
+- CONFIDENCE must be MEDIUM for BUY_NO. Do NOT emit BUY_NO with CONFIDENCE: HIGH for the first 30 days of this rollout — emit BUY_NO with MEDIUM, or SKIP. HIGH BUY_NO is dropped post-Claude.
+- PROJECTION CONDITION — emit BUY_NO on `-9` ONLY when your projected_total < 8.5 runs; on `-10` ONLY when projected_total < 9.5 runs. This is the mirror of Rule 1 above: your projection must sit cleanly on the NO side of the line, not a "value tail" claim.
+- PITCHING CONDITION — both probable starters' season ERA must be > 3.50. Rationale: bad pitching → more runs → UNDER on a low line is the wrong read structurally. Only emit BUY_NO when the pitching is decent enough that "fewer runs than the line" is the modal outcome, not a longshot.
+- EDGE CONVENTION for BUY_NO — compute EDGE as (1 - TRUE_PROBABILITY) - no_market_implied, where no_market_implied = MARKET NO PRICE / 100. TRUE_PROBABILITY remains the YES probability (the same number you would emit for BUY_YES on this ticker). Must clear MEDIUM_MIN_EDGE.
+- Backtest grounding: 180d directional backtest on KXMLBTOTAL shows UNDER bets at T=8.5 have +9pp Wilson-stable lift over the always-UNDER trivial baseline, replicating across both 60d and 180d windows; T=9.5 is borderline positive (+3pp). T≥10.5 UNDER bets just rediscover the trivial baseline (no real predictive signal), which is why this cohort is narrow.
 
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
@@ -1450,6 +1466,7 @@ def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> s
     blocks = []
     for i, it in enumerate(items, 1):
         ya = it["yes_ask_cents"]
+        na = it.get("no_ask_cents", max(1, 100 - ya))
         entities = ", ".join(it.get("entities") or []) or "(none matched)"
         block = (
             f"=== MARKET {i} ===\n"
@@ -1457,6 +1474,7 @@ def _build_user_message(items: list[dict[str, Any]], stats: dict[str, Any]) -> s
             f"TITLE: {it['title']}\n"
             f"HOURS UNTIL RESOLUTION: {it['hours_left']}\n"
             f"MARKET YES PRICE: {ya}¢ (implies {ya/100:.2%} YES)\n"
+            f"MARKET NO PRICE: {na}¢ (implies {na/100:.2%} NO)\n"
             f"STATS ENTITIES MATCHED: {entities}"
         )
         facts = _mlb_facts_for_ticker(it["ticker"], stats)
@@ -1569,12 +1587,18 @@ def _build_embed(item: dict[str, Any], pred: dict[str, Any]) -> dict[str, Any]:
     market_url = f"https://kalshi.com/markets/{ticker}"
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     edge_pct = pred["edge"] * 100
+    is_buy_no = pred.get("recommendation") == "BUY_NO"
+    price_field = (
+        f"{item.get('no_ask_cents', '?')}¢ (NO)"
+        if is_buy_no
+        else f"{item.get('yes_ask_cents', '?')}¢"
+    )
     return {
         "title": f"🎯 KALSHI EDGE — {title[:80]}",
         "url": market_url,
-        "color": 0x2ECC71,
+        "color": 0xE67E22 if is_buy_no else 0x2ECC71,
         "fields": [
-            {"name": "Market Price", "value": f"{item.get('yes_ask_cents', '?')}¢", "inline": True},
+            {"name": "Market Price", "value": price_field, "inline": True},
             {"name": "True Probability", "value": f"{pred['true_probability']:.1%}", "inline": True},
             {"name": "Edge", "value": f"{edge_pct:+.1f}%", "inline": True},
             {"name": "Confidence", "value": pred["confidence"], "inline": True},
@@ -1981,22 +2005,52 @@ def run() -> None:
                                         f"[BTC-FILTER] {ticker} PASS {reason}",
                                         flush=True,
                                     )
+                            # BUY_NO eligibility — narrow KXMLBTOTAL -9/-10
+                            # cohort, MEDIUM-only. Out-of-cohort or wrong-tier
+                            # BUY_NO recommendations from Claude are forced to
+                            # SKIP here so the prompt rule is enforced in code,
+                            # not just trust.
+                            rec = pred["recommendation"]
+                            if rec == "BUY_NO":
+                                tail = (
+                                    ticker.rsplit("-", 1)[-1] if "-" in ticker else ""
+                                )
+                                eligible = (
+                                    ticker.startswith("KXMLBTOTAL")
+                                    and tail in ("9", "10")
+                                    and pred["confidence"] == "MEDIUM"
+                                )
+                                if not eligible:
+                                    post_drops["buy_no_ineligible"] = (
+                                        post_drops.get("buy_no_ineligible", 0) + 1
+                                    )
+                                    print(
+                                        f"[BUY-NO-INELIGIBLE] {ticker} "
+                                        f"conf={pred['confidence']} tail={tail}",
+                                        flush=True,
+                                    )
+                                    pred["recommendation"] = "SKIP"
+                                    rec = "SKIP"
+
+                            is_buy_yes = rec == "BUY"
+                            is_buy_no = rec == "BUY_NO"
                             high_ok = (
                                 pred["confidence"] == "HIGH"
                                 and pred["edge"] >= MIN_EDGE
+                                and not is_buy_no
                             )
                             medium_ok = (
                                 pred["confidence"] == "MEDIUM"
                                 and pred["edge"] >= MEDIUM_MIN_EDGE
                             )
-                            if pred["recommendation"] != "BUY" or not (
+                            if not (is_buy_yes or is_buy_no) or not (
                                 high_ok or medium_ok
                             ):
                                 skipped += 1
                                 # Distinguish "Claude voted SKIP" from "Claude
-                                # voted BUY but tier-edge floor wasn't cleared"
-                                # — different signals, different fixes.
-                                if pred["recommendation"] != "BUY":
+                                # voted BUY/BUY_NO but tier-edge floor wasn't
+                                # cleared" — different signals, different fixes.
+                                if not (is_buy_yes or is_buy_no):
                                     post_drops["claude_skip"] = (
                                         post_drops.get("claude_skip", 0) + 1
                                     )
@@ -2006,24 +2060,42 @@ def run() -> None:
                                     )
                                 continue
                             approved += 1
-                            payload = {
-                                "ticker": ticker,
-                                "title": it["title"],
-                                "yes_ask": it["yes_ask_cents"],
-                                "hours_left": it["hours_left"],
-                                "close_time": it["close_time"],
-                                "true_probability": pred["true_probability"],
-                                "edge": pred["edge"],
-                                "confidence": pred["confidence"],
-                                "recommendation": "BUY_YES",  # rename for trader's side mapping
-                                "reasoning": pred["reasoning"],
-                                "side": "yes",
-                                "price_for_order_cents": it["yes_ask_cents"],
-                                # Forwarded so the trader can detect
-                                # correlated bets (same team / same event)
-                                # against today's existing trades.
-                                "entities": it.get("entities") or [],
-                            }
+                            if is_buy_no:
+                                payload = {
+                                    "ticker": ticker,
+                                    "title": it["title"],
+                                    "yes_ask": it["yes_ask_cents"],
+                                    "no_ask": it["no_ask_cents"],
+                                    "hours_left": it["hours_left"],
+                                    "close_time": it["close_time"],
+                                    "true_probability": pred["true_probability"],
+                                    "edge": pred["edge"],
+                                    "confidence": pred["confidence"],
+                                    "recommendation": "BUY_NO",
+                                    "reasoning": pred["reasoning"],
+                                    "side": "no",
+                                    "price_for_order_cents": it["no_ask_cents"],
+                                    "entities": it.get("entities") or [],
+                                }
+                            else:
+                                payload = {
+                                    "ticker": ticker,
+                                    "title": it["title"],
+                                    "yes_ask": it["yes_ask_cents"],
+                                    "hours_left": it["hours_left"],
+                                    "close_time": it["close_time"],
+                                    "true_probability": pred["true_probability"],
+                                    "edge": pred["edge"],
+                                    "confidence": pred["confidence"],
+                                    "recommendation": "BUY_YES",  # rename for trader's side mapping
+                                    "reasoning": pred["reasoning"],
+                                    "side": "yes",
+                                    "price_for_order_cents": it["yes_ask_cents"],
+                                    # Forwarded so the trader can detect
+                                    # correlated bets (same team / same event)
+                                    # against today's existing trades.
+                                    "entities": it.get("entities") or [],
+                                }
                             kalshi_queue.enqueue("risk", ticker, payload)
                             send_discord(_build_embed(it, pred))
                 _save_seen(seen)

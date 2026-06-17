@@ -1,8 +1,11 @@
 """Kalshi trader — sizes, places, and tracks every approved trade.
 
-Pulls approved BUY_YES trades off kalshi_queue stage "risk" (filled by
+Pulls approved trades off kalshi_queue stage "risk" (filled by
 kalshi_edge), sizes each with half-Kelly capped at MAX_BET_PCT of
 bankroll and the remaining daily-loss budget, then places the order.
+Side is read from the payload — BUY_YES pays yes_ask, BUY_NO pays the
+NO ask carried in `price_for_order_cents`. BUY_NO is only enabled by
+kalshi_edge for the narrow KXMLBTOTAL -9/-10 cohort (2026-06-17).
 PAPER_TRADING gates whether the order hits Kalshi or just gets logged.
 
 Every placed order is appended to trades_log.json with status=pending.
@@ -393,14 +396,17 @@ def _correlation_collision(ticker: str, entities: list[str]) -> str | None:
 
 # ─── Kelly sizing ──────────────────────────────────────────────────────
 
-def _half_kelly_pct(true_prob: float, yes_cents: float) -> float:
-    """Half-Kelly fraction of bankroll for a BUY_YES at price yes_cents.
+def _half_kelly_pct(true_prob: float, price_cents: float) -> float:
+    """Half-Kelly fraction of bankroll for a BUY at price `price_cents`
+    with win probability `true_prob` on the side being bought.
 
-    For BUY_YES at P cents: pay $P to win $(100 - P), so b = (100-P)/P.
-    Half-Kelly halves the raw Kelly to absorb true-prob estimation error.
+    For a contract bought at P cents: pay $P to win $(100 - P), so
+    b = (100-P)/P. Half-Kelly halves the raw Kelly to absorb true-prob
+    estimation error. Side-neutral — callers pass the side-specific
+    price and the probability of THAT side resolving.
     """
     p = max(0.001, min(0.999, true_prob))
-    yes_p = max(1.0, min(99.0, yes_cents))
+    yes_p = max(1.0, min(99.0, price_cents))
     b = (100 - yes_p) / yes_p
     q = 1 - p
     if b <= 0:
@@ -414,12 +420,23 @@ def _half_kelly_pct(true_prob: float, yes_cents: float) -> float:
 def _size_trade(item: dict[str, Any]) -> tuple[int, float, float, str | None]:
     """Returns (contracts, bet_size_usd, kelly_pct, reject_reason).
     reject_reason is None on approval.
+
+    Side-aware: for BUY_NO, our win probability is (1 - true_probability)
+    and the price we pay per contract is the NO ask (passed in
+    `price_for_order_cents`), not the YES ask. The Kelly math is
+    symmetric between sides — every contract pays $1 on a win.
     """
+    side = item.get("side", "yes")
     true_prob = float(item.get("true_probability", 0))
-    yes_cents = float(item.get("yes_ask", 50))
-    kelly_pct = _half_kelly_pct(true_prob, yes_cents)
+    price_cents = float(
+        item.get("price_for_order_cents")
+        or (item.get("no_ask") if side == "no" else item.get("yes_ask"))
+        or 50
+    )
+    effective_prob = (1.0 - true_prob) if side == "no" else true_prob
+    kelly_pct = _half_kelly_pct(effective_prob, price_cents)
     bet_size = BANKROLL * kelly_pct
-    contracts = int(bet_size / (yes_cents / 100)) if yes_cents > 0 else 0
+    contracts = int(bet_size / (price_cents / 100)) if price_cents > 0 else 0
 
     if kelly_pct <= 0:
         return contracts, bet_size, kelly_pct, "Kelly <= 0"
@@ -879,8 +896,22 @@ def run() -> None:
                 try:
                     ticker = item.get("ticker", "")
                     side = item.get("side", "yes")
+                    # Side-aware order price. BUY_YES pays yes_ask; BUY_NO
+                    # pays the NO ask carried as `price_for_order_cents`
+                    # (set by kalshi_edge from no_ask_cents). yes_ask is
+                    # kept on the payload for context but is not what we
+                    # pay on a BUY_NO.
                     yes_cents = int(item.get("yes_ask", 0))
-                    if not (ticker and side == "yes" and 1 <= yes_cents <= 99):
+                    price_cents = int(
+                        item.get("price_for_order_cents")
+                        or (item.get("no_ask") if side == "no" else yes_cents)
+                        or 0
+                    )
+                    if not (
+                        ticker
+                        and side in ("yes", "no")
+                        and 1 <= price_cents <= 99
+                    ):
                         print(f"[trader] malformed item, skipping: {item}", flush=True)
                         failed += 1
                         continue
@@ -912,11 +943,22 @@ def run() -> None:
                         rejected += 1
                         continue
 
-                    placed, error, order = _place_order(ticker, side, contracts, yes_cents)
+                    placed, error, order = _place_order(ticker, side, contracts, price_cents)
+                    if placed and side == "no":
+                        print(
+                            f"[BUY-NO] {ticker} contracts={contracts} "
+                            f"no_price={price_cents}c bet=${bet_size:.2f}",
+                            flush=True,
+                        )
                     timestamp = datetime.now(timezone.utc).isoformat()
 
                     _our_prob = round(float(item.get("true_probability", 0)), 4)
-                    _mkt_price = round(yes_cents / 100, 4)
+                    # `market_price` and `market_price_cents` record what
+                    # we actually paid per contract on the side we bought
+                    # (side-specific). `yes_ask` keeps the YES-side
+                    # snapshot for downstream context regardless of side.
+                    _mkt_price = round(price_cents / 100, 4)
+                    _yes_ask_snapshot = round(yes_cents / 100, 4) if yes_cents else _mkt_price
                     entry = {
                         "ticker": ticker,
                         "title": item.get("title", ""),
@@ -927,8 +969,8 @@ def run() -> None:
                         # so existing dashboards don't break.
                         "true_probability": _our_prob,
                         "market_price": _mkt_price,
-                        "yes_ask": _mkt_price,
-                        "market_price_cents": yes_cents,
+                        "yes_ask": _yes_ask_snapshot,
+                        "market_price_cents": price_cents,
                         "edge": round(float(item.get("edge", 0)), 4),
                         "confidence": item.get("confidence", "?"),
                         "reasoning": item.get("reasoning", ""),
