@@ -2059,6 +2059,43 @@ def run() -> None:
                                     pred["recommendation"] = "SKIP"
                                     rec = "SKIP"
 
+                            # Rule 1 enforcement (post-Claude) — UNDER-LEAN
+                            # ROUTING per the prompt: for any KXMLBTOTAL `-N`,
+                            # projected_total < (N - 0.5) ⇒ SKIP regardless of
+                            # computed edge. Haiku was observed violating this
+                            # (e.g. -16 BUY YES with projected 8.8 runs), so
+                            # enforce in code too. Parse N from the tail and
+                            # the projection from reasoning; if no projection
+                            # is parseable, let it through — conservative.
+                            if rec == "BUY" and ticker.startswith("KXMLBTOTAL"):
+                                tail_r1 = (
+                                    ticker.rsplit("-", 1)[-1]
+                                    if "-" in ticker else ""
+                                )
+                                try:
+                                    line_n = int(tail_r1)
+                                except ValueError:
+                                    line_n = None
+                                proj_match = re.search(
+                                    r"project\w*[^\d]{0,40}(\d+(?:\.\d+)?)\s*runs?",
+                                    pred.get("reasoning", "") or "",
+                                    re.IGNORECASE,
+                                )
+                                if line_n is not None and proj_match:
+                                    projected = float(proj_match.group(1))
+                                    if projected < line_n - 0.5:
+                                        post_drops["rule1_violation"] = (
+                                            post_drops.get("rule1_violation", 0) + 1
+                                        )
+                                        print(
+                                            f"[RULE1-VIOLATION] {ticker} "
+                                            f"projected={projected} line={line_n} "
+                                            f"forced SKIP",
+                                            flush=True,
+                                        )
+                                        pred["recommendation"] = "SKIP"
+                                        rec = "SKIP"
+
                             is_buy_yes = rec == "BUY"
                             is_buy_no = rec == "BUY_NO"
                             high_ok = (
