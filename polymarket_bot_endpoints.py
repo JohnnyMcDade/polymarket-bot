@@ -388,6 +388,30 @@ def _dash_go_live(state: dict) -> dict:
 # don't represent current bot performance. The dashboard defaults to the
 # windowed view; `?since=all` shows lifetime stats.
 _DASH_DEFAULT_SINCE = "2026-06-07"
+
+# Per-series disable cutoffs. When a series was disabled in production
+# after a given date, trades placed before that date no longer reflect
+# current bot performance — they're damage from the now-disabled cohort.
+# Excluded from the default windowed view; `?since=all` still shows them.
+# KXMLBTEAMTOTAL: disabled 2026-06-14 after 60d backtest showed the
+# N≥5 elite-starter cohort lost its lift in the recent 30d window.
+_DASH_SERIES_DISABLED_BEFORE: dict[str, str] = {
+    "KXMLBTEAMTOTAL": "2026-06-14",
+}
+
+
+def _dash_pre_disable_dropout(t: dict) -> bool:
+    """True when the trade is in a now-disabled series and was placed
+    before that series' disable date — so the windowed view should hide
+    it. Returns False for every trade in a still-active series."""
+    ticker = t.get("ticker", "")
+    ts_date = (t.get("timestamp") or "")[:10]
+    for series, disable_date in _DASH_SERIES_DISABLED_BEFORE.items():
+        if ticker.startswith(series) and ts_date < disable_date:
+            return True
+    return False
+
+
 _DASH_COHORT_ERA_CAP = 3.50  # mirrors kalshi_edge.BACKTEST_FILTER_ERA_CAP
 # BTC filter F&G thresholds — read from env so the dashboard always
 # reflects whatever the production edge agent is using. Defaults to 20
@@ -785,8 +809,11 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     pre-filter-fix days."""
     all_trades = _dash_load_trades()
     if since and since.lower() != "all":
-        trades = [t for t in all_trades
-                  if (t.get("timestamp") or "")[:10] >= since]
+        trades = [
+            t for t in all_trades
+            if (t.get("timestamp") or "")[:10] >= since
+            and not _dash_pre_disable_dropout(t)
+        ]
     else:
         trades = all_trades
     overall = _dash_overall(trades)

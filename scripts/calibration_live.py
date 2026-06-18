@@ -21,6 +21,7 @@ Run
     railway ssh ... 'python3 /app/scripts/calibration_live.py'
     python3 scripts/calibration_live.py --trades-log /tmp/trades.json
     python3 scripts/calibration_live.py --recent-n 10
+    python3 scripts/calibration_live.py --since 2026-06-14
 """
 
 from __future__ import annotations
@@ -103,6 +104,14 @@ def main() -> int:
         "--recent-n", type=int, default=10,
         help="Window size for the trend comparison (default 10)",
     )
+    p.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "ISO date (YYYY-MM-DD); only trades with timestamp >= this date "
+            "are included. Useful for excluding pre-fix historical damage."
+        ),
+    )
     args = p.parse_args()
 
     path = Path(args.trades_log)
@@ -113,12 +122,26 @@ def main() -> int:
     with path.open() as f:
         data = json.load(f)
     trades = data if isinstance(data, list) else data.get("trades", [])
+    if args.since:
+        before = len(trades)
+        trades = [
+            t for t in trades
+            if (t.get("timestamp") or "")[:10] >= args.since
+        ]
+        excluded = before - len(trades)
+    else:
+        excluded = 0
     settled = [t for t in trades if t.get("outcome") in ("won", "lost")]
 
+    since_line = (
+        f"since: {args.since} (excluded {excluded} earlier trades)\n"
+        if args.since else ""
+    )
     print(
         f"CALIBRATION LIVE — {datetime.now(timezone.utc).isoformat()}\n"
         f"trades_log: {path}\n"
-        f"total trades in log: {len(trades)}\n"
+        f"{since_line}"
+        f"total trades in window: {len(trades)}\n"
         f"settled: {len(settled)}\n"
         f"window for trend: last {args.recent_n} vs prior {args.recent_n}"
     )
