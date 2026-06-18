@@ -2070,7 +2070,7 @@ def run() -> None:
                             # reasoning; if unparseable, let it through.
                             if rec == "BUY_NO" and ticker.startswith("KXMLBTOTAL"):
                                 proj_match_no = re.search(
-                                    r"project\w*[^\d]{0,40}(\d+(?:\.\d+)?)\s*runs?",
+                                    r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
                                     pred.get("reasoning", "") or "",
                                     re.IGNORECASE,
                                 )
@@ -2107,7 +2107,7 @@ def run() -> None:
                                 except ValueError:
                                     line_n = None
                                 proj_match = re.search(
-                                    r"project\w*[^\d]{0,40}(\d+(?:\.\d+)?)\s*runs?",
+                                    r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
                                     pred.get("reasoning", "") or "",
                                     re.IGNORECASE,
                                 )
