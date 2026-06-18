@@ -811,7 +811,7 @@ RECOMMENDATION RULES
   The MEDIUM tier requires a larger edge because MEDIUM means you are admitting uncertainty — the extra margin compensates for that uncertainty. Required data:
     - for sports: the named team or player appears in SPORTS STATS
     - for economic: the current value of the macro variable is in ECONOMIC DATA and resolution is close enough that the variable is unlikely to swing materially
-- SKIP in every other case. BUY_NO is allowed only on the narrow KXMLBTOTAL -9/-10 cohort defined in the KXMLBTOTAL BUY_NO ELIGIBILITY section below — every other ticker is YES-only; emit BUY (= BUY_YES) or SKIP.
+- SKIP in every other case. BUY_NO is allowed only on the narrow KXMLBTOTAL -9 cohort defined in the KXMLBTOTAL BUY_NO ELIGIBILITY section below — every other ticker (including KXMLBTOTAL -10) is YES-only; emit BUY (= BUY_YES) or SKIP.
 - SKIP if the market's resolution depends on something not covered by either block (politics, weather, awards, esports, etc.).
 
 CONFIDENCE GUIDANCE
@@ -916,22 +916,23 @@ KXMLBTOTAL PARK / UMPIRE / WEATHER SIGNALS (NEW 2026-06-15)
 - These three signals are SUPPLEMENTARY — they tune the prediction but never override the rolling-ERA + bullpen + H2H foundation. A 2.50 rolling-ERA elite arm at Coors with strong tailwind is still your best UNDER bet at the 11.5 line, not the OVER, because the starter quality dominates the park effect over 6 innings.
 
 KXMLBTOTAL UNDER-LEAN ROUTING (NEW 2026-06-17)
-- BUY_NO is allowed ONLY on -9/-10 tickers in the specific cohort below (see KXMLBTOTAL BUY_NO ELIGIBILITY). Every other KXMLBTOTAL ticker is YES-only. When your projected total comes in BELOW the line family of available tickers, the previously observed failure mode was to claim a "value tail" BUY YES on a high-line ticker (e.g. projected 8.7 runs, ticker -11, claim our_prob=0.42 vs ask=0.28 → BUY YES). 180-day directional backtest shows the predictor adds NO positive lift on high-line OVER picks (line 10.5 and 11.5 OVER lift is at or below zero), so these cheap-tail YES bets lose at a measurable rate.
+- BUY_NO is allowed ONLY on -9 tickers in the specific cohort below (see KXMLBTOTAL BUY_NO ELIGIBILITY). Every other KXMLBTOTAL ticker — including -10 — is YES-only. When your projected total comes in BELOW the line family of available tickers, the previously observed failure mode was to claim a "value tail" BUY YES on a high-line ticker (e.g. projected 8.7 runs, ticker -11, claim our_prob=0.42 vs ask=0.28 → BUY YES). 180-day directional backtest shows the predictor adds NO positive lift on high-line OVER picks (line 10.5 and 11.5 OVER lift is at or below zero), so these cheap-tail YES bets lose at a measurable rate.
 - RULE 1 (per-ticker projected-vs-threshold floor): for any KXMLBTOTAL ticker `-N`, if your projected_total < (N - 0.5), set RECOMMENDATION: SKIP regardless of computed edge. The "value tail on a longshot" reasoning is the contradiction this rule blocks.
 - RULE 2 (UNDER-favoring overlay): if your reasoning concludes the matchup is UNDER-favoring — any of: elite-duel (both starters rolling_era_last3 < 3.00), both bullpens bullpen_era_15d ≤ 3.00, both starters with vs_opponent.avg_runs_last3_vs ≤ 3.0 across starts ≥ 2, or projected_total at or below the lowest available threshold in the family — do NOT BUY YES on any -11 or higher ticker. Either BUY YES on the LOWEST available line N where projected_total ≥ N + 0.5, or SKIP every ticker in the family.
-- Worked example: projected 8.7 runs, tickers -8, -9, -10, -11, -12 available, both starter ERAs < 3.50. -8 passes (8.7 ≥ 8.5). -9, -10, -11, -12 all fail Rule 1 and Rule 2 for BUY YES. → Evaluate BUY YES on -8 (subject to the usual edge-tier gate); evaluate BUY_NO on -9 and -10 (subject to the BUY_NO ELIGIBILITY gates and MEDIUM edge floor); SKIP -11 and -12.
+- Worked example: projected 7.2 runs, tickers -7, -8, -9, -10, -11 available, both starter ERAs < 3.50. -7 passes BUY YES (7.2 ≥ 6.5). -8 fails Rule 1 for BUY YES (7.2 < 7.5). -9 fails BUY YES (Rule 1) but PASSES the BUY_NO cohort + projection gate (7.2 ≤ 7.5; see BUY_NO ELIGIBILITY). -10 is not in the BUY_NO cohort (removed 2026-06-18) and fails Rule 1 for BUY YES. -11 fails Rule 1. → Evaluate BUY YES on -7 and BUY_NO on -9 (each subject to its own edge-tier gate); SKIP -8, -10, -11.
 
-KXMLBTOTAL BUY_NO ELIGIBILITY (NEW 2026-06-17, narrow staged rollout)
-- BUY_NO is allowed ONLY on KXMLBTOTAL tickers ending in `-9` or `-10` (the T=8.5 and T=9.5 lines). On every other KXMLBTOTAL ticker — and on every other series — the build is YES-only; emit BUY or SKIP, never BUY_NO. Out-of-cohort BUY_NO recommendations are dropped post-Claude by the code.
+KXMLBTOTAL BUY_NO ELIGIBILITY (NEW 2026-06-17 narrow rollout; tightened 2026-06-18 to the data-stable cell)
+- BUY_NO is allowed ONLY on KXMLBTOTAL tickers ending in `-9` (the T=8.5 line). The `-10` (T=9.5) carveout was REMOVED 2026-06-18 — the 180d cohort backtest showed no Wilson-stable lift over the always-UNDER baseline at T=9.5 at any projection margin (baseline 64.1%, best wlo 58.2%), so -10 BUY_NO loses money in expectation. `-10` is YES-only; emit BUY or SKIP, never BUY_NO. On every other KXMLBTOTAL ticker — and on every other series — the build is YES-only. Out-of-cohort BUY_NO recommendations are dropped post-Claude by the code.
 - CONFIDENCE must be MEDIUM for BUY_NO. Do NOT emit BUY_NO with CONFIDENCE: HIGH for the first 30 days of this rollout — emit BUY_NO with MEDIUM, or SKIP. HIGH BUY_NO is dropped post-Claude.
-- PROJECTION CONDITION — emit BUY_NO on `-9` ONLY when your projected_total < 8.5 runs; on `-10` ONLY when projected_total < 9.5 runs. This is the mirror of Rule 1 above: your projection must sit cleanly on the NO side of the line, not a "value tail" claim.
+- PROJECTION CONDITION — emit BUY_NO on `-9` ONLY when your projected_total ≤ 7.5 runs (a full 1.0-run margin below the T=8.5 line). The data-stable cell sits exactly here: n=25 strict-cohort games in the 180d backtest where the predictor said projected ≤ 7.5, win rate 80%, Wilson 95% LB 60.9% vs always-UNDER baseline 56.9%. Looser margins (projected 7.6–8.4) LOST relative to the baseline in the 180d window — the predictor's UNDER edge does not generalize to "merely sits below 8.5"; it requires a clear 1.0-run buffer. Projections strictly greater than 7.5 force SKIP regardless of computed edge.
 - PITCHING CONDITION — both probable starters' season ERA must be < 3.50. Rationale: decent pitching → fewer runs → UNDER is the modal outcome and BUY_NO is the structurally correct read. Bad pitching (high ERA) → more runs → BUY_NO would be a longshot bet, which is the failure mode we are blocking. Only emit BUY_NO when both starters are credibly suppressing the run total.
 - EDGE CONVENTION for BUY_NO — compute EDGE as (1 - TRUE_PROBABILITY) - no_market_implied, where no_market_implied = MARKET NO PRICE / 100. TRUE_PROBABILITY remains the YES probability (the same number you would emit for BUY_YES on this ticker). Must clear MEDIUM_MIN_EDGE. Subject to the global +0.18 EDGE SANITY CAP — claimed edges above that force SKIP regardless of which side.
 - WORKED EXAMPLES (BUY_NO eligibility — read these before emitting any BUY_NO):
-    - Example A (positive — clean BUY_NO): Both starters' season ERA = 2.50 (both < 3.50 ✓). Projected total = 7.8 runs. Ticker `-9` (line T=8.5). Projection check: 7.8 < 8.5 ✓. MARKET NO PRICE = 60¢ → no_market_implied = 0.60. Set TRUE_PROBABILITY = 0.30 (you think YES is 30% likely given the elite arms and below-line projection). EDGE = (1 - 0.30) - 0.60 = 0.70 - 0.60 = +0.10. Clears MEDIUM_MIN_EDGE. → RECOMMENDATION: BUY_NO, CONFIDENCE: MEDIUM.
-    - Example B (positive — just clears MEDIUM): Elite duel — both starters with rolling_era_last3 < 3.00 and season ERA both < 3.50. Projected total = 8.2 runs. Ticker `-10` (line T=9.5). Projection check: 8.2 < 9.5 ✓. Pitching check ✓. MARKET NO PRICE = 65¢. Set TRUE_PROBABILITY = 0.27. EDGE = (1 - 0.27) - 0.65 = 0.73 - 0.65 = +0.08. Just clears MEDIUM_MIN_EDGE. → RECOMMENDATION: BUY_NO, CONFIDENCE: MEDIUM. (Sensitivity: if your TRUE_PROBABILITY had been 0.30 instead, EDGE = 0.70 - 0.65 = +0.05 — BELOW MEDIUM_MIN_EDGE, so SKIP. A 3pp shift in your YES estimate flips the verdict at this margin.)
-    - Example C (negative — SKIP, pitching gate fails): Both starters' season ERA = 4.50 and 4.80 (BOTH > 3.50 → bad pitching). PITCHING CONDITION fails — bad pitching favors OVER, not UNDER, and the cohort's backtest lift only holds for decent-pitching matchups. → RECOMMENDATION: SKIP regardless of computed edge. (Independently, the projected total for a bad-pitching matchup is typically ≥ 9.5 runs, which also fails the PROJECTION CONDITION for ticker `-9` (need projected < 8.5). Either gate alone forces SKIP; both fail here.)
-- Backtest grounding: 180d directional backtest on KXMLBTOTAL shows UNDER bets at T=8.5 have +9pp Wilson-stable lift over the always-UNDER trivial baseline, replicating across both 60d and 180d windows; T=9.5 is borderline positive (+3pp). T≥10.5 UNDER bets just rediscover the trivial baseline (no real predictive signal), which is why this cohort is narrow.
+    - Example A (positive — clean BUY_NO): Both starters' season ERA = 2.50 (both < 3.50 ✓). Projected total = 7.2 runs. Ticker `-9` (line T=8.5). Projection check: 7.2 ≤ 7.5 ✓ (a full 1.0-run margin below the line, inside the data-stable cell). MARKET NO PRICE = 60¢ → no_market_implied = 0.60. Set TRUE_PROBABILITY = 0.30 (you think YES is 30% likely given the elite arms and below-line projection). EDGE = (1 - 0.30) - 0.60 = 0.70 - 0.60 = +0.10. Clears MEDIUM_MIN_EDGE. → RECOMMENDATION: BUY_NO, CONFIDENCE: MEDIUM.
+    - Example B (negative — SKIP, projection too close to the line): Both starters' season ERA = 3.20 (both < 3.50 ✓). Projected total = 8.0 runs. Ticker `-9` (line T=8.5). Projection check: 8.0 > 7.5 ✗ (only 0.5-run margin — the predictor's edge requires ≥ 1.0-run buffer). The 180d data shows the cohort at this margin LOST to the always-UNDER baseline (wr 59.3% vs baseline 56.9% sounds positive, but Wilson LB drops to 47–48% — below baseline). → RECOMMENDATION: SKIP regardless of computed edge.
+    - Example C (negative — SKIP, pitching gate fails): Both starters' season ERA = 4.50 and 4.80 (BOTH > 3.50 → bad pitching). PITCHING CONDITION fails — bad pitching favors OVER, not UNDER, and the cohort's backtest lift only holds for decent-pitching matchups. → RECOMMENDATION: SKIP regardless of computed edge.
+    - Example D (negative — SKIP, -10 no longer in cohort): Both starters' season ERA = 2.80 (both < 3.50 ✓). Projected total = 8.0 runs. Ticker `-10` (line T=9.5). The -10 carveout was removed 2026-06-18 — no Wilson-stable UNDER edge at T=9.5 in the 180d backtest. → RECOMMENDATION: SKIP regardless of computed edge. (BUY YES on -10 is still allowed via the normal RECOMMENDATION RULES if your projection ≥ 9.0 and the edge tier clears.)
+- Backtest grounding: 180d strict cohort backtest (both starters' rolling_era_last3 < 3.50, n=153 games) shows exactly one Wilson-stable cell: T=8.5 (-9 ticker) at projection margin δ ≥ 1.00 (projected ≤ 7.5) — n=25, wr=80%, wlo=60.9% vs always-UNDER baseline 56.9%, lift +23pp. Every other (T, δ) cell in the strict cohort fails the wlo > baseline test. T=9.5 has no stable cell at any margin. The eligibility rule above is the single data-stable cell — narrow on purpose.
 
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
@@ -2032,11 +2033,13 @@ def run() -> None:
                                         f"[BTC-FILTER] {ticker} PASS {reason}",
                                         flush=True,
                                     )
-                            # BUY_NO eligibility — narrow KXMLBTOTAL -9/-10
-                            # cohort, MEDIUM-only. Out-of-cohort or wrong-tier
-                            # BUY_NO recommendations from Claude are forced to
-                            # SKIP here so the prompt rule is enforced in code,
-                            # not just trust.
+                            # BUY_NO eligibility — narrow KXMLBTOTAL -9
+                            # cohort, MEDIUM-only. -10 was removed 2026-06-18
+                            # after the 180d backtest showed no Wilson-stable
+                            # lift at T=9.5. Out-of-cohort or wrong-tier
+                            # BUY_NO recommendations from Claude are forced
+                            # to SKIP here so the prompt rule is enforced in
+                            # code, not just trust.
                             rec = pred["recommendation"]
                             if rec == "BUY_NO":
                                 tail = (
@@ -2044,7 +2047,7 @@ def run() -> None:
                                 )
                                 eligible = (
                                     ticker.startswith("KXMLBTOTAL")
-                                    and tail in ("9", "10")
+                                    and tail == "9"
                                     and pred["confidence"] == "MEDIUM"
                                 )
                                 if not eligible:
@@ -2058,6 +2061,33 @@ def run() -> None:
                                     )
                                     pred["recommendation"] = "SKIP"
                                     rec = "SKIP"
+
+                            # BUY_NO projection gate — the 180d data-stable
+                            # cell on -9 sits at projected ≤ 7.5 (δ ≥ 1.00
+                            # from the T=8.5 line). Looser margins (7.6–8.4)
+                            # lost to the always-UNDER baseline. Mirrors the
+                            # Rule 1 gate for BUY YES: parse projection from
+                            # reasoning; if unparseable, let it through.
+                            if rec == "BUY_NO" and ticker.startswith("KXMLBTOTAL"):
+                                proj_match_no = re.search(
+                                    r"project\w*[^\d]{0,40}(\d+(?:\.\d+)?)\s*runs?",
+                                    pred.get("reasoning", "") or "",
+                                    re.IGNORECASE,
+                                )
+                                if proj_match_no:
+                                    proj_no = float(proj_match_no.group(1))
+                                    if proj_no > 7.5:
+                                        post_drops["buy_no_projection_fail"] = (
+                                            post_drops.get("buy_no_projection_fail", 0) + 1
+                                        )
+                                        print(
+                                            f"[BUY-NO-PROJECTION-FAIL] {ticker} "
+                                            f"projected={proj_no} threshold=7.5 "
+                                            f"forced SKIP",
+                                            flush=True,
+                                        )
+                                        pred["recommendation"] = "SKIP"
+                                        rec = "SKIP"
 
                             # Rule 1 enforcement (post-Claude) — UNDER-LEAN
                             # ROUTING per the prompt: for any KXMLBTOTAL `-N`,

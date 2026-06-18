@@ -2,18 +2,24 @@
 data; applies the exact filters the production rule enforces:
   - KXMLBTOTAL line in {8.5, 9.5}  (== `-9` and `-10` tickers)
   - direction: UNDER only           (== BUY_NO on these tickers)
-  - both starters' rolling_era_last3 < 3.50
+  - both starters' rolling_era_last3 < ERA_CAP  (default 3.50)
 
 We show two cohort definitions and the production reading:
-  (a) BOTH starters < 3.50 — strict, matches production rule
-  (b) AVG starter ERA < 3.50 — looser, matches the existing dashboard
+  (a) BOTH starters < cap — strict, matches production rule
+  (b) AVG starter ERA < cap — looser, matches the existing dashboard
       qualifying-games definition
 
 Reports n, win_rate, Wilson 95% LB, and lift over the always-UNDER
 baseline computed on the SAME filtered cohort (not the full slate —
 baseline shifts in the elite-pitching subset).
+
+Run
+    python3 scripts/cohort_buy_no_backtest.py              # 60d, cap 3.50
+    python3 scripts/cohort_buy_no_backtest.py 180          # 180d, cap 3.50
+    python3 scripts/cohort_buy_no_backtest.py 60 --era-cap 3.75
 """
 from datetime import datetime, timezone, timedelta
+import argparse
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -60,10 +66,11 @@ def sweep_under(rows, T, deltas):
     return out
 
 
-def main(days=60):
+def main(days=60, era_cap=3.50):
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
     print(f"Fetching schedule {start} → {end}...")
+    print(f"ERA cap: < {era_cap}")
     games = bt.fetch_schedule(start.isoformat(), end.isoformat())
     print(f"  {len(games)} finished games")
     pids = {pid for g in games
@@ -73,21 +80,21 @@ def main(days=60):
     rows, skipped = bt.run_total_backtest(games, gamelogs)
     print(f"  {len(rows)} rows pre-filter, skipped={skipped}")
 
-    # Production cohort: BOTH starters' ERA (rolling_era_last3 proxy) < 3.50
+    # Production cohort: BOTH starters' ERA (rolling_era_last3 proxy) < era_cap
     strict = [r for r in rows
               if r['home_era'] is not None and r['away_era'] is not None
-              and r['home_era'] < 3.50 and r['away_era'] < 3.50]
-    # Looser cohort: AVG of the two ERAs < 3.50 (dashboard definition)
+              and r['home_era'] < era_cap and r['away_era'] < era_cap]
+    # Looser cohort: AVG of the two ERAs < era_cap (dashboard definition)
     avg_lt = [r for r in rows
-              if r['starter_avg_era'] < 3.50]
+              if r['starter_avg_era'] < era_cap]
 
-    print(f"\nStrict cohort (both starters < 3.50): n={len(strict)}")
-    print(f"Avg-ERA cohort (avg < 3.50):           n={len(avg_lt)}")
+    print(f"\nStrict cohort (both starters < {era_cap}): n={len(strict)}")
+    print(f"Avg-ERA cohort (avg < {era_cap}):           n={len(avg_lt)}")
 
     deltas = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
     for cohort_name, cohort in (
-        ("STRICT (both starters < 3.50 — matches production rule)", strict),
-        ("LOOSER (avg starter ERA < 3.50 — dashboard definition)", avg_lt),
+        (f"STRICT (both starters < {era_cap} — matches production rule)", strict),
+        (f"LOOSER (avg starter ERA < {era_cap} — dashboard definition)", avg_lt),
     ):
         print()
         print("=" * 80)
@@ -114,10 +121,10 @@ def main(days=60):
 
 
 if __name__ == '__main__':
-    days = 60
-    if len(sys.argv) > 1:
-        try:
-            days = int(sys.argv[1])
-        except ValueError:
-            pass
-    main(days)
+    p = argparse.ArgumentParser()
+    p.add_argument("days", nargs="?", type=int, default=60,
+                   help="Backtest window in days (default 60)")
+    p.add_argument("--era-cap", type=float, default=3.50,
+                   help="Season ERA ceiling per starter (default 3.50)")
+    args = p.parse_args()
+    main(args.days, args.era_cap)
