@@ -396,7 +396,7 @@ _DASH_DEFAULT_SINCE = "2026-06-07"
 # KXMLBTEAMTOTAL: disabled 2026-06-14 after 60d backtest showed the
 # N≥5 elite-starter cohort lost its lift in the recent 30d window.
 _DASH_SERIES_DISABLED_BEFORE: dict[str, str] = {
-    "KXMLBTEAMTOTAL": "2026-06-14",
+    "KXMLBTEAMTOTAL": "2026-06-15",
 }
 
 
