@@ -2144,10 +2144,27 @@ def run() -> None:
                                 # Distinguish "Claude voted SKIP" from "Claude
                                 # voted BUY/BUY_NO but tier-edge floor wasn't
                                 # cleared" — different signals, different fixes.
+                                # Within Claude-SKIP, split further: if Claude
+                                # cited Rule 1 in its reasoning it self-enforced
+                                # the post-Claude projection gate, so bucket
+                                # under rule1_self_enforced rather than the
+                                # generic claude_skip. The code-level
+                                # rule1_violation counter only fires when Claude
+                                # voted BUY but projection contradicts; this
+                                # captures the other half of Rule-1 activity.
                                 if not (is_buy_yes or is_buy_no):
-                                    post_drops["claude_skip"] = (
-                                        post_drops.get("claude_skip", 0) + 1
-                                    )
+                                    if "Rule 1" in (pred.get("reasoning") or ""):
+                                        post_drops["rule1_self_enforced"] = (
+                                            post_drops.get("rule1_self_enforced", 0) + 1
+                                        )
+                                        print(
+                                            f"[RULE1-SELF] {ticker}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        post_drops["claude_skip"] = (
+                                            post_drops.get("claude_skip", 0) + 1
+                                        )
                                 else:
                                     post_drops["low_edge"] = (
                                         post_drops.get("low_edge", 0) + 1

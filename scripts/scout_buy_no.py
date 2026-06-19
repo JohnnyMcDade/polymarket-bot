@@ -4,7 +4,8 @@ which games qualify for the BUY_NO eligibility cohort.
 
 The cohort is defined in kalshi_edge.py's KXMLBTOTAL BUY_NO ELIGIBILITY
 section:
-  - Ticker tail must be -9 or -10 (T=8.5 / T=9.5 lines)
+  - Ticker tail must be -9 (T=8.5 line). -10 was removed 2026-06-18
+    after the 180d backtest showed no Wilson-stable lift at T=9.5.
   - Both probable starters' season ERA must be < 3.50
   - (At runtime: projected_total must clear the line on the NO side)
 
@@ -143,7 +144,7 @@ def main() -> int:
         ap_era = ap.get("era")
         hp_era = hp.get("era")
         cohort_tails = sorted(
-            available_tails.get((away, home), set()) & {"9", "10"},
+            available_tails.get((away, home), set()) & {"9"},
             key=int,
         )
         row = {
@@ -191,12 +192,12 @@ def main() -> int:
         print(
             "  ↑ Pitching gate is favorable. BUY_NO will fire ONLY if "
             "Claude's runtime\n"
-            "    projected_total comes in < 8.5 (for -9) or < 9.5 "
-            "(for -10) at trade time."
+            "    projected_total comes in ≤ 7.5 (T=8.5 line, δ ≥ 1.00) "
+            "at trade time."
         )
         print()
     section(
-        "PITCHING GATE FAIL (at least one ERA ≥ cap, or no -9/-10 listed)",
+        "PITCHING GATE FAIL (at least one ERA ≥ cap, or no -9 listed)",
         not_qualifying,
     )
     if no_data:
