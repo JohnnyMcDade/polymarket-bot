@@ -414,37 +414,6 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
             "inline": False,
         })
 
-    # Prediction accuracy (KXMLBTOTAL). Compares projected_total
-    # extracted from each settled trade's reasoning string against
-    # actual final game runs from statsapi.mlb.com. Trips a FLAG
-    # line when MAE > 1.5 runs over ≥ 15 samples — at that point a
-    # systematic +1.5 run correction to KXMLBTOTAL projections is
-    # justified by the data, not noise.
-    pa = _load_prediction_accuracy_stats()
-    if pa["n"] == 0:
-        pa_value = "—  (no accuracy records yet)"
-    else:
-        flag_str = (
-            f"\n⚠️ **FLAG**: mean error > "
-            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} runs over "
-            f"{pa['n']} samples — consider a systematic +"
-            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} run correction "
-            f"to KXMLBTOTAL projections."
-            if pa["flag"] else ""
-        )
-        pa_value = (
-            f"Mean error: **{pa['mean_error']:.2f} runs** | "
-            f"Bias: **{pa['bias']}** "
-            f"({pa['n_over']} OVER / {pa['n_under']} UNDER)\n"
-            f"Direction correct: **{pa['n_correct']}/{pa['n']}**"
-            f"{flag_str}"
-        )
-    fields.append({
-        "name": "🎯 Prediction Accuracy (KXMLBTOTAL)",
-        "value": pa_value,
-        "inline": False,
-    })
-
     # Clickable dashboard link as the last field. The /dashboard route
     # mirrors most of this report (overall + per-series tables + last
     # 10 trades) and adds an SVG cumulative-P&L chart that doesn't fit
@@ -615,10 +584,44 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
         {"name": "📈 Cumulative PnL (last 5)",
          "value": f"`{path_str}`",
          "inline": False},
-        {"name": "📊 View Dashboard",
-         "value": f"[Open live dashboard]({DASHBOARD_URL})",
-         "inline": False},
     ]
+
+    # Prediction accuracy (KXMLBTOTAL). Compares projected_total
+    # extracted from each settled trade's reasoning string against
+    # actual final game runs from statsapi.mlb.com. Trips a FLAG
+    # line when MAE > 1.5 runs over ≥ 15 samples — at that point a
+    # systematic +1.5 run correction to KXMLBTOTAL projections is
+    # justified by the data, not noise. Independent of the
+    # calibration window above (different file, different cohort).
+    pa = _load_prediction_accuracy_stats()
+    if pa["n"] == 0:
+        pa_value = "—  (no accuracy records yet)"
+    else:
+        flag_str = (
+            f"\n⚠️ **FLAG**: mean error > "
+            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} runs over "
+            f"{pa['n']} samples — consider a systematic +"
+            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} run correction "
+            f"to KXMLBTOTAL projections."
+            if pa["flag"] else ""
+        )
+        pa_value = (
+            f"Mean error: **{pa['mean_error']:.2f} runs** | "
+            f"Bias: **{pa['bias']}** "
+            f"({pa['n_over']} OVER / {pa['n_under']} UNDER)\n"
+            f"Direction correct: **{pa['n_correct']}/{pa['n']}**"
+            f"{flag_str}"
+        )
+    fields.append({
+        "name": "🎯 Prediction Accuracy (KXMLBTOTAL)",
+        "value": pa_value,
+        "inline": False,
+    })
+    fields.append({
+        "name": "📊 View Dashboard",
+        "value": f"[Open live dashboard]({DASHBOARD_URL})",
+        "inline": False,
+    })
 
     return {
         "title": f"📐 KALSHI CALIBRATION — daily{title_suffix}",
