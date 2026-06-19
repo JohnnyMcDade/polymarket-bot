@@ -701,9 +701,19 @@ def _fetch_actual_total_runs(ticker: str) -> int | None:
     except ValueError:
         return None
     try:
+        # hydrate=team is required: the bare /schedule response leaves
+        # teams.{side}.team as {id, link, name} only — no abbreviation
+        # — and without it the suffix match against the ticker's middle
+        # segment can never succeed. Discovered during backfill: all 14
+        # historical games matched 'state=F' but skipped on missing
+        # abbrs.
         r = requests.get(
             f"{_MLB_STATSAPI}/schedule",
-            params={"sportId": 1, "date": date_iso},
+            params={
+                "sportId": 1,
+                "date": date_iso,
+                "hydrate": "team",
+            },
             timeout=15,
         )
         r.raise_for_status()
