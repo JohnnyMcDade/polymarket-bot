@@ -58,6 +58,13 @@ MAX_EDGE = float(os.getenv("KALSHI_MAX_EDGE", "0.18"))             # 18%
 # for the model's admitted uncertainty — without it, every borderline
 # market the model isn't sure about would slip through.
 MEDIUM_MIN_EDGE = float(os.getenv("KALSHI_MEDIUM_MIN_EDGE", "0.08"))  # 8%
+# Edge sanity gate. Recompute derived_edge from true_probability and the
+# live ask; if Claude's claimed edge diverges by more than this tolerance,
+# force SKIP. Catches internally-inconsistent predictions like true_p=0.15
+# at ask=98c with claimed_edge=+0.08 (real edge: -0.83) that MAX_EDGE_CAP
+# can't see because it only checks the claimed number. 0.15 absorbs
+# reasonable rounding without firing on genuine disagreements.
+EDGE_SANITY_TOLERANCE = float(os.getenv("KALSHI_EDGE_SANITY_TOLERANCE", "0.15"))
 BATCH_SIZE = int(os.getenv("KALSHI_EDGE_BATCH_SIZE", "10"))
 MAX_MARKETS_PER_CYCLE = int(os.getenv("KALSHI_EDGE_MAX_MARKETS", "40"))
 DEBUG_LOG = os.getenv("KALSHI_EDGE_DEBUG_LOG", "").lower() in ("1", "true", "yes")
@@ -1805,6 +1812,46 @@ def run() -> None:
                                     f"why={pred.get('reasoning', '')[:200]!r}",
                                     flush=True,
                                 )
+                            # Edge sanity gate. Runs first so downstream
+                            # gates never see internally-inconsistent
+                            # numbers. For BUY YES: derived_edge =
+                            # true_p - yes_ask/100. For BUY_NO:
+                            # derived_edge = (1 - true_p) - no_ask/100.
+                            # `continue` here (rather than just forcing
+                            # SKIP) so the bucket is unambiguous —
+                            # otherwise the final approval check would
+                            # also count this into claude_skip.
+                            if pred["recommendation"] in ("BUY", "BUY_NO"):
+                                if pred["recommendation"] == "BUY_NO":
+                                    ask_cents = int(it.get("no_ask_cents") or 100)
+                                    derived_edge = (
+                                        (1.0 - pred["true_probability"])
+                                        - (ask_cents / 100.0)
+                                    )
+                                else:
+                                    ask_cents = int(it.get("yes_ask_cents") or 100)
+                                    derived_edge = (
+                                        pred["true_probability"]
+                                        - (ask_cents / 100.0)
+                                    )
+                                gap = abs(pred["edge"] - derived_edge)
+                                if gap > EDGE_SANITY_TOLERANCE:
+                                    skipped += 1
+                                    post_drops["edge_sanity_fail"] = (
+                                        post_drops.get("edge_sanity_fail", 0) + 1
+                                    )
+                                    print(
+                                        f"[EDGE-SANITY-FAIL] {ticker} "
+                                        f"claimed={pred['edge']:+.3f} "
+                                        f"derived={derived_edge:+.3f} "
+                                        f"gap={gap:.3f} "
+                                        f"(tol={EDGE_SANITY_TOLERANCE:.2f}) "
+                                        f"true_p={pred['true_probability']:.3f} "
+                                        f"ask={ask_cents}c "
+                                        f"side={pred['recommendation']}",
+                                        flush=True,
+                                    )
+                                    continue
                             # Whale boost: if we're about to BUY YES and a
                             # >= WHALE_BOOST_MIN_USD whale hit YES on the
                             # same ticker recently, bump conf one notch
