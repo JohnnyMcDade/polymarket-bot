@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -47,6 +48,30 @@ WEEKLY_DOW = int(os.getenv("KALSHI_WEEKLY_DOW", "0"))  # 0 = Monday
 # 30 days of the BUY_NO staged rollout (2026-06-17) — surfaces silent
 # non-firing as well as actual fires.
 BUY_NO_WATCH_HOUR = int(os.getenv("KALSHI_BUY_NO_WATCH_HOUR", "23"))
+# Wimbledon scout daily report — runs scripts/scout_wimbledon.py via
+# direct import and posts to Discord ONLY when at least one market
+# clears the production tennis filter. Gated by start date so the
+# noise window (warmup tournaments without live books) doesn't trip
+# the channel every day. Defaults: 13:00 UTC daily from 2026-06-25
+# (5 days before Wimbledon 2026 main draw on 2026-06-30).
+WIMBLEDON_SCOUT_HOUR = int(os.getenv("KALSHI_WIMBLEDON_SCOUT_HOUR", "13"))
+WIMBLEDON_SCOUT_START_DATE = os.getenv(
+    "KALSHI_WIMBLEDON_SCOUT_START", "2026-06-25"
+)
+# Same env key the dashboard's countdown uses — single source of truth
+# for the date, so the 7AM calibration embed and the 13:00 scout never
+# disagree on when the slam starts.
+WIMBLEDON_START_ISO = os.getenv("KALSHI_WIMBLEDON_START", "2026-06-30")
+WIMBLEDON_COUNTDOWN_MAX_DAYS = int(os.getenv(
+    "KALSHI_WIMBLEDON_COUNTDOWN_MAX_DAYS", "14"
+))
+# Static one-liner appended to the countdown so the operator sees the
+# specialist-regen reminder at a glance instead of having to remember
+# it from CLAUDE.md / memory.
+WIMBLEDON_REGEN_REMINDER = os.getenv(
+    "KALSHI_WIMBLEDON_REGEN_REMINDER",
+    "grass specialist regen due June 28",
+)
 # Public dashboard URL surfaced in the daily Discord embed so anyone
 # subscribed to the channel can one-click into the live HTML view.
 # Override via env if the Railway public domain ever changes.
@@ -553,7 +578,31 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
     path_str = _last_n_pnl_path(r["trades"], k=5)
     verdict = "GO LIVE" if r["all_pass"] else "STAY PAPER"
 
-    fields = [
+    fields = []
+    # Wimbledon countdown — only surfaced when the slam is within
+    # WIMBLEDON_COUNTDOWN_MAX_DAYS so the embed isn't noisy 11 months
+    # of the year. Pulls the same WIMBLEDON_START_ISO env the scout
+    # watchdog uses so the dates can never drift apart. Renders nothing
+    # on a bad date string or when the slam is past.
+    try:
+        _w_start = datetime.fromisoformat(WIMBLEDON_START_ISO).date()
+        _w_today = datetime.now(timezone.utc).date()
+        _w_days = (_w_start - _w_today).days
+    except ValueError:
+        _w_days = None
+    if _w_days is not None and 0 <= _w_days <= WIMBLEDON_COUNTDOWN_MAX_DAYS:
+        if _w_days == 0:
+            _w_phrase = "**starts today**"
+        elif _w_days == 1:
+            _w_phrase = "**in 1 day**"
+        else:
+            _w_phrase = f"**in {_w_days} days**"
+        fields.append({
+            "name": "🎾 Wimbledon",
+            "value": f"{_w_phrase} — {WIMBLEDON_REGEN_REMINDER}",
+            "inline": False,
+        })
+    fields += [
         {"name": "🪟 Window",
          "value": f"{n} of {r['raw_n']} settled",
          "inline": True},
@@ -1301,6 +1350,168 @@ def _run_buy_no_watch_loop() -> None:
             time.sleep(60)
 
 
+def _build_wimbledon_scout_embed(data: dict[str, Any]) -> dict[str, Any]:
+    """One-page Wimbledon scout post. Lists every PASS row with title
+    + ask, plus a compact bucket-level summary so the operator can see
+    at a glance which tournaments have action and which don't."""
+    total = data["total"]
+    total_pass = data["total_pass"]
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    buckets = data["buckets"]
+    fields: list[dict[str, Any]] = []
+    summary_lines = []
+    for label, key in (
+        ("🎾 Wimbledon", "wimbledon"),
+        ("🌱 Grass-other", "grass-other"),
+        ("🔵 Non-grass", "non-grass"),
+    ):
+        rows = buckets[key]
+        n_pass = sum(1 for r in rows if r["passes"])
+        summary_lines.append(f"`{label:<14}` {n_pass} PASS / {len(rows)} markets")
+    fields.append({
+        "name": "📊 Bucket summary",
+        "value": "\n".join(summary_lines),
+        "inline": False,
+    })
+
+    # Full list of passing rows — these are the markets the bot would
+    # approve if Claude returned HIGH/BUY. Render up to 10 to stay
+    # within Discord's per-field char ceiling; if more clear, truncate
+    # with a "…+N more" suffix so the operator knows to run the script
+    # for the full list.
+    passing_rows = [
+        (key, r)
+        for key in ("wimbledon", "grass-other", "non-grass")
+        for r in buckets[key]
+        if r["passes"]
+    ]
+    if passing_rows:
+        lines = []
+        for key, r in passing_rows[:10]:
+            tag = {"wimbledon": "W", "grass-other": "G", "non-grass": "-"}[key]
+            ask_s = f"{r['yes_ask']}c" if r["yes_ask"] is not None else "—"
+            lines.append(f"`[{tag}] {ask_s}` {r['title'][:60]}")
+        if len(passing_rows) > 10:
+            lines.append(f"…+{len(passing_rows) - 10} more")
+        fields.append({
+            "name": f"✅ PASS list ({total_pass})",
+            "value": "\n".join(lines),
+            "inline": False,
+        })
+
+    f = data["funnel"]
+    fields.append({
+        "name": "🪟 Funnel",
+        "value": (
+            f"fetched={f['fetched']} | no-ask={f['no_ask']} | "
+            f"priced={f['priced']}"
+        ),
+        "inline": False,
+    })
+    color = 0x2ECC71 if total_pass > 0 else 0x95A5A6
+    return {
+        "title": f"🎾 Wimbledon Scout — {total} markets, {total_pass} PASS",
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"PassivePoly Kalshi Wimbledon Scout  •  {now_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _do_wimbledon_scout_report() -> None:
+    """Run the scout. Bail silently if today is before
+    WIMBLEDON_SCOUT_START_DATE (warmup-tournament noise window) or if
+    zero markets PASSED — the channel only wants signal, not "0/N
+    today" daily noise."""
+    today = datetime.now(timezone.utc).date()
+    try:
+        start = datetime.fromisoformat(WIMBLEDON_SCOUT_START_DATE).date()
+    except ValueError as e:
+        print(
+            f"[wimbledon_scout] bad start date "
+            f"{WIMBLEDON_SCOUT_START_DATE!r}: {e} — skipping",
+            flush=True,
+        )
+        return
+    if today < start:
+        print(
+            f"[wimbledon_scout] today={today.isoformat()} < "
+            f"start={start.isoformat()}; no Discord post (window not open)",
+            flush=True,
+        )
+        return
+    # Import lazily so a syntax error in scout_wimbledon.py can't break
+    # the rest of the winrate agent at startup. scripts/ isn't on the
+    # default path so push it on now (cheap; idempotent).
+    scripts_dir = Path(__file__).resolve().parent / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    try:
+        from scout_wimbledon import scout
+    except Exception as e:
+        print(
+            f"[wimbledon_scout] scout import failed: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+        return
+    stats_path = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
+    try:
+        data = scout(stats_path, tour="both")
+    except SystemExit as e:
+        # scout() calls sys.exit() on stats_cache load failure; convert
+        # to a log so the watchdog loop survives.
+        print(
+            f"[wimbledon_scout] scout aborted (exit {e.code}); skipping",
+            flush=True,
+        )
+        return
+    except Exception as e:
+        print(
+            f"[wimbledon_scout] scout crashed: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return
+    print(
+        f"[wimbledon_scout] total={data['total']} pass={data['total_pass']} "
+        f"wimbledon={len(data['buckets']['wimbledon'])} "
+        f"grass-other={len(data['buckets']['grass-other'])} "
+        f"non-grass={len(data['buckets']['non-grass'])}",
+        flush=True,
+    )
+    if data["total_pass"] < 1:
+        print(
+            "[wimbledon_scout] 0 passes — no Discord post (signal-only)",
+            flush=True,
+        )
+        return
+    send_discord(_build_wimbledon_scout_embed(data))
+
+
+def _run_wimbledon_scout_loop() -> None:
+    print(
+        f"[wimbledon_scout] watchdog armed — fires daily at "
+        f"{WIMBLEDON_SCOUT_HOUR:02d}:00 UTC from "
+        f"{WIMBLEDON_SCOUT_START_DATE} onwards",
+        flush=True,
+    )
+    while True:
+        wait_s = _seconds_until_next_hour(WIMBLEDON_SCOUT_HOUR)
+        print(
+            f"[wimbledon_scout] next scout in {wait_s/3600:.1f}h",
+            flush=True,
+        )
+        time.sleep(wait_s)
+        try:
+            _do_wimbledon_scout_report()
+        except Exception as e:
+            print(
+                f"[WARN] wimbledon_scout cycle crashed: {e}",
+                flush=True,
+            )
+            time.sleep(60)
+
+
 def _do_report() -> None:
     trades = _load_trades()
     stats = _compute_stats(trades)
@@ -1376,7 +1587,9 @@ def run() -> None:
     print(
         f"Kalshi Win-Rate Agent starting — daily at {WINRATE_HOUR:02d}:00 UTC, "
         f"weekly summary Mondays at {WEEKLY_HOUR:02d}:00 UTC, "
-        f"BUY_NO watchdog daily at {BUY_NO_WATCH_HOUR:02d}:00 UTC"
+        f"BUY_NO watchdog daily at {BUY_NO_WATCH_HOUR:02d}:00 UTC, "
+        f"Wimbledon scout daily at {WIMBLEDON_SCOUT_HOUR:02d}:00 UTC "
+        f"(from {WIMBLEDON_SCOUT_START_DATE})"
     )
     # Weekly summary runs in its own daemon thread so launcher.py needs
     # no change. No catch-up on weekly — a missed Monday post is mildly
@@ -1391,6 +1604,12 @@ def run() -> None:
     # silent non-firing as well as actual fires.
     threading.Thread(
         target=_run_buy_no_watch_loop, name="kalshi-buy-no-watch", daemon=True
+    ).start()
+    # Wimbledon scout. Same daemon-thread pattern, gated by date so it
+    # produces zero traffic between deploy and the warm-up window.
+    threading.Thread(
+        target=_run_wimbledon_scout_loop, name="kalshi-wimbledon-scout",
+        daemon=True,
     ).start()
     # Catch-up fire on startup. Without this, a deploy/restart anywhere in
     # the 07:01-23:59 UTC window puts the sleep loop on tomorrow's clock
