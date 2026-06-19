@@ -182,6 +182,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json"))
 GO_LIVE_STATE_PATH = Path(os.getenv("KALSHI_GO_LIVE_STATE", "/app/data/go_live_state.json"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
+GATE_ACTIVITY_PATH = Path(os.getenv("KALSHI_GATE_ACTIVITY", "/app/data/gate_activity.json"))
 
 _DASH_SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
@@ -694,6 +695,30 @@ def _dash_recalib_status() -> dict:
     }
 
 
+def _dash_gate_activity() -> dict:
+    """Read the rolling 24h funnel snapshot kalshi_edge writes after each
+    cycle. Returns:
+      cycles_in_window (int|None — None if file missing/unreadable),
+      totals_24h (dict[str, int]),
+      updated_at (str|None).
+
+    The dashboard renders fixed rows for the named Rule-1 / BUY_NO /
+    sanity gates plus a couple of context counters; absent keys read as
+    zero. Missing file is treated as "agent hasn't completed a cycle
+    since deploy" — not an error."""
+    if not GATE_ACTIVITY_PATH.exists():
+        return {"cycles_in_window": None, "totals_24h": {}, "updated_at": None}
+    try:
+        state = json.loads(GATE_ACTIVITY_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"cycles_in_window": None, "totals_24h": {}, "updated_at": None}
+    return {
+        "cycles_in_window": state.get("cycles_in_window"),
+        "totals_24h": state.get("totals_24h") or {},
+        "updated_at": state.get("updated_at"),
+    }
+
+
 def _dash_btc_status(stats: dict) -> dict:
     """Snapshot of the macro signals that gate KXBTC trading. Returns:
       fng_value (int|None), fng_class (str), momentum_pct (float|None),
@@ -830,6 +855,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
+    gate_activity = _dash_gate_activity()
     wimbledon = _dash_wimbledon_countdown()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1187,6 +1213,59 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f"</tr>"
         )
 
+    # Gate Activity (last 24h). One row per named gate so dormant gates
+    # are visible too (0 count). cycles_in_window = None means the edge
+    # agent hasn't completed a cycle since deploy — show a hint instead.
+    _gate_rows_spec: list[tuple[str, str, str]] = [
+        ("rule1_self_enforced", "Rule 1 self-enforced",
+         "Claude cited Rule 1 in SKIP reasoning"),
+        ("rule1_violation", "Rule 1 violation (code)",
+         "Code gate caught a BUY that contradicts projection"),
+        ("edge_sanity_fail", "Edge sanity fail",
+         "Claimed edge disagrees with true_p − ask by &gt; 0.15"),
+        ("buy_no_ineligible", "BUY NO ineligible",
+         "Out of -9 cohort or wrong confidence tier"),
+        ("buy_no_projection_fail", "BUY NO projection fail",
+         "Projection > 7.5 on a -9 ticker"),
+        ("max_edge_cap", "Max edge cap",
+         "Claimed edge above 18% sanity cap (context)"),
+        ("claude_skip", "Claude SKIP (other)",
+         "Claude voted SKIP without a Rule 1 mention (context)"),
+    ]
+    if gate_activity["cycles_in_window"] is None:
+        gate_activity_html = (
+            '<div class="highlight highlight-muted">'
+            '🟡 Gate activity file not present yet — '
+            'edge agent has not completed a cycle since deploy.'
+            '</div>'
+        )
+    else:
+        gate_rows_html: list[str] = []
+        for key, label, hint in _gate_rows_spec:
+            count = int(gate_activity["totals_24h"].get(key, 0))
+            count_cls = "muted" if count == 0 else ""
+            gate_rows_html.append(
+                f"<tr>"
+                f"<td>{label}</td>"
+                f"<td class='{count_cls}'>{count}</td>"
+                f"<td class='muted'>{hint}</td>"
+                f"</tr>"
+            )
+        cyc_n = gate_activity["cycles_in_window"]
+        upd = (gate_activity["updated_at"] or "")[:19].replace("T", " ")
+        gate_activity_html = (
+            f'<p class="muted" style="margin-top:0;">'
+            f'Rolling 24h post-Claude drop counts across '
+            f'<strong>{cyc_n}</strong> cycle(s). '
+            f'Updated {upd} UTC. Dormant gates (0) stay visible so you '
+            f'can spot a regression where one stops firing.'
+            f'</p>'
+            f'<table>'
+            f'<thead><tr><th>Gate</th><th>24h count</th><th>What it catches</th></tr></thead>'
+            f'<tbody>{"".join(gate_rows_html)}</tbody>'
+            f'</table>'
+        )
+
     is_live_badge = (
         "<span style='background:#2a9d2a;color:#fff;padding:2px 8px;"
         "border-radius:4px;font-size:0.85em;'>LIVE</span>"
@@ -1291,6 +1370,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 
 <h2>Trade frequency — last 14 days</h2>
 {freq_svg}
+
+<h2>Gate activity — last 24h</h2>
+{gate_activity_html}
 
 <h2>Next expected trade</h2>
 {next_trade_html}

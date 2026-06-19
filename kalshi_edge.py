@@ -198,6 +198,14 @@ CLOSE_SOON_FOR_IN_PROGRESS = int(os.getenv("KALSHI_CLOSE_SOON_IN_PROGRESS", "720
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 SEEN_CACHE_PATH = Path(os.getenv("KALSHI_EDGE_SEEN_CACHE", "/app/data/edge_seen.json"))
 PRICE_HISTORY_PATH = Path(os.getenv("KALSHI_EDGE_PRICE_HISTORY", "/app/data/edge_price_history.json"))
+# Rolling 24h funnel snapshot for the operator dashboard. Each cycle
+# appends its post_drops counts with a timestamp; entries older than
+# GATE_ACTIVITY_WINDOW_SECS are pruned on every write and totals_24h is
+# recomputed in place so the dashboard only needs to read one file.
+GATE_ACTIVITY_PATH = Path(
+    os.getenv("KALSHI_GATE_ACTIVITY", "/app/data/gate_activity.json")
+)
+GATE_ACTIVITY_WINDOW_SECS = 24 * 3600
 
 # Line-movement guard. If a market's YES price has shifted more than this
 # many cents since we last saw it, someone with information we don't have
@@ -370,6 +378,55 @@ def _save_seen(seen: dict[str, float]) -> None:
     with tmp.open("w") as f:
         json.dump({"tickers": seen}, f)
     tmp.replace(SEEN_CACHE_PATH)
+
+
+def _update_gate_activity(
+    cycle: int, post_drops: dict[str, int]
+) -> None:
+    """Append this cycle's post_drops to /app/data/gate_activity.json,
+    prune entries older than GATE_ACTIVITY_WINDOW_SECS, and rewrite
+    totals_24h. Empty-post_drops cycles are still recorded so the
+    dashboard can compute cycles_in_window (cycles_with_drops would
+    otherwise miscount activity vs. dormancy)."""
+    now = time.time()
+    cutoff = now - GATE_ACTIVITY_WINDOW_SECS
+    state: dict[str, Any] = {"events": []}
+    if GATE_ACTIVITY_PATH.exists():
+        try:
+            with GATE_ACTIVITY_PATH.open() as f:
+                state = json.load(f) or {"events": []}
+        except (json.JSONDecodeError, OSError) as e:
+            print(
+                f"[WARN] gate_activity load failed ({e}); rebuilding",
+                flush=True,
+            )
+            state = {"events": []}
+    events = [
+        e for e in (state.get("events") or [])
+        if (e.get("ts_epoch") or 0) >= cutoff
+    ]
+    events.append({
+        "ts_epoch": now,
+        "ts": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        "cycle": cycle,
+        "drops": dict(post_drops),
+    })
+    totals: dict[str, int] = {}
+    for ev in events:
+        for k, v in (ev.get("drops") or {}).items():
+            totals[k] = totals.get(k, 0) + int(v or 0)
+    out = {
+        "updated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        "window_secs": GATE_ACTIVITY_WINDOW_SECS,
+        "cycles_in_window": len(events),
+        "totals_24h": totals,
+        "events": events,
+    }
+    GATE_ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GATE_ACTIVITY_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(out, f, separators=(",", ":"))
+    tmp.replace(GATE_ACTIVITY_PATH)
 
 
 # ─── Stats cache ────────────────────────────────────────────────────────
@@ -2295,6 +2352,17 @@ def run() -> None:
                     f"demoted={{{demoted_str}}}",
                     flush=True,
                 )
+                # Persist the post-Claude drop counts for the dashboard's
+                # Gate Activity panel. Failure here must not poison the
+                # cycle — log and continue.
+                try:
+                    _update_gate_activity(cycle, post_drops)
+                except Exception as e:
+                    print(
+                        f"[WARN] gate_activity write failed: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
         except Exception as e:
             # Print the full traceback so we can pinpoint where the cycle
             # died — bare str(e) was hiding the real cause (e.g. naive vs
