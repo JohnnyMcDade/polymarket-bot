@@ -194,6 +194,36 @@ def main() -> int:
             conf_rows.append((c, st))
     print_table("BY CONFIDENCE", conf_rows)
 
+    # Prediction accuracy (KXMLBTOTAL) — sourced from
+    # /app/data/prediction_accuracy.json which kalshi_trader writes at
+    # settlement for KXMLBTOTAL trades only. Filter by --since on
+    # settled_at so the window matches the calibration window above.
+    accuracy_path = path.parent / "prediction_accuracy.json"
+    if accuracy_path.exists():
+        try:
+            accuracy_store = json.loads(accuracy_path.read_text()) or {}
+        except (json.JSONDecodeError, OSError):
+            accuracy_store = {}
+        rows = list(accuracy_store.values())
+        if args.since:
+            rows = [
+                r for r in rows
+                if (r.get("settled_at") or "")[:10] >= args.since
+            ]
+        if rows:
+            errs = [abs(float(r["error"])) for r in rows]
+            mean_err = sum(errs) / len(errs)
+            n_over = sum(1 for r in rows if r.get("direction") == "OVER")
+            n_under = sum(1 for r in rows if r.get("direction") == "UNDER")
+            n_correct = sum(1 for r in rows if r.get("direction") == "CORRECT")
+            print(
+                f"\nPrediction accuracy (KXMLBTOTAL):\n"
+                f"  Mean error: {mean_err:.2f} runs\n"
+                f"  OVER-predictions: {n_over}\n"
+                f"  UNDER-predictions: {n_under}\n"
+                f"  Direction correct: {n_correct}/{len(rows)}"
+            )
+
     # Trend: most recent N vs preceding N
     print(f"\n=== TREND (last {args.recent_n} vs prior {args.recent_n}) ===")
     if len(settled) < args.recent_n * 2:

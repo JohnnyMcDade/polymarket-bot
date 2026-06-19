@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -69,6 +70,28 @@ DAILY_SPENT_PATH = Path(os.getenv("KALSHI_DAILY_SPENT", "/app/data/daily_spent.j
 CALIBRATION_RUNNING_PATH = Path(os.getenv(
     "KALSHI_CALIBRATION_RUNNING", "/app/data/calibration_running.json"
 ))
+# Per-ticker prediction-accuracy log. Written by _record_prediction_accuracy
+# at settlement for KXMLBTOTAL trades only — every other series's run-total
+# concept is undefined. Read by scripts/calibration_live.py.
+PREDICTION_ACCURACY_PATH = Path(os.getenv(
+    "KALSHI_PREDICTION_ACCURACY", "/app/data/prediction_accuracy.json"
+))
+# Anything within ±this of actual counts as a directionally-correct
+# projection. 1.0 run is a generous-but-defensible threshold for "the
+# model essentially got the total right"; tightening to 0.5 would push
+# almost every prediction into OVER/UNDER given run totals are integers.
+ACCURACY_TOLERANCE_RUNS = 1.0
+# Broad projection regex — matches Haiku's actual phrasings
+# ("projected", "predicted", "baseline", "expected", "estimated"). Same
+# pattern kalshi_edge.py uses for the post-Claude RULE 1 and BUY_NO
+# projection gates; kept in sync so a SKIP and an [ACCURACY] record
+# always read the same number from the same reasoning string.
+_PROJECTED_RUNS_RE = re.compile(
+    r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)"
+    r"[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
+    re.IGNORECASE,
+)
+_MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
 # Weekly drawdown circuit-breaker. Distinct from MAX_DAILY_LOSS — the
 # daily cap blocks new spend mid-day but resets fresh tomorrow. The
 # weekly limit blocks ALL trades for the rest of the week once the
@@ -654,6 +677,130 @@ def _update_calibration_running(trades: list[dict]) -> None:
         )
 
 
+def _fetch_actual_total_runs(ticker: str) -> int | None:
+    """Final combined runs (away + home) for the KXMLBTOTAL ticker's
+    game. Returns None if the ticker isn't parseable, the schedule
+    fetch fails, no game matches, or the game isn't yet final.
+
+    Ticker format: `KXMLBTOTAL-<YYMONDDHHMM><AWAY><HOME>-N`. Team
+    abbreviations are variable length (SF, KC, TB are 2-char) so we
+    enumerate every game on the date and pick the one whose
+    `away+home` concat suffixes the ticker's middle segment — the same
+    matching trick scout_buy_no.py uses."""
+    if not ticker.startswith("KXMLBTOTAL-"):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return None
+    middle = parts[1]
+    if len(middle) < 7:
+        return None
+    date_token, tail_segment = middle[:7], middle[7:]
+    try:
+        date_iso = datetime.strptime(date_token, "%y%b%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+    try:
+        r = requests.get(
+            f"{_MLB_STATSAPI}/schedule",
+            params={"sportId": 1, "date": date_iso},
+            timeout=15,
+        )
+        r.raise_for_status()
+        sched = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(
+            f"[WARN] accuracy: schedule fetch failed for {ticker} "
+            f"({date_iso}): {e}",
+            flush=True,
+        )
+        return None
+    for d in (sched or {}).get("dates", []) or []:
+        for g in d.get("games", []) or []:
+            # Final / Final-Tie / Final-Replay all imply scores are set.
+            # Anything else (Scheduled, In Progress, Postponed) is too
+            # early — caller will retry on the next settlement sweep.
+            state = (g.get("status") or {}).get("codedGameState", "")
+            if state not in ("F", "FT", "FR"):
+                continue
+            teams = g.get("teams") or {}
+            a_blob = teams.get("away") or {}
+            h_blob = teams.get("home") or {}
+            a_abbr = (a_blob.get("team") or {}).get("abbreviation", "")
+            h_abbr = (h_blob.get("team") or {}).get("abbreviation", "")
+            if not (a_abbr and h_abbr):
+                continue
+            if not tail_segment.endswith(a_abbr + h_abbr):
+                continue
+            a_score = a_blob.get("score")
+            h_score = h_blob.get("score")
+            if not isinstance(a_score, int) or not isinstance(h_score, int):
+                continue
+            return a_score + h_score
+    return None
+
+
+def _record_prediction_accuracy(entry: dict[str, Any]) -> None:
+    """For settled KXMLBTOTAL trades, extract projected_total from the
+    placement reasoning, fetch the actual game total from MLB statsapi,
+    and persist {projected, actual, error, direction, settled_at}
+    keyed by ticker in PREDICTION_ACCURACY_PATH.
+
+    direction is 'CORRECT' if |error| ≤ ACCURACY_TOLERANCE_RUNS, else
+    'OVER' (projected > actual — model overestimated runs) or 'UNDER'
+    (projected < actual). All failure modes (no projection in
+    reasoning, schedule fetch failed, no matching final game) silently
+    skip the record — this is a passive observability hook, not a
+    blocker for the settlement loop."""
+    ticker = entry.get("ticker", "")
+    if not ticker.startswith("KXMLBTOTAL"):
+        return
+    reasoning = entry.get("reasoning") or ""
+    m = _PROJECTED_RUNS_RE.search(reasoning)
+    if not m:
+        return
+    try:
+        projected = float(m.group(1))
+    except ValueError:
+        return
+    actual = _fetch_actual_total_runs(ticker)
+    if actual is None:
+        return
+    error = round(projected - actual, 2)
+    if abs(error) <= ACCURACY_TOLERANCE_RUNS:
+        direction = "CORRECT"
+    elif error > 0:
+        direction = "OVER"
+    else:
+        direction = "UNDER"
+    settled_at = entry.get("settled_at") or datetime.now(timezone.utc).isoformat()
+    record = {
+        "projected": projected,
+        "actual": actual,
+        "error": error,
+        "direction": direction,
+        "settled_at": settled_at,
+    }
+    print(
+        f"[ACCURACY] {ticker} projected={projected} actual={actual} "
+        f"error={error:+} direction={direction}",
+        flush=True,
+    )
+    try:
+        store: dict[str, dict] = {}
+        if PREDICTION_ACCURACY_PATH.exists():
+            with PREDICTION_ACCURACY_PATH.open() as f:
+                store = json.load(f) or {}
+        store[ticker] = record
+        PREDICTION_ACCURACY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PREDICTION_ACCURACY_PATH.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(store, f, indent=2)
+        tmp.replace(PREDICTION_ACCURACY_PATH)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] prediction_accuracy write failed: {e}", flush=True)
+
+
 def _check_settlements() -> None:
     with _log_lock:
         entries = _load_log()
@@ -718,6 +865,17 @@ def _check_settlements() -> None:
                 f"[BRIER] {ticker} our_prob={our_prob:.2f} outcome="
                 f"{'WON' if won else 'LOST'} brier={brier:.3f} "
                 f"conf={entry.get('confidence', '?')}",
+                flush=True,
+            )
+        # Passive accuracy tracker for KXMLBTOTAL: compare the
+        # projected_total Claude wrote in reasoning to the actual
+        # final score. Skipped silently for other series.
+        try:
+            _record_prediction_accuracy(entry)
+        except Exception as e:
+            print(
+                f"[WARN] prediction_accuracy unexpected error for "
+                f"{ticker}: {type(e).__name__}: {e}",
                 flush=True,
             )
         updated += 1
