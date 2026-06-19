@@ -61,6 +61,22 @@ CSV_HISTORY_PATH = Path(os.getenv("KALSHI_WINRATE_CSV", "/app/data/winrate_histo
 # Path mirrors kalshi_stats.STATS_CACHE_PATH default — using the env
 # var (not a direct import) so the two modules stay loosely coupled.
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
+# Prediction accuracy snapshot for the 7AM daily embed. Written by
+# kalshi_trader._record_prediction_accuracy at each KXMLBTOTAL
+# settlement. Read-only here — we never write back.
+PREDICTION_ACCURACY_PATH = Path(os.getenv(
+    "KALSHI_PREDICTION_ACCURACY", "/app/data/prediction_accuracy.json"
+))
+# Threshold for the daily "needs systematic correction" flag in the
+# accuracy embed field. Mean abs error > this AND at least
+# PREDICTION_ACCURACY_FLAG_MIN_N samples both required — small-n noise
+# would otherwise trip the flag.
+PREDICTION_ACCURACY_FLAG_MIN_ERROR = float(os.getenv(
+    "KALSHI_ACCURACY_FLAG_MIN_ERROR", "1.5"
+))
+PREDICTION_ACCURACY_FLAG_MIN_N = int(os.getenv(
+    "KALSHI_ACCURACY_FLAG_MIN_N", "15"
+))
 
 # Auto-go-live: flip PAPER_TRADING=false via Railway API when all 4 calibration
 # criteria pass on N consecutive daily reports. Disabled by default — user must
@@ -133,6 +149,61 @@ def _load_macro_snapshot() -> dict[str, Any]:
         "fng_class": fng_class,
         "momentum_pct": momentum,
         "btc_spot": btc_spot,
+    }
+
+
+def _load_prediction_accuracy_stats() -> dict[str, Any]:
+    """Aggregate every KXMLBTOTAL projection-vs-actual record from
+    /app/data/prediction_accuracy.json for the daily 7AM embed.
+
+    Returns:
+      n (int), mean_error (float|None — MAE in runs, None when n=0),
+      n_over / n_under / n_correct (int),
+      bias ('OVER'|'UNDER'|'EVEN'|None — whichever count is higher),
+      flag (bool — True when MAE > PREDICTION_ACCURACY_FLAG_MIN_ERROR
+      AND n >= PREDICTION_ACCURACY_FLAG_MIN_N; trips the "needs
+      systematic correction" warning).
+
+    No `since` filter: the bot only began writing accuracy records
+    after the 2026-06-18 deploy, so every record is post-fix by
+    construction — narrowing the window would just shrink n for no
+    benefit."""
+    empty = {
+        "n": 0, "mean_error": None, "n_over": 0, "n_under": 0,
+        "n_correct": 0, "bias": None, "flag": False,
+    }
+    if not PREDICTION_ACCURACY_PATH.exists():
+        return empty
+    try:
+        store = json.loads(PREDICTION_ACCURACY_PATH.read_text()) or {}
+    except (json.JSONDecodeError, OSError):
+        return empty
+    rows = list(store.values())
+    if not rows:
+        return empty
+    errs = [abs(float(r["error"])) for r in rows]
+    mean_err = sum(errs) / len(errs)
+    n_over = sum(1 for r in rows if r.get("direction") == "OVER")
+    n_under = sum(1 for r in rows if r.get("direction") == "UNDER")
+    n_correct = sum(1 for r in rows if r.get("direction") == "CORRECT")
+    if n_over > n_under:
+        bias = "OVER"
+    elif n_under > n_over:
+        bias = "UNDER"
+    else:
+        bias = "EVEN"
+    flag = (
+        mean_err > PREDICTION_ACCURACY_FLAG_MIN_ERROR
+        and len(rows) >= PREDICTION_ACCURACY_FLAG_MIN_N
+    )
+    return {
+        "n": len(rows),
+        "mean_error": mean_err,
+        "n_over": n_over,
+        "n_under": n_under,
+        "n_correct": n_correct,
+        "bias": bias,
+        "flag": flag,
     }
 
 
@@ -342,6 +413,37 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
             "value": f"—  ({macro.get('reason', 'unavailable')})",
             "inline": False,
         })
+
+    # Prediction accuracy (KXMLBTOTAL). Compares projected_total
+    # extracted from each settled trade's reasoning string against
+    # actual final game runs from statsapi.mlb.com. Trips a FLAG
+    # line when MAE > 1.5 runs over ≥ 15 samples — at that point a
+    # systematic +1.5 run correction to KXMLBTOTAL projections is
+    # justified by the data, not noise.
+    pa = _load_prediction_accuracy_stats()
+    if pa["n"] == 0:
+        pa_value = "—  (no accuracy records yet)"
+    else:
+        flag_str = (
+            f"\n⚠️ **FLAG**: mean error > "
+            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} runs over "
+            f"{pa['n']} samples — consider a systematic +"
+            f"{PREDICTION_ACCURACY_FLAG_MIN_ERROR:.1f} run correction "
+            f"to KXMLBTOTAL projections."
+            if pa["flag"] else ""
+        )
+        pa_value = (
+            f"Mean error: **{pa['mean_error']:.2f} runs** | "
+            f"Bias: **{pa['bias']}** "
+            f"({pa['n_over']} OVER / {pa['n_under']} UNDER)\n"
+            f"Direction correct: **{pa['n_correct']}/{pa['n']}**"
+            f"{flag_str}"
+        )
+    fields.append({
+        "name": "🎯 Prediction Accuracy (KXMLBTOTAL)",
+        "value": pa_value,
+        "inline": False,
+    })
 
     # Clickable dashboard link as the last field. The /dashboard route
     # mirrors most of this report (overall + per-series tables + last
