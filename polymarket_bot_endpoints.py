@@ -183,6 +183,9 @@ TRADES_LOG_PATH = Path(os.getenv("KALSHI_TRADES_LOG", "/app/data/trades_log.json
 GO_LIVE_STATE_PATH = Path(os.getenv("KALSHI_GO_LIVE_STATE", "/app/data/go_live_state.json"))
 STATS_CACHE_PATH = Path(os.getenv("KALSHI_STATS_CACHE", "/app/data/stats_cache.json"))
 GATE_ACTIVITY_PATH = Path(os.getenv("KALSHI_GATE_ACTIVITY", "/app/data/gate_activity.json"))
+PREDICTION_ACCURACY_PATH = Path(os.getenv(
+    "KALSHI_PREDICTION_ACCURACY", "/app/data/prediction_accuracy.json"
+))
 
 _DASH_SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
@@ -719,6 +722,64 @@ def _dash_gate_activity() -> dict:
     }
 
 
+def _dash_prediction_accuracy(since: str | None) -> dict:
+    """Aggregate KXMLBTOTAL projection-vs-actual records from
+    /app/data/prediction_accuracy.json. Honors the dashboard's
+    `since` filter (settled_at >= since), or includes everything
+    when since is None / 'all'.
+
+    Returns:
+      n (int), mean_error (float|None — None when n=0),
+      n_over (int), n_under (int), n_correct (int),
+      bias ('OVER'|'UNDER'|'EVEN'|None) — whichever count is higher,
+      EVEN on a tie, None when n=0,
+      severity ('green'|'yellow'|'red'|'none') for color coding."""
+    empty = {
+        "n": 0, "mean_error": None, "n_over": 0, "n_under": 0,
+        "n_correct": 0, "bias": None, "severity": "none",
+    }
+    if not PREDICTION_ACCURACY_PATH.exists():
+        return empty
+    try:
+        store = json.loads(PREDICTION_ACCURACY_PATH.read_text()) or {}
+    except (json.JSONDecodeError, OSError):
+        return empty
+    rows = list(store.values())
+    if since and since.lower() != "all":
+        rows = [
+            r for r in rows
+            if (r.get("settled_at") or "")[:10] >= since
+        ]
+    if not rows:
+        return empty
+    errs = [abs(float(r["error"])) for r in rows]
+    mean_err = sum(errs) / len(errs)
+    n_over = sum(1 for r in rows if r.get("direction") == "OVER")
+    n_under = sum(1 for r in rows if r.get("direction") == "UNDER")
+    n_correct = sum(1 for r in rows if r.get("direction") == "CORRECT")
+    if n_over > n_under:
+        bias = "OVER"
+    elif n_under > n_over:
+        bias = "UNDER"
+    else:
+        bias = "EVEN"
+    if mean_err > 2.0:
+        severity = "red"
+    elif mean_err >= 1.0:
+        severity = "yellow"
+    else:
+        severity = "green"
+    return {
+        "n": len(rows),
+        "mean_error": mean_err,
+        "n_over": n_over,
+        "n_under": n_under,
+        "n_correct": n_correct,
+        "bias": bias,
+        "severity": severity,
+    }
+
+
 def _dash_btc_status(stats: dict) -> dict:
     """Snapshot of the macro signals that gate KXBTC trading. Returns:
       fng_value (int|None), fng_class (str), momentum_pct (float|None),
@@ -856,6 +917,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     gate_activity = _dash_gate_activity()
+    prediction_accuracy = _dash_prediction_accuracy(
+        since if (since and since.lower() != "all") else None
+    )
     wimbledon = _dash_wimbledon_countdown()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1266,6 +1330,45 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</table>'
         )
 
+    # Prediction Accuracy (KXMLBTOTAL). Colored by mean absolute
+    # error in runs: green < 1.0 (essentially right), yellow 1.0-2.0
+    # (off but within tolerance), red > 2.0 (systematically off).
+    # Bias is whichever of OVER / UNDER has more entries (EVEN on a
+    # tie) — direction the model is most often wrong in.
+    pa = prediction_accuracy
+    if pa["n"] == 0:
+        prediction_accuracy_html = (
+            '<div class="highlight highlight-muted">'
+            '🟡 <strong>Prediction accuracy (KXMLBTOTAL):</strong> '
+            'no accuracy records yet for this window.'
+            '</div>'
+        )
+    else:
+        cls_map = {
+            "green": "highlight-green",
+            "yellow": "highlight-muted",
+            "red": "highlight-red",
+        }
+        icon_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+        cls = cls_map[pa["severity"]]
+        icon = icon_map[pa["severity"]]
+        bias_str = (
+            f"{pa['bias']} ({pa['n_over']} OVER / {pa['n_under']} UNDER)"
+            if pa["bias"] != "EVEN"
+            else f"EVEN ({pa['n_over']} OVER / {pa['n_under']} UNDER)"
+        )
+        prediction_accuracy_html = (
+            f'<div class="highlight {cls}">'
+            f'{icon} <strong>Prediction accuracy (KXMLBTOTAL):</strong>'
+            f'<ul style="margin:6px 0 0 0; padding-left:20px;">'
+            f'<li>Mean error: <strong>{pa["mean_error"]:.2f} runs</strong></li>'
+            f'<li>Bias: <strong>{bias_str}</strong></li>'
+            f'<li>Direction correct: '
+            f'<strong>{pa["n_correct"]}/{pa["n"]}</strong></li>'
+            f'</ul>'
+            f'</div>'
+        )
+
     is_live_badge = (
         "<span style='background:#2a9d2a;color:#fff;padding:2px 8px;"
         "border-radius:4px;font-size:0.85em;'>LIVE</span>"
@@ -1310,6 +1413,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
                        color: #1b4d1b; }}
   .highlight-muted {{ background: #fff8e0; border: 1px solid #f0d97a;
                        color: #6b5712; }}
+  .highlight-red {{ background: #fdecea; border: 1px solid #f5b5b0;
+                     color: #8a1c14; }}
   .side-badge {{ display: inline-block; padding: 1px 7px; border-radius: 4px;
                   font-size: 0.78em; font-weight: 600; letter-spacing: 0.03em; }}
   .side-yes {{ background: #e6f6e6; color: #1b4d1b; }}
@@ -1415,6 +1520,9 @@ both, the row is flagged red — that's a HIGH-inversion signal.
 {"".join(confidence_table_rows) or "<tr><td colspan='6' class='muted'>no settled trades yet</td></tr>"}
 </tbody>
 </table>
+
+<h2>Prediction accuracy (KXMLBTOTAL)</h2>
+{prediction_accuracy_html}
 
 <h2>Last 10 trades</h2>
 <table>
