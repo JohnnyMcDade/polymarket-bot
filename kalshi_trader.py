@@ -81,16 +81,29 @@ PREDICTION_ACCURACY_PATH = Path(os.getenv(
 # model essentially got the total right"; tightening to 0.5 would push
 # almost every prediction into OVER/UNDER given run totals are integers.
 ACCURACY_TOLERANCE_RUNS = 1.0
-# Broad projection regex — matches Haiku's actual phrasings
-# ("projected", "predicted", "baseline", "expected", "estimated"). Same
-# pattern kalshi_edge.py uses for the post-Claude RULE 1 and BUY_NO
-# projection gates; kept in sync so a SKIP and an [ACCURACY] record
-# always read the same number from the same reasoning string.
+# Two-pass projection extraction.
+#   Primary: same broad regex kalshi_edge.py uses for the post-Claude
+#   RULE 1 / BUY_NO projection gates — kept in sync so a SKIP and an
+#   [ACCURACY] record always read the same number from the same
+#   reasoning string.
+#   Fallback: a narrower "N total runs" pattern that doesn't require
+#   a projection keyword. Catches reasonings that omit "projected /
+#   predicted / etc." but still say "9.5 total runs" outright.
+# Followed by a numeric sanity floor (ACCURACY_PROJECTION_{MIN,MAX}):
+# the broad regex can latch onto unrelated numbers in the reasoning
+# (e.g. "0.3 ER/inning" returned projected=0.3 for a real backfilled
+# trade). Clamp to a plausible MLB run-total band to drop those.
 _PROJECTED_RUNS_RE = re.compile(
     r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)"
     r"[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
     re.IGNORECASE,
 )
+_TOTAL_RUNS_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*total\s*runs?",
+    re.IGNORECASE,
+)
+ACCURACY_PROJECTION_MIN = 2.0
+ACCURACY_PROJECTION_MAX = 25.0
 _MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
 # Weekly drawdown circuit-breaker. Distinct from MAX_DAILY_LOSS — the
 # daily cap blocks new spend mid-day but resets fresh tomorrow. The
@@ -766,12 +779,23 @@ def _record_prediction_accuracy(entry: dict[str, Any]) -> None:
     if not ticker.startswith("KXMLBTOTAL"):
         return
     reasoning = entry.get("reasoning") or ""
-    m = _PROJECTED_RUNS_RE.search(reasoning)
+    m = _PROJECTED_RUNS_RE.search(reasoning) or _TOTAL_RUNS_RE.search(reasoning)
     if not m:
         return
     try:
         projected = float(m.group(1))
     except ValueError:
+        return
+    if (
+        projected < ACCURACY_PROJECTION_MIN
+        or projected > ACCURACY_PROJECTION_MAX
+    ):
+        print(
+            f"[ACCURACY-SKIP] {ticker} projected={projected} "
+            f"reason='out of plausible range "
+            f"({ACCURACY_PROJECTION_MIN}-{ACCURACY_PROJECTION_MAX})'",
+            flush=True,
+        )
         return
     actual = _fetch_actual_total_runs(ticker)
     if actual is None:
