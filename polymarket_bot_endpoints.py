@@ -536,6 +536,98 @@ def _dash_next_buy_no_candidate(stats: dict) -> dict | None:
     return candidates[0]
 
 
+_SPREAD_HOME_ADV = 0.3
+_SPREAD_ERA_WEIGHT = 0.5
+_SPREAD_COHORT_LINES = (1.5, 2.5)
+_SPREAD_DELTA = 1.0
+
+
+def _dash_next_spread_candidate(stats: dict) -> dict | None:
+    """Nearest upcoming game where a HOME or AWAY KXMLBSPREAD bet would
+    pass the pilot cohort gate: line ∈ (1.5, 2.5) AND projected_margin
+    ≥ line + 1.0 in the spread-team's favor.
+
+    Uses the same predictor formula as scout_spread.py and the prompt's
+    methodology block, so this card and the bot's own gate agree on
+    which game is the next plausible spread candidate. Returns None
+    when no upcoming game qualifies."""
+    games = (stats.get("mlb", {}) or {}).get("upcoming_games", []) or []
+    team_scoring = (stats.get("mlb", {}) or {}).get("team_scoring", {}) or {}
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    candidates: list[dict] = []
+    for g in games:
+        gd = str(g.get("game_date", ""))
+        if gd < today_iso:
+            continue
+        home = g.get("home") or ""
+        away = g.get("away") or ""
+        if not home or not away:
+            continue
+        home_stats = team_scoring.get(home) or {}
+        away_stats = team_scoring.get(away) or {}
+        home_rs = home_stats.get("rs_per_game")
+        away_rs = away_stats.get("rs_per_game")
+        hp = g.get("home_pitcher") or {}
+        ap = g.get("away_pitcher") or {}
+        home_era = hp.get("rolling_era_last3") or hp.get("era")
+        away_era = ap.get("rolling_era_last3") or ap.get("era")
+        if not all(
+            isinstance(x, (int, float))
+            for x in (home_rs, away_rs, home_era, away_era)
+        ):
+            continue
+        # Home-perspective margin: + means home wins, - means away wins.
+        # Algebraically away_margin = -home_margin (the +0.3 home boost is
+        # already baked into home_margin and flips sign cleanly).
+        home_margin = (
+            float(home_rs) - float(away_rs)
+            + _SPREAD_ERA_WEIGHT * (float(away_era) - float(home_era))
+            + _SPREAD_HOME_ADV
+        )
+        away_margin = -home_margin
+        # Pick the direction with the strongest signal that also clears
+        # the δ-gate at some cohort line.
+        best: dict | None = None
+        for direction, margin, team, pitcher_self, pitcher_opp, era_self, era_opp in (
+            ("HOME", home_margin, home, hp.get("player", ""),
+             ap.get("player", ""), home_era, away_era),
+            ("AWAY", away_margin, away, ap.get("player", ""),
+             hp.get("player", ""), away_era, home_era),
+        ):
+            # Find the highest cohort line this margin clears by ≥ DELTA
+            cleared_lines = [
+                ln for ln in _SPREAD_COHORT_LINES if margin >= ln + _SPREAD_DELTA
+            ]
+            if not cleared_lines:
+                continue
+            best_line = max(cleared_lines)
+            row = {
+                "direction": direction,
+                "margin": margin,
+                "best_line": best_line,
+                "threshold": best_line + _SPREAD_DELTA,
+                "spread_team": team,
+                "spread_pitcher": pitcher_self,
+                "opp_pitcher": pitcher_opp,
+                "spread_era": float(era_self),
+                "opp_era": float(era_opp),
+            }
+            if best is None or row["margin"] > best["margin"]:
+                best = row
+        if best is None:
+            continue
+        candidates.append({
+            "date": gd,
+            "matchup": f"{away}@{home}",
+            "start_time_utc": g.get("start_time_utc", "?"),
+            **best,
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: (r["date"], r["start_time_utc"]))
+    return candidates[0]
+
+
 def _dash_t_minus_30_iso(game_date: str, start_time_utc: str) -> str | None:
     """Compute the T-30min-start eviction UTC ISO from game date + UTC
     start time (HH:MM format from the stats cache). Returns None on
@@ -914,6 +1006,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     stats_cache = _dash_load_stats_cache()
     qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
+    next_spread = _dash_next_spread_candidate(stats_cache)
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     gate_activity = _dash_gate_activity()
@@ -1075,8 +1168,50 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         next_buy_no,
         is_buy_no=True,
     )
+
+    # KXMLBSPREAD pilot card — different schema than the BUY YES/NO cards
+    # so it's rendered inline rather than going through _trade_card. Shows
+    # direction (HOME/AWAY), projected margin, the best cohort line it
+    # clears, and the two starters with their ERAs.
+    if next_spread:
+        sp = next_spread
+        sp_az = _dash_utc_to_az_str(sp["start_time_utc"])
+        sp_evict = _dash_t_minus_30_iso(sp["date"], sp["start_time_utc"]) or "—"
+        spread_card = (
+            f'<div class="trade-card trade-card-spread">'
+            f'<div class="trade-card-label">📐 Next KXMLBSPREAD candidate</div>'
+            f'<div class="trade-card-game">'
+            f'<strong>{sp["matchup"]}</strong> · {sp["date"]} · {sp_az}'
+            f'</div>'
+            f'<div class="trade-card-pitchers">'
+            f'{sp["direction"]}-spread on <strong>{sp["spread_team"]}</strong> · '
+            f'line {sp["best_line"]:.1f} · '
+            f'projected margin <strong>{sp["margin"]:+.2f}</strong> '
+            f'(threshold {sp["threshold"]:.1f})'
+            f'</div>'
+            f'<div class="trade-card-pitchers">'
+            f'{sp["spread_pitcher"][:18]} ({sp["spread_era"]:.2f}) vs '
+            f'{sp["opp_pitcher"][:18]} ({sp["opp_era"]:.2f})'
+            f'</div>'
+            f'<div class="trade-card-evict">'
+            f'Earliest re-eval: <strong>{sp_evict}</strong> '
+            f'<span class="muted">(T-30min-start eviction)</span>'
+            f'</div>'
+            f'</div>'
+        )
+    else:
+        spread_card = (
+            f'<div class="trade-card trade-card-spread">'
+            f'<div class="trade-card-label">📐 Next KXMLBSPREAD candidate</div>'
+            f'<div class="trade-card-empty">'
+            f'No upcoming game where the predictor projects '
+            f'a margin ≥ line + 1.0 in the cohort (lines 1.5 / 2.5).'
+            f'</div>'
+            f'</div>'
+        )
+
     next_trade_html = (
-        f'<div class="trade-cards">{buy_yes_card}{buy_no_card}</div>'
+        f'<div class="trade-cards">{buy_yes_card}{buy_no_card}{spread_card}</div>'
     )
 
     # Recalibration cooldown badge. Active = current Discord-level
@@ -1430,6 +1565,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
                  background: #f7f7f9; font-size: 0.92em; line-height: 1.5; }}
   .trade-card-yes {{ background: #e6f6e6; border-color: #b6e0b6; }}
   .trade-card-no {{ background: #fbe5d0; border-color: #f0c89c; }}
+  .trade-card-spread {{ background: #eaeaff; border-color: #b0b0e8; }}
   .trade-card-label {{ font-size: 0.85em; font-weight: 600;
                        color: #555; margin-bottom: 4px; }}
   .trade-card-game {{ font-size: 1.05em; margin-bottom: 4px; }}
