@@ -2397,6 +2397,15 @@ def run() -> None:
                                     )
                                 continue
                             approved += 1
+                            # Structured prediction fields propagate to the
+                            # trader so trades_log.json persists them per
+                            # entry. Lets _record_prediction_accuracy and
+                            # _record_spread_accuracy compare structured
+                            # numbers against actual outcomes without
+                            # regex'ing reasoning prose (the same fragility
+                            # we fixed for Rule 1 on 2026-06-19). Either
+                            # field can be None — only relevant for its
+                            # own series — and the receiver tolerates that.
                             if is_buy_no:
                                 payload = {
                                     "ticker": ticker,
@@ -2410,6 +2419,8 @@ def run() -> None:
                                     "confidence": pred["confidence"],
                                     "recommendation": "BUY_NO",
                                     "reasoning": pred["reasoning"],
+                                    "projected_total": pred.get("projected_total"),
+                                    "projected_margin": pred.get("projected_margin"),
                                     "side": "no",
                                     "price_for_order_cents": it["no_ask_cents"],
                                     "entities": it.get("entities") or [],
@@ -2426,6 +2437,8 @@ def run() -> None:
                                     "confidence": pred["confidence"],
                                     "recommendation": "BUY_YES",  # rename for trader's side mapping
                                     "reasoning": pred["reasoning"],
+                                    "projected_total": pred.get("projected_total"),
+                                    "projected_margin": pred.get("projected_margin"),
                                     "side": "yes",
                                     "price_for_order_cents": it["yes_ask_cents"],
                                     # Forwarded so the trader can detect

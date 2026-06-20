@@ -779,14 +779,23 @@ def _record_prediction_accuracy(entry: dict[str, Any]) -> None:
     ticker = entry.get("ticker", "")
     if not ticker.startswith("KXMLBTOTAL"):
         return
-    reasoning = entry.get("reasoning") or ""
-    m = _PROJECTED_RUNS_RE.search(reasoning) or _TOTAL_RUNS_RE.search(reasoning)
-    if not m:
-        return
-    try:
-        projected = float(m.group(1))
-    except ValueError:
-        return
+    # Structured PROJECTED_TOTAL field (added to trade record 2026-06-20)
+    # takes precedence — same source-of-truth precedent we set for the
+    # Rule 1 gate. Regex on reasoning is the fallback for legacy trades
+    # that predate the structured field.
+    projected: float | None = None
+    structured = entry.get("projected_total")
+    if isinstance(structured, (int, float)):
+        projected = float(structured)
+    else:
+        reasoning = entry.get("reasoning") or ""
+        m = _PROJECTED_RUNS_RE.search(reasoning) or _TOTAL_RUNS_RE.search(reasoning)
+        if not m:
+            return
+        try:
+            projected = float(m.group(1))
+        except ValueError:
+            return
     if (
         projected < ACCURACY_PROJECTION_MIN
         or projected > ACCURACY_PROJECTION_MAX
@@ -1167,6 +1176,12 @@ def run() -> None:
                         "edge": round(float(item.get("edge", 0)), 4),
                         "confidence": item.get("confidence", "?"),
                         "reasoning": item.get("reasoning", ""),
+                        # Structured prediction fields — None for series
+                        # that don't emit them. Used by accuracy trackers
+                        # so they don't regex `reasoning` prose to find
+                        # the projected number.
+                        "projected_total": item.get("projected_total"),
+                        "projected_margin": item.get("projected_margin"),
                         "side": side,
                         "contracts": contracts,
                         "bet_size": round(bet_size, 2),
