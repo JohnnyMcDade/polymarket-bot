@@ -38,6 +38,16 @@ GRASS_JSON = ROOT / "resources" / "grass_specialists.json"
 MIN_GRASS_MATCHES = 10
 MIN_TOTAL_MATCHES = 50
 
+# Sackmann publishes match data on a lag (~1-2 weeks post-tournament).
+# Running --refresh before Halle/Queens/Stuttgart have been published
+# wipes the local 90-player cohort with 0 players, then a `git push`
+# would deploy an empty list to production right when Wimbledon starts.
+# This date is the lower bound of "is Sackmann current enough" — the
+# tail end of the warm-up grass swing. If max match date is below it,
+# the script refuses to overwrite. Bump this each year as the grass
+# calendar shifts.
+SACKMANN_MIN_LATEST_DATE = "2026-06-15"
+
 # Players we KNOW should be on the list per scripts/validate_grass_specialists
 # — Halle/Queens scout 2026-06-14. Used purely for highlighting in the
 # diff output; doesn't influence inclusion logic.
@@ -64,6 +74,15 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="Compute diff but don't write the JSON",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help=(
+            f"Bypass the Sackmann-currency check (max match date >= "
+            f"{SACKMANN_MIN_LATEST_DATE}). Only use when you've manually "
+            f"confirmed Sackmann's data is current and the date guard "
+            f"is wrong (e.g. you've bumped the cutoff)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.refresh:
@@ -83,6 +102,39 @@ def main() -> int:
         ms = load_sackmann_matches(tour, args.years)
         print(f"  {tour}: {len(ms)} matches loaded")
         all_matches.extend(ms)
+
+    # Currency guard: Sackmann publishes on a 1-2 week lag. If the
+    # latest match in the loaded data is older than SACKMANN_MIN_LATEST_DATE,
+    # Halle/Queens (and whatever else closed inside this window) aren't
+    # in the data yet. Re-running the regen on stale data would zero
+    # out the grass-specialists cohort right before Wimbledon — exactly
+    # the failure mode we hit on 2026-06-19 before this guard existed.
+    if all_matches:
+        latest_date = max(m.date for m in all_matches)
+    else:
+        latest_date = ""
+    if not args.force and latest_date < SACKMANN_MIN_LATEST_DATE:
+        print()
+        print(f"{'='*70}")
+        print(f"⚠️  Sackmann data ends {latest_date or '(empty)'}")
+        print(
+            f"   Halle/Queens not yet published "
+            f"(need ≥ {SACKMANN_MIN_LATEST_DATE})."
+        )
+        print(
+            f"   Skipping regen to preserve existing "
+            f"{len(json.loads(GRASS_JSON.read_text()).get('players') or {}) if GRASS_JSON.exists() else 0}"
+            f" players in grass_specialists.json."
+        )
+        print(f"   Re-run when Sackmann has refreshed.")
+        print(f"   To force anyway, pass --force.")
+        print(f"{'='*70}")
+        return 0
+    if latest_date:
+        print(
+            f"  ✓ currency check: latest match {latest_date} ≥ "
+            f"{SACKMANN_MIN_LATEST_DATE}"
+        )
 
     # Tally per-player W/L overall vs grass
     rec: dict[str, dict[str, int]] = defaultdict(
