@@ -190,6 +190,10 @@ PREDICTION_ACCURACY_PATH = Path(os.getenv(
 SPREAD_ACCURACY_PATH = Path(os.getenv(
     "KALSHI_SPREAD_ACCURACY", "/app/data/spread_accuracy.json"
 ))
+# Placement date that gates pre/post Rule 1 enforcement. See
+# scripts/calibration_live.py for the matching constant; same source-of-truth
+# rationale (commit d10c78c shipped the structured PROJECTED_TOTAL gate).
+RULE1_FIX_DATE = "2026-06-19"
 
 _DASH_SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
@@ -917,37 +921,61 @@ def _dash_prediction_accuracy_by_line(
     trades: list[dict], since: str | None
 ) -> list[dict]:
     """Bucket KXMLBTOTAL prediction-accuracy records by ticker tail
-    integer. Returns one row per bucket (always 3 rows so the table
-    renders all three even when some are empty):
-      T=8.5 (tail 9), T=9.5 (tail 10), T=10.5+ (tail 11+).
+    integer × pre/post Rule 1 fix date (2026-06-19). Returns six rows
+    (3 buckets × 2 phases) in display order:
+      T=8.5 (-9) Pre, T=8.5 (-9) Post,
+      T=9.5 (-10) Pre, T=9.5 (-10) Post,
+      T=10.5+ (-11+) Pre, T=10.5+ (-11+) Post.
 
-    Each row carries n, signed mean_error, bias label, plus wins/
-    losses joined from trades_log by ticker. WR is computed downstream.
-    Surfaces whether the 2026-06-19 Rule 1 fix is concentrating losses
-    in the high-line bucket (which it's meant to suppress)."""
-    empty_rows = [
-        {"label": "T=8.5 (-9)", "n": 0, "mean_error": None,
-         "bias": None, "wins": 0, "losses": 0},
-        {"label": "T=9.5 (-10)", "n": 0, "mean_error": None,
-         "bias": None, "wins": 0, "losses": 0},
-        {"label": "T=10.5+ (-11+)", "n": 0, "mean_error": None,
-         "bias": None, "wins": 0, "losses": 0},
-    ]
+    Each row carries label, phase, n, signed mean_error, bias label,
+    wins, losses (joined from trades_log by ticker), plus a
+    'highlight' flag that's True on the Pre/-11+ row so the renderer
+    can call out the historical-loss cohort.
+
+    Phase split is on the trade's placement timestamp (trades_log
+    `timestamp`), not the accuracy record's `settled_at`. The fix
+    deployed on the 19th; pre/post a trade is determined by when it
+    was placed, not when it cleared."""
+    # Build six empty rows up front so the table always renders all
+    # phases even when buckets are empty.
+    empty: list[dict] = []
+    for label in ("T=8.5 (-9)", "T=9.5 (-10)", "T=10.5+ (-11+)"):
+        for phase in ("Pre-fix", "Post-fix"):
+            empty.append({
+                "label": label, "phase": phase, "n": 0,
+                "mean_error": None, "bias": None,
+                "wins": 0, "losses": 0,
+                "highlight": label == "T=10.5+ (-11+)" and phase == "Pre-fix",
+            })
     if not PREDICTION_ACCURACY_PATH.exists():
-        return empty_rows
+        return empty
     try:
         store = json.loads(PREDICTION_ACCURACY_PATH.read_text()) or {}
     except (json.JSONDecodeError, OSError):
-        return empty_rows
+        return empty
 
+    placed_by_ticker = {
+        t.get("ticker", ""): (t.get("timestamp") or "")[:10]
+        for t in trades
+    }
     outcomes_by_ticker = {
         t.get("ticker", ""): t.get("outcome") for t in trades
     }
-    buckets: dict[str, list[tuple[str, dict]]] = {
-        "T=8.5 (-9)": [],
-        "T=9.5 (-10)": [],
-        "T=10.5+ (-11+)": [],
-    }
+
+    def _bucket_label(n_tail: int) -> str | None:
+        if n_tail == 9:
+            return "T=8.5 (-9)"
+        if n_tail == 10:
+            return "T=9.5 (-10)"
+        if n_tail >= 11:
+            return "T=10.5+ (-11+)"
+        return None
+
+    buckets: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    for label in ("T=8.5 (-9)", "T=9.5 (-10)", "T=10.5+ (-11+)"):
+        for phase in ("Pre-fix", "Post-fix"):
+            buckets[(label, phase)] = []
+
     for ticker, rec in store.items():
         if since and since.lower() != "all":
             if (rec.get("settled_at") or "")[:10] < since:
@@ -955,44 +983,48 @@ def _dash_prediction_accuracy_by_line(
         m = re.search(r"-(\d+)$", ticker)
         if not m:
             continue
-        n_tail = int(m.group(1))
-        if n_tail == 9:
-            label = "T=8.5 (-9)"
-        elif n_tail == 10:
-            label = "T=9.5 (-10)"
-        elif n_tail >= 11:
-            label = "T=10.5+ (-11+)"
-        else:
+        label = _bucket_label(int(m.group(1)))
+        if label is None:
             continue
-        buckets[label].append((ticker, rec))
+        # Placement-date based split; fall back to settled_at only when
+        # the trade record is missing (defensive — shouldn't happen).
+        placed = placed_by_ticker.get(ticker) or (rec.get("settled_at") or "")[:10]
+        phase = "Post-fix" if placed >= RULE1_FIX_DATE else "Pre-fix"
+        buckets[(label, phase)].append((ticker, rec))
 
     out: list[dict] = []
     for label in ("T=8.5 (-9)", "T=9.5 (-10)", "T=10.5+ (-11+)"):
-        items = buckets[label]
-        if not items:
+        for phase in ("Pre-fix", "Post-fix"):
+            items = buckets[(label, phase)]
+            highlight = label == "T=10.5+ (-11+)" and phase == "Pre-fix"
+            if not items:
+                out.append({
+                    "label": label, "phase": phase, "n": 0,
+                    "mean_error": None, "bias": None,
+                    "wins": 0, "losses": 0,
+                    "highlight": highlight,
+                })
+                continue
+            errs = [float(r.get("error", 0)) for _, r in items]
+            mean_err = sum(errs) / len(errs)
+            if abs(mean_err) < 0.10:
+                bias = "neutral"
+            elif mean_err > 0:
+                bias = "OVER"
+            else:
+                bias = "UNDER"
+            wins = sum(
+                1 for t, _ in items if outcomes_by_ticker.get(t) == "won"
+            )
+            losses = sum(
+                1 for t, _ in items if outcomes_by_ticker.get(t) == "lost"
+            )
             out.append({
-                "label": label, "n": 0, "mean_error": None,
-                "bias": None, "wins": 0, "losses": 0,
+                "label": label, "phase": phase, "n": len(items),
+                "mean_error": mean_err, "bias": bias,
+                "wins": wins, "losses": losses,
+                "highlight": highlight,
             })
-            continue
-        errs = [float(r.get("error", 0)) for _, r in items]
-        mean_err = sum(errs) / len(errs)
-        if abs(mean_err) < 0.10:
-            bias = "neutral"
-        elif mean_err > 0:
-            bias = "OVER"
-        else:
-            bias = "UNDER"
-        wins = sum(
-            1 for t, _ in items if outcomes_by_ticker.get(t) == "won"
-        )
-        losses = sum(
-            1 for t, _ in items if outcomes_by_ticker.get(t) == "lost"
-        )
-        out.append({
-            "label": label, "n": len(items), "mean_error": mean_err,
-            "bias": bias, "wins": wins, "losses": losses,
-        })
     return out
 
 
@@ -1633,15 +1665,19 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</div>'
         )
 
-    # By-line breakdown — surfaces whether high-line buckets (T=10.5+)
-    # are being suppressed by the post-2026-06-19 Rule 1 fix. If the
-    # fix is working, the -11+ bucket count should trend toward 0 over
-    # time and only the -9 / -10 buckets should accumulate new entries.
+    # By-line breakdown × pre/post Rule 1 fix date. Six rows total —
+    # three line buckets × two phases. The Pre/-11+ row is highlighted
+    # to call out the historical-loss cohort the fix was built to
+    # suppress. If Rule 1 is doing its job, Post-fix rows in -11+
+    # should stay empty as new trades accumulate.
     pa_line_rows = []
     for b in prediction_accuracy_by_line:
+        row_cls = " class='conf-inverted'" if b.get("highlight") else ""
         if b["n"] == 0:
             pa_line_rows.append(
-                f"<tr><td>{b['label']}</td>"
+                f"<tr{row_cls}>"
+                f"<td>{b['label']}</td>"
+                f"<td>{b['phase']}</td>"
                 f"<td class='muted'>0</td>"
                 f"<td class='muted'>—</td>"
                 f"<td class='muted'>—</td>"
@@ -1661,7 +1697,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             else ""
         )
         pa_line_rows.append(
-            f"<tr><td>{b['label']}</td>"
+            f"<tr{row_cls}>"
+            f"<td>{b['label']}</td>"
+            f"<td>{b['phase']}</td>"
             f"<td>{b['n']}</td>"
             f"<td>{err_str}</td>"
             f"<td class='{wr_cls}'>{wr_str}</td>"
@@ -1671,6 +1709,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         '<table>'
         '<thead><tr>'
         '<th>Line bucket</th>'
+        '<th>Phase</th>'
         '<th>n (accuracy)</th>'
         '<th>Mean error (signed)</th>'
         '<th>WR</th>'
@@ -1888,12 +1927,13 @@ both, the row is flagged red — that's a HIGH-inversion signal.
 <h2>Prediction accuracy (KXMLBTOTAL)</h2>
 {prediction_accuracy_html}
 <p class="muted" style="margin-top:0;">
-By-line breakdown — tracks whether the 2026-06-19 Rule 1 fix is
-suppressing the high-line bucket (<code>-11+</code>) it was built to catch.
-Mean error is signed (+ = OVER-projected; − = UNDER-projected). WR is
-joined from <code>trades_log.json</code> by ticker; <code>n (settled)</code>
-may be lower than <code>n (accuracy)</code> when an accuracy record exists
-without a settled trade outcome.
+By-line breakdown × Rule 1 fix date ({RULE1_FIX_DATE}). Each line bucket
+is split into <strong>Pre-fix</strong> (trades placed before the structured
+PROJECTED_TOTAL gate shipped) and <strong>Post-fix</strong> (placed on or
+after). Mean error is signed (+ = OVER-projected; − = UNDER-projected). WR
+is joined from <code>trades_log.json</code> by ticker. The highlighted row
+is the historical -11+ Pre-fix cohort the gate was built to suppress —
+its Post-fix counterpart should stay near zero if Rule 1 is doing its job.
 </p>
 {prediction_accuracy_by_line_html}
 

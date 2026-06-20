@@ -34,6 +34,15 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The 2026-06-19 commit (d10c78c) replaced the regex-on-reasoning Rule 1
+# enforcement with a structured PROJECTED_TOTAL field + code gate. Trades
+# placed BEFORE this date used the old (porous) path; trades placed on
+# or after used the hardened one. The by-line breakdown splits on the
+# trade's `timestamp` (placement time) to answer "is Rule 1 actually
+# preventing the -11+ losses it was built to prevent?" — a question
+# that 'mean accuracy over the whole window' obscures.
+RULE1_FIX_DATE = "2026-06-19"
+
 
 SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
@@ -225,19 +234,41 @@ def main() -> int:
                 f"  Direction correct: {n_correct}/{len(rows)}"
             )
 
-            # By-line breakdown: bucket records by ticker tail (line N).
-            # Three buckets — tail 9 (T=8.5), tail 10 (T=9.5), tail 11+
-            # (T=10.5+ pooled — historically the "value tail" losses Rule 1
-            # is meant to suppress). Looks up bet outcome from trades_log
-            # since the accuracy file doesn't carry bet_won today. Tails
-            # below 9 are out-of-cohort and skipped.
-            by_line: dict[str, list[tuple[str, dict]]] = {
-                "T=8.5 (-9)": [],
-                "T=9.5 (-10)": [],
-                "T=10.5+ (-11+)": [],
+            # By-line breakdown split pre/post Rule 1 fix date. Bucket
+            # records by ticker tail (line N), then within each bucket
+            # split by trade placement date vs RULE1_FIX_DATE. Trades
+            # placed before the fix used the regex path; trades on or
+            # after used the structured-field gate. If Rule 1 is doing
+            # its job, the -11+ post-fix sub-row should stay empty
+            # while pre-fix shows the historical losses.
+            #
+            # Placement timestamp comes from trades_log (the accuracy
+            # file only carries settled_at). Falls back to settled_at
+            # for any accuracy record whose ticker isn't in trades_log,
+            # which is a defensive case — shouldn't happen in practice.
+            placed_by_ticker = {
+                t.get("ticker", ""): (t.get("timestamp") or "")[:10]
+                for t in trades
             }
             outcomes_by_ticker = {
                 t.get("ticker", ""): t.get("outcome") for t in trades
+            }
+
+            def _bucket_label(n_tail: int) -> str | None:
+                if n_tail == 9:
+                    return "T=8.5 (-9)"
+                if n_tail == 10:
+                    return "T=9.5 (-10)"
+                if n_tail >= 11:
+                    return "T=10.5+ (-11+)"
+                return None
+
+            # Each bucket: {"pre": [...], "post": [...]} where each
+            # entry is (ticker, rec).
+            by_line: dict[str, dict[str, list]] = {
+                "T=8.5 (-9)": {"pre": [], "post": []},
+                "T=9.5 (-10)": {"pre": [], "post": []},
+                "T=10.5+ (-11+)": {"pre": [], "post": []},
             }
             for ticker, rec in accuracy_store.items():
                 if args.since and (rec.get("settled_at") or "")[:10] < args.since:
@@ -245,22 +276,16 @@ def main() -> int:
                 m_tail = re.search(r"-(\d+)$", ticker)
                 if not m_tail:
                     continue
-                n_tail = int(m_tail.group(1))
-                if n_tail == 9:
-                    label = "T=8.5 (-9)"
-                elif n_tail == 10:
-                    label = "T=9.5 (-10)"
-                elif n_tail >= 11:
-                    label = "T=10.5+ (-11+)"
-                else:
+                label = _bucket_label(int(m_tail.group(1)))
+                if label is None:
                     continue
-                by_line[label].append((ticker, rec))
+                placed = placed_by_ticker.get(ticker) or (rec.get("settled_at") or "")[:10]
+                phase = "post" if placed >= RULE1_FIX_DATE else "pre"
+                by_line[label][phase].append((ticker, rec))
 
-            print("\nPrediction accuracy by line (KXMLBTOTAL):")
-            for label, items in by_line.items():
+            def _format_phase(items: list) -> str:
                 if not items:
-                    print(f"  {label}: n=0  (no settled trades in window)")
-                    continue
+                    return "n=0"
                 errs_signed = [float(r.get("error", 0)) for _, r in items]
                 mean_signed = sum(errs_signed) / len(errs_signed)
                 if abs(mean_signed) < 0.10:
@@ -282,10 +307,19 @@ def main() -> int:
                     f"{wins}W/{losses}L ({wins/n_settled:.0%} WR)"
                     if n_settled else "no outcomes yet"
                 )
-                print(
-                    f"  {label}: n={len(items)} "
-                    f"mean error {mean_signed:+.2f} ({bias}) — {wr_str}"
+                return (
+                    f"n={len(items)} mean error {mean_signed:+.2f} ({bias})"
+                    f" — {wr_str}"
                 )
+
+            print(
+                "\nPrediction accuracy by line (KXMLBTOTAL) — "
+                f"split on Rule 1 fix date {RULE1_FIX_DATE}:"
+            )
+            for label, phases in by_line.items():
+                print(f"  {label}:")
+                print(f"    Pre-fix:  {_format_phase(phases['pre'])}")
+                print(f"    Post-fix: {_format_phase(phases['post'])}")
 
     # Prediction accuracy (KXMLBSPREAD) — sourced from
     # /app/data/spread_accuracy.json. Same --since gating as above.
