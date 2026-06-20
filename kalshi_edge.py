@@ -891,6 +891,7 @@ TRUE_PROBABILITY: <float 0.0-1.0>
 EDGE: <float -1.0-1.0>
 CONFIDENCE: <LOW|MEDIUM|HIGH>
 PROJECTED_TOTAL: <float — REQUIRED for KXMLBTOTAL only; omit line entirely for other series>
+PROJECTED_MARGIN: <float — REQUIRED for KXMLBSPREAD only; signed (positive = spread-team wins); omit line for other series>
 RECOMMENDATION: <BUY|BUY_NO|SKIP>   (BUY = BUY_YES; BUY_NO only on the narrow KXMLBTOTAL cohort below)
 REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
@@ -899,6 +900,11 @@ PROJECTED_TOTAL FIELD (KXMLBTOTAL only)
 - For every KXMLBTOTAL market, emit your best single-number estimate of combined total runs (both teams) on the PROJECTED_TOTAL line — e.g. `PROJECTED_TOTAL: 8.7`. Not a range, not a hedge.
 - The code-level Rule 1 gate and BUY_NO projection gate read this field directly. Forgetting it OR emitting it in a non-numeric form (e.g. `PROJECTED_TOTAL: ~8-9`, `PROJECTED_TOTAL: high`) disables both gates for that ticker — Claude's projection-vs-threshold contradiction will not be blocked, and a losing BUY YES like "projected 8.8 runs, bought YES on -16" will go through. Always emit a single decimal.
 - For non-KXMLBTOTAL series, omit the PROJECTED_TOTAL line entirely.
+
+PROJECTED_MARGIN FIELD (KXMLBSPREAD only)
+- For every KXMLBSPREAD market, emit a signed decimal estimate of how many runs the SPREAD-TEAM (named in the ticker tail) will win by — positive if you project them to win, negative if they lose. e.g. `PROJECTED_MARGIN: +1.8` or `PROJECTED_MARGIN: -0.7`. Single decimal, not a range.
+- The code-level δ-gate reads this field directly. Forgetting it OR emitting it in a non-numeric form disables the gate for that ticker. Always emit a signed decimal.
+- For non-KXMLBSPREAD series, omit the PROJECTED_MARGIN line entirely.
 
 EDGE SANITY CAP (GLOBAL OVERRIDE — APPLIES TO EVERY MARKET)
 - Real edge on liquid Kalshi markets almost never exceeds 18%. If you computed an edge of +0.18 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
@@ -1003,6 +1009,17 @@ KXMLBTOTAL BUY_NO ELIGIBILITY (NEW 2026-06-17 narrow rollout; tightened 2026-06-
     - Example C (negative — SKIP, pitching gate fails): Both starters' season ERA = 4.50 and 4.80 (BOTH > 3.50 → bad pitching). PITCHING CONDITION fails — bad pitching favors OVER, not UNDER, and the cohort's backtest lift only holds for decent-pitching matchups. → RECOMMENDATION: SKIP regardless of computed edge.
     - Example D (negative — SKIP, -10 no longer in cohort): Both starters' season ERA = 2.80 (both < 3.50 ✓). Projected total = 8.0 runs. Ticker `-10` (line T=9.5). The -10 carveout was removed 2026-06-18 — no Wilson-stable UNDER edge at T=9.5 in the 180d backtest. → RECOMMENDATION: SKIP regardless of computed edge. (BUY YES on -10 is still allowed via the normal RECOMMENDATION RULES if your projection ≥ 9.0 and the edge tier clears.)
 - Backtest grounding: 180d strict cohort backtest (both starters' rolling_era_last3 < 3.50, n=153 games) shows exactly one Wilson-stable cell: T=8.5 (-9 ticker) at projection margin δ ≥ 1.00 (projected ≤ 7.5) — n=25, wr=80%, wlo=60.9% vs always-UNDER baseline 56.9%, lift +23pp. Every other (T, δ) cell in the strict cohort fails the wlo > baseline test. T=9.5 has no stable cell at any margin. The eligibility rule above is the single data-stable cell — narrow on purpose.
+
+KXMLBSPREAD RUN-LINE METHODOLOGY (NEW 2026-06-20 pilot rollout)
+- KXMLBSPREAD tickers resolve YES if a specific team wins by ≥N runs. Ticker tail format: `<TEAM_ABBR><N>` (e.g. `KXMLBSPREAD-26JUN082205MILATH-MIL2` = "Will MIL win by 2+?"). The implied betting line is `N - 0.5` (so ticker tail ending in `2` = line 1.5; tail ending in `3` = line 2.5). The matchup stem before the team tail is `<AWAY><HOME>` (so `MILATH` = MIL@ATH; MIL is away, ATH is home).
+- COHORT GATE — BUY (YES) is allowed ONLY on tickers where the implied line is 1.5 or 2.5 — i.e. ticker tail ending in `2` or `3`. Tail `1` (line 0.5, "any win") and tail `4+` (line 3.5+) are out-of-cohort. 180d backtest (n=759) shows Wilson-stable signal at lines 1.5 and 2.5 with δ ≥ 1.0 in both HOME and AWAY directions; lines outside this band are either statistically marginal or one-sided. Out-of-cohort BUY recommendations are dropped to SKIP post-Claude.
+- PROJECTED_MARGIN — required output field. Estimate from the SPREAD-TEAM's perspective: positive if the team named in the ticker tail is projected to win, negative if they lose. Compute as: `spread_team_rs_per_game - opp_team_rs_per_game + 0.5 × (opp_starter_rolling_era_last3 - spread_team_starter_rolling_era_last3) + (+0.3 if spread-team is home else -0.3)`. Use the matchup ordering (away then home in the ticker stem) to determine home/away.
+- δ ≥ 1.0 GATE — emit BUY only when PROJECTED_MARGIN ≥ (line + 1.0) in the spread-team's favor. For line=1.5 (ticker tail `2`) BUY only if projected ≥ 2.5; for line=2.5 (ticker tail `3`) BUY only if projected ≥ 3.5. Below this threshold the 180d signal compressed to noise; the 60d window already shows the edge eroding. The code gate enforces this — projections that fail it force SKIP regardless of computed edge.
+- CONFIDENCE CAP — MEDIUM maximum during this pilot rollout. HIGH BUY recommendations are downgraded to MEDIUM post-Claude. Same precedent as the KXMLBTOTAL BUY_NO rollout.
+- BOTH DIRECTIONS allowed — the 180d backtest showed signal on both home-favorite and away-favorite spread bets at line=1.5 / δ=1.0. Pick the spread-team your projection favors; do not infer market expectations from the price.
+- NO ERA cohort filter — the proposed "both starters avg ERA ≤ 3.00" cohort had insufficient sample (only 10 of 206 cohort games fired a bet in the 180d backtest, vs 98 in the unfiltered cohort at the same cell). Use the full predictor on every KXMLBSPREAD ticker that passes the line cohort.
+- EDGE THRESHOLD — same MEDIUM_MIN_EDGE as KXMLBTOTAL applies; the +0.18 EDGE SANITY CAP applies globally.
+- WORKED EXAMPLE: ticker `KXMLBSPREAD-26JUN201610MILATL-MIL2`. Matchup stem `MILATL` → MIL@ATL → ATL is home, MIL is away. Spread-team = MIL (the team in the tail). Suppose MIL 5.0 rs/g, ATL 4.5 rs/g, MIL starter rolling_era_last3 = 1.34, ATL starter = 2.90. Compute: 5.0 - 4.5 + 0.5×(2.90 - 1.34) + (-0.3 because MIL is away) = 0.5 + 0.78 - 0.3 = +0.98. PROJECTED_MARGIN: +0.98. Line=1.5, δ-gate threshold = 2.5. 0.98 < 2.5 → fails the δ-gate. → RECOMMENDATION: SKIP regardless of computed edge.
 
 CRITICAL RULES
 - Echo TICKER exactly so we can match outputs to inputs.
@@ -1611,6 +1628,13 @@ def _parse_response(text: str) -> dict[str, dict[str, Any]]:
                 projected_total = float(proj_raw)
             except ValueError:
                 projected_total = None
+        projected_margin: float | None = None
+        margin_raw = fields.get("PROJECTED_MARGIN")
+        if margin_raw:
+            try:
+                projected_margin = float(margin_raw)
+            except ValueError:
+                projected_margin = None
         out[ticker] = {
             "true_probability": true_prob,
             "edge": edge,
@@ -1618,6 +1642,7 @@ def _parse_response(text: str) -> dict[str, dict[str, Any]]:
             "recommendation": fields.get("RECOMMENDATION", "SKIP").upper(),
             "reasoning": fields.get("REASONING", ""),
             "projected_total": projected_total,
+            "projected_margin": projected_margin,
         }
     return out
 
@@ -2256,6 +2281,76 @@ def run() -> None:
                                         )
                                         pred["recommendation"] = "SKIP"
                                         rec = "SKIP"
+
+                            # KXMLBSPREAD pilot rollout (2026-06-20) —
+                            # restrict to the line ∈ (1.5, 2.5) cohort and
+                            # require PROJECTED_MARGIN ≥ line + 1.0 in the
+                            # spread-team's favor. Both restrictions are
+                            # documented in the KXMLBSPREAD methodology
+                            # section of the prompt; this is the code-side
+                            # backstop so Claude can't bypass either. Same
+                            # structured-field-first / regex-fallback
+                            # pattern as the KXMLBTOTAL Rule 1 gate.
+                            if rec == "BUY" and ticker.startswith("KXMLBSPREAD"):
+                                m_spread = re.search(r"-[A-Z]+(\d+)$", ticker)
+                                spread_n = (
+                                    int(m_spread.group(1)) if m_spread else None
+                                )
+                                spread_line = (
+                                    spread_n - 0.5 if spread_n is not None else None
+                                )
+                                if spread_line not in (1.5, 2.5):
+                                    post_drops["spread_line_out_of_cohort"] = (
+                                        post_drops.get("spread_line_out_of_cohort", 0) + 1
+                                    )
+                                    print(
+                                        f"[SPREAD-LINE-RESTRICT] {ticker} "
+                                        f"N={spread_n} line={spread_line} not in "
+                                        f"(1.5, 2.5) — forced SKIP",
+                                        flush=True,
+                                    )
+                                    pred["recommendation"] = "SKIP"
+                                    rec = "SKIP"
+                                else:
+                                    margin = pred.get("projected_margin")
+                                    if margin is None:
+                                        m_margin = re.search(
+                                            r"projected[_ ]?margin[^\d.+-]{0,40}([+-]?\d+(?:\.\d+)?)",
+                                            pred.get("reasoning", "") or "",
+                                            re.IGNORECASE,
+                                        )
+                                        if m_margin:
+                                            margin = float(m_margin.group(1))
+                                    threshold = spread_line + 1.0
+                                    if margin is not None and margin < threshold:
+                                        post_drops["spread_margin_fail"] = (
+                                            post_drops.get("spread_margin_fail", 0) + 1
+                                        )
+                                        print(
+                                            f"[SPREAD-MARGIN-FAIL] {ticker} "
+                                            f"projected_margin={margin} line={spread_line} "
+                                            f"threshold={threshold} forced SKIP",
+                                            flush=True,
+                                        )
+                                        pred["recommendation"] = "SKIP"
+                                        rec = "SKIP"
+
+                            # KXMLBSPREAD confidence cap — MEDIUM max during
+                            # pilot. Downgrade rather than SKIP so the bet
+                            # still fires (smaller Kelly size) when Claude
+                            # is confident but the rollout phase wants
+                            # de-risked exposure.
+                            if (
+                                rec == "BUY"
+                                and ticker.startswith("KXMLBSPREAD")
+                                and pred.get("confidence") == "HIGH"
+                            ):
+                                print(
+                                    f"[SPREAD-CONF-CAP] {ticker} HIGH → MEDIUM "
+                                    f"(pilot rollout)",
+                                    flush=True,
+                                )
+                                pred["confidence"] = "MEDIUM"
 
                             is_buy_yes = rec == "BUY"
                             is_buy_no = rec == "BUY_NO"
