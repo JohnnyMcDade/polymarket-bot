@@ -640,6 +640,41 @@ def _dash_next_spread_candidate(stats: dict) -> dict | None:
     return candidates[0]
 
 
+def _dash_kxmlbtotal_streak(trades: list[dict]) -> dict[str, Any]:
+    """Walk settled KXMLBTOTAL trades backward from the most recent to
+    find the current consecutive same-outcome streak. Returns
+    {direction: 'win'|'loss'|None, count: int, since_iso: str|None}.
+
+    'win' = the latest streak is wins; 'loss' = the latest streak is
+    losses; None when no settled KXMLBTOTAL trades exist. The
+    `since_iso` field is the timestamp of the trade that *started*
+    the streak — useful for surfacing "started ~2 days ago" context."""
+    settled = [
+        t for t in trades
+        if (t.get("ticker") or "").startswith("KXMLBTOTAL")
+        and t.get("outcome") in ("won", "lost")
+    ]
+    if not settled:
+        return {"direction": None, "count": 0, "since_iso": None}
+    settled.sort(key=lambda t: t.get("timestamp") or "")
+    latest = settled[-1]
+    streak_outcome = latest.get("outcome")
+    count = 0
+    streak_start = latest
+    for t in reversed(settled):
+        if t.get("outcome") == streak_outcome:
+            count += 1
+            streak_start = t
+        else:
+            break
+    direction = "win" if streak_outcome == "won" else "loss"
+    return {
+        "direction": direction,
+        "count": count,
+        "since_iso": streak_start.get("timestamp"),
+    }
+
+
 def _dash_spread_breakdown() -> dict[str, dict[str, int]]:
     """Read /app/data/spread_accuracy.json and aggregate settled
     KXMLBSPREAD pilot trades into direction (HOME/AWAY) and line
@@ -1168,6 +1203,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     next_spread = _dash_next_spread_candidate(stats_cache)
     spread_breakdown = _dash_spread_breakdown()
+    streak = _dash_kxmlbtotal_streak(all_trades)
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     gate_activity = _dash_gate_activity()
@@ -1874,6 +1910,16 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
   <div class="card">
     <span class="label">Go-live criteria</span>
     <span class="value">{gl['passes']} / {gl['total']}</span>
+  </div>
+  <div class="card">
+    <span class="label">KXMLBTOTAL streak</span>
+    <span class="value{' pos' if streak['direction']=='win' else ' neg' if streak['direction']=='loss' else ''}">{
+      f"🔥 {streak['count']}-game win streak"
+      if streak['direction']=='win'
+      else (f"❄️ {streak['count']}-game losing streak"
+            if streak['direction']=='loss'
+            else '—')
+    }</span>
   </div>
 </div>
 
