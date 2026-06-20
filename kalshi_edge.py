@@ -890,9 +890,15 @@ TICKER: <ticker echoed from input>
 TRUE_PROBABILITY: <float 0.0-1.0>
 EDGE: <float -1.0-1.0>
 CONFIDENCE: <LOW|MEDIUM|HIGH>
+PROJECTED_TOTAL: <float — REQUIRED for KXMLBTOTAL only; omit line entirely for other series>
 RECOMMENDATION: <BUY|BUY_NO|SKIP>   (BUY = BUY_YES; BUY_NO only on the narrow KXMLBTOTAL cohort below)
 REASONING: <one sentence pointing at the specific stat that drove the call>
 ---
+
+PROJECTED_TOTAL FIELD (KXMLBTOTAL only)
+- For every KXMLBTOTAL market, emit your best single-number estimate of combined total runs (both teams) on the PROJECTED_TOTAL line — e.g. `PROJECTED_TOTAL: 8.7`. Not a range, not a hedge.
+- The code-level Rule 1 gate and BUY_NO projection gate read this field directly. Forgetting it OR emitting it in a non-numeric form (e.g. `PROJECTED_TOTAL: ~8-9`, `PROJECTED_TOTAL: high`) disables both gates for that ticker — Claude's projection-vs-threshold contradiction will not be blocked, and a losing BUY YES like "projected 8.8 runs, bought YES on -16" will go through. Always emit a single decimal.
+- For non-KXMLBTOTAL series, omit the PROJECTED_TOTAL line entirely.
 
 EDGE SANITY CAP (GLOBAL OVERRIDE — APPLIES TO EVERY MARKET)
 - Real edge on liquid Kalshi markets almost never exceeds 18%. If you computed an edge of +0.18 or higher, you are almost certainly misreading the market — wrong bucket, in-progress game whose live state you cannot see, resolution criteria you misunderstood, or a stale stat masquerading as current.
@@ -1598,12 +1604,20 @@ def _parse_response(text: str) -> dict[str, dict[str, Any]]:
         if not (0 <= true_prob <= 1) or not (-1 <= edge <= 1):
             print(f"[WARN] edge: out-of-range for {ticker}: prob={true_prob} edge={edge}", flush=True)
             continue
+        projected_total: float | None = None
+        proj_raw = fields.get("PROJECTED_TOTAL")
+        if proj_raw:
+            try:
+                projected_total = float(proj_raw)
+            except ValueError:
+                projected_total = None
         out[ticker] = {
             "true_probability": true_prob,
             "edge": edge,
             "confidence": fields.get("CONFIDENCE", "LOW").upper(),
             "recommendation": fields.get("RECOMMENDATION", "SKIP").upper(),
             "reasoning": fields.get("REASONING", ""),
+            "projected_total": projected_total,
         }
     return out
 
@@ -2169,38 +2183,48 @@ def run() -> None:
                             # BUY_NO projection gate — the 180d data-stable
                             # cell on -9 sits at projected ≤ 7.5 (δ ≥ 1.00
                             # from the T=8.5 line). Looser margins (7.6–8.4)
-                            # lost to the always-UNDER baseline. Mirrors the
-                            # Rule 1 gate for BUY YES: parse projection from
-                            # reasoning; if unparseable, let it through.
+                            # lost to the always-UNDER baseline. Read the
+                            # structured PROJECTED_TOTAL field that the
+                            # prompt now requires; fall back to a regex on
+                            # REASONING for the rare case Claude omits the
+                            # field. If neither yields a number, let
+                            # through — conservative.
                             if rec == "BUY_NO" and ticker.startswith("KXMLBTOTAL"):
-                                proj_match_no = re.search(
-                                    r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
-                                    pred.get("reasoning", "") or "",
-                                    re.IGNORECASE,
-                                )
-                                if proj_match_no:
-                                    proj_no = float(proj_match_no.group(1))
-                                    if proj_no > 7.5:
-                                        post_drops["buy_no_projection_fail"] = (
-                                            post_drops.get("buy_no_projection_fail", 0) + 1
-                                        )
-                                        print(
-                                            f"[BUY-NO-PROJECTION-FAIL] {ticker} "
-                                            f"projected={proj_no} threshold=7.5 "
-                                            f"forced SKIP",
-                                            flush=True,
-                                        )
-                                        pred["recommendation"] = "SKIP"
-                                        rec = "SKIP"
+                                proj_no = pred.get("projected_total")
+                                if proj_no is None:
+                                    proj_match_no = re.search(
+                                        r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
+                                        pred.get("reasoning", "") or "",
+                                        re.IGNORECASE,
+                                    )
+                                    if proj_match_no:
+                                        proj_no = float(proj_match_no.group(1))
+                                if proj_no is not None and proj_no > 7.5:
+                                    post_drops["buy_no_projection_fail"] = (
+                                        post_drops.get("buy_no_projection_fail", 0) + 1
+                                    )
+                                    print(
+                                        f"[BUY-NO-PROJECTION-FAIL] {ticker} "
+                                        f"projected={proj_no} threshold=7.5 "
+                                        f"forced SKIP",
+                                        flush=True,
+                                    )
+                                    pred["recommendation"] = "SKIP"
+                                    rec = "SKIP"
 
                             # Rule 1 enforcement (post-Claude) — UNDER-LEAN
                             # ROUTING per the prompt: for any KXMLBTOTAL `-N`,
                             # projected_total < (N - 0.5) ⇒ SKIP regardless of
                             # computed edge. Haiku was observed violating this
-                            # (e.g. -16 BUY YES with projected 8.8 runs), so
-                            # enforce in code too. Parse N from the tail and
-                            # the projection from reasoning; if no projection
-                            # is parseable, let it through — conservative.
+                            # (e.g. -16 BUY YES with projected 8.8 runs). The
+                            # prior REASONING-regex caught the obvious cases
+                            # but missed phrasings without the literal "runs"
+                            # suffix; CWSNYY 6/18 (projected 8.8 vs -16, $5
+                            # loss) slipped through that way. Now reads the
+                            # structured PROJECTED_TOTAL field first and
+                            # falls back to the regex only when the field is
+                            # absent — the prompt requires the field on
+                            # every KXMLBTOTAL response.
                             if rec == "BUY" and ticker.startswith("KXMLBTOTAL"):
                                 tail_r1 = (
                                     ticker.rsplit("-", 1)[-1]
@@ -2210,13 +2234,16 @@ def run() -> None:
                                     line_n = int(tail_r1)
                                 except ValueError:
                                     line_n = None
-                                proj_match = re.search(
-                                    r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
-                                    pred.get("reasoning", "") or "",
-                                    re.IGNORECASE,
-                                )
-                                if line_n is not None and proj_match:
-                                    projected = float(proj_match.group(1))
+                                projected = pred.get("projected_total")
+                                if projected is None:
+                                    proj_match = re.search(
+                                        r"(?:project\w*|predict\w*|baseline|expected|estimate\w*)[^\d]{0,60}(\d+(?:\.\d+)?)\s*(?:total\s+)?runs?",
+                                        pred.get("reasoning", "") or "",
+                                        re.IGNORECASE,
+                                    )
+                                    if proj_match:
+                                        projected = float(proj_match.group(1))
+                                if line_n is not None and projected is not None:
                                     if projected < line_n - 0.5:
                                         post_drops["rule1_violation"] = (
                                             post_drops.get("rule1_violation", 0) + 1
