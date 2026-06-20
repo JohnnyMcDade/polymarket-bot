@@ -195,6 +195,28 @@ SPREAD_ACCURACY_PATH = Path(os.getenv(
 # rationale (commit d10c78c shipped the structured PROJECTED_TOTAL gate).
 RULE1_FIX_DATE = "2026-06-19"
 
+# Anthropic API cost estimation (USD per million tokens). Values reflect
+# the prompt-caching tier and are accurate for Haiku 4.5 / Sonnet 4.6 as
+# of 2026-06-20. Cycle estimates here are deliberately rough — the
+# system prompt re-caches every cycle (5-min TTL << 28-min cycle interval)
+# so cache writes dominate; per-cycle output tokens scale with the
+# number of markets that reached Claude (avg 2-4/cycle from gate funnel).
+# Tune _COST_TOKENS_* constants if a per-cycle audit against the
+# `[USAGE]` logs shows drift.
+_ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL_KALSHI_EDGE", "claude-haiku-4-5-20251001")
+
+# {model_prefix: (input, output, cache_write_5min, cache_read) $/MTok}
+_MODEL_PRICING_USD_PER_MTOK: dict[str, tuple[float, float, float, float]] = {
+    "claude-haiku-4-5":   (1.00, 5.00, 1.25, 0.10),
+    "claude-haiku-3-5":   (1.00, 5.00, 1.25, 0.10),
+    "claude-sonnet-4-6":  (3.00, 15.00, 3.75, 0.30),
+    "claude-sonnet-4-5":  (3.00, 15.00, 3.75, 0.30),
+    "claude-opus-4-7":    (15.00, 75.00, 18.75, 1.50),
+}
+_COST_TOKENS_CACHE_WRITE_PER_CYCLE = 15000  # system prompt re-cached each cycle
+_COST_TOKENS_INPUT_PER_CYCLE = 2000          # per-market FACTS in user message
+_COST_TOKENS_OUTPUT_PER_CYCLE = 1200         # avg 3 markets × ~400 tok/response
+
 _DASH_SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
     "KXATPMATCH", "KXWTAMATCH", "KXBTC", "KXAAAGASD",
@@ -638,6 +660,49 @@ def _dash_next_spread_candidate(stats: dict) -> dict | None:
         return None
     candidates.sort(key=lambda r: (r["date"], r["start_time_utc"]))
     return candidates[0]
+
+
+def _dash_api_cost_estimate(cycles_in_window: int | None) -> dict[str, Any]:
+    """Estimate daily Anthropic API spend from the cycle count over the
+    24h gate_activity window. Returns {model, daily_usd, weekly_usd,
+    cycles, per_cycle_usd}. Approximation only — accurate per-cycle
+    cost depends on actual reached_claude count and cache hit/miss
+    pattern, which we'd need to read from the [USAGE] log lines for
+    a precise number. Tune _COST_TOKENS_* constants if drift > 30%."""
+    if cycles_in_window is None or cycles_in_window <= 0:
+        return {
+            "model": _ANTHROPIC_MODEL, "cycles": 0,
+            "per_cycle_usd": 0.0, "daily_usd": 0.0, "weekly_usd": 0.0,
+            "available": False,
+        }
+    # Match against the longest model-prefix key so future point releases
+    # (e.g. claude-haiku-4-5-20260101) still pick up the same family.
+    pricing: tuple[float, float, float, float] | None = None
+    matched_key = ""
+    for key, prices in _MODEL_PRICING_USD_PER_MTOK.items():
+        if _ANTHROPIC_MODEL.startswith(key) and len(key) > len(matched_key):
+            pricing = prices
+            matched_key = key
+    if pricing is None:
+        return {
+            "model": _ANTHROPIC_MODEL, "cycles": cycles_in_window,
+            "per_cycle_usd": 0.0, "daily_usd": 0.0, "weekly_usd": 0.0,
+            "available": False,
+        }
+    in_p, out_p, cw_p, _cr_p = pricing
+    per_cycle = (
+        _COST_TOKENS_CACHE_WRITE_PER_CYCLE * cw_p / 1_000_000
+        + _COST_TOKENS_INPUT_PER_CYCLE * in_p / 1_000_000
+        + _COST_TOKENS_OUTPUT_PER_CYCLE * out_p / 1_000_000
+    )
+    daily = cycles_in_window * per_cycle
+    return {
+        "model": _ANTHROPIC_MODEL, "cycles": cycles_in_window,
+        "per_cycle_usd": per_cycle,
+        "daily_usd": daily,
+        "weekly_usd": daily * 7,
+        "available": True,
+    }
 
 
 def _dash_kxmlbtotal_streak(trades: list[dict]) -> dict[str, Any]:
@@ -1204,6 +1269,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_spread = _dash_next_spread_candidate(stats_cache)
     spread_breakdown = _dash_spread_breakdown()
     streak = _dash_kxmlbtotal_streak(all_trades)
+    api_cost = _dash_api_cost_estimate(gate_activity.get("cycles_in_window"))
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     gate_activity = _dash_gate_activity()
@@ -1919,6 +1985,14 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
       else (f"❄️ {streak['count']}-game losing streak"
             if streak['direction']=='loss'
             else '—')
+    }</span>
+  </div>
+  <div class="card">
+    <span class="label">Est. API cost today</span>
+    <span class="value" title="Model: {api_cost['model']} | {api_cost['cycles']} cycles × ${api_cost['per_cycle_usd']:.4f}/cycle | ~${api_cost['weekly_usd']:.2f}/wk pace">{
+      f"${api_cost['daily_usd']:.2f}"
+      if api_cost['available']
+      else '—'
     }</span>
   </div>
 </div>
