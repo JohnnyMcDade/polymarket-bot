@@ -1094,6 +1094,72 @@ def _filter_trades_to_last_week(
     return in_window, cutoff, now
 
 
+def _compute_spread_verdict(days: int = 30) -> str:
+    """Run the KXMLBSPREAD backtest for the last `days` days and return
+    a one-line verdict for the Monday weekly report. Counts ★ stable
+    cells (n≥15, lift≥+2pp, Wilson_lo > direction baseline). Wraps any
+    backtest exception in a safe fallback so the weekly report doesn't
+    crash if MLB statsapi flakes — the verdict is informational, not
+    the report's primary purpose."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        import backtest_kalshi as bk
+
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=days)
+        games = bk.fetch_schedule(start.isoformat(), end.isoformat())
+        season = end.year
+        pids = {
+            pid for g in games
+            for pid in (g.home_pitcher_id, g.away_pitcher_id) if pid
+        }
+        gamelogs: dict = {}
+        for pid in pids:
+            try:
+                gl = bk.fetch_pitcher_gamelog(pid, season)
+                if gl:
+                    gamelogs[pid] = gl
+            except Exception:
+                continue
+        rows, _ = bk.run_spread_backtest(games, gamelogs)
+        if not rows:
+            return f"**{days}d**: no games scored — verdict unavailable"
+
+        actuals = [r["actual_margin"] for r in rows]
+        starred_cells: list[str] = []
+        for line in bk.SPREAD_LINES:
+            n_total = sum(1 for a in actuals if a != line and a != -line)
+            if n_total == 0:
+                continue
+            home_base = sum(1 for a in actuals if a >= line) / n_total
+            away_base = sum(1 for a in actuals if a <= -line) / n_total
+            for d in bk.SPREAD_DELTAS:
+                res = bk._sweep_spread_at_line(rows, line, d)
+                for side, (w, l), base in (
+                    ("HOME", res["home"], home_base),
+                    ("AWAY", res["away"], away_base),
+                ):
+                    n = w + l
+                    if n < 15:
+                        continue
+                    wr = w / n
+                    wlo = bk._wilson_lower(w, n)
+                    if wlo > base and (wr - base) >= 0.02:
+                        starred_cells.append(f"{side[0]}{line}δ{d}")
+        if starred_cells:
+            return (
+                f"**{days}d**: {len(starred_cells)} ★ cells / "
+                f"edge INTACT ({', '.join(starred_cells[:5])}"
+                f"{'…' if len(starred_cells) > 5 else ''})"
+            )
+        return (
+            f"**{days}d**: 0 ★ cells / consider disabling — "
+            f"no Wilson-stable lift over baseline"
+        )
+    except Exception as e:
+        return f"verdict unavailable ({type(e).__name__}: {str(e)[:60]})"
+
+
 def _top_series_by_pnl(
     by_series: dict[str, dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1170,6 +1236,9 @@ def _build_weekly_embed(
         {"name": "🥇 Best Trade", "value": _trade_line(s.get("best")), "inline": False},
         {"name": "🥶 Worst Trade", "value": _trade_line(s.get("worst")), "inline": False},
         {"name": "🏅 Top Series (by PnL)", "value": ts_str, "inline": False},
+        {"name": "📐 KXMLBSPREAD edge (30d backtest)",
+         "value": _compute_spread_verdict(30),
+         "inline": False},
         {"name": "🎯 Go-Live Progress", "value": gl_str, "inline": False},
         {"name": "📊 View Dashboard",
          "value": f"[Open live dashboard]({DASHBOARD_URL})", "inline": False},
