@@ -228,8 +228,12 @@ def main() -> int:
     # /app/data/spread_accuracy.json. Same --since gating as above.
     # 'HOME/AWAY correct' counts BET WINS (actual_margin ≥ N) split by
     # whether the spread-team was the home or away side of the matchup.
-    # Mean margin error is the |projected_margin − actual_margin|
-    # average across all spread bets in window.
+    # Mean margin error is |projected − actual|; signed mean error
+    # surfaces directional bias (OVER = predictor too bullish on the
+    # spread-team; UNDER = too bearish). When HOME bets bias OVER and
+    # AWAY bets bias UNDER (opposite signs), the +0.3 home-advantage
+    # constant is too aggressive. Same-sign biases point at the broader
+    # predictor weights (ERA / rs differential) instead.
     spread_accuracy_path = path.parent / "spread_accuracy.json"
     if spread_accuracy_path.exists():
         try:
@@ -243,18 +247,69 @@ def main() -> int:
                 if (r.get("settled_at") or "")[:10] >= args.since
             ]
         if spread_rows:
-            errs = [abs(float(r.get("error", 0))) for r in spread_rows]
-            mean_err = sum(errs) / len(errs)
+            errs_abs = [abs(float(r.get("error", 0))) for r in spread_rows]
+            mean_abs_err = sum(errs_abs) / len(errs_abs)
             home_rows = [r for r in spread_rows if r.get("spread_team_is_home") is True]
             away_rows = [r for r in spread_rows if r.get("spread_team_is_home") is False]
             home_wins = sum(1 for r in home_rows if r.get("bet_won") is True)
             away_wins = sum(1 for r in away_rows if r.get("bet_won") is True)
+
+            def _signed_mean(rows: list[dict]) -> float | None:
+                if not rows:
+                    return None
+                return sum(float(r.get("error", 0)) for r in rows) / len(rows)
+
+            def _bias_label(err: float | None) -> str:
+                if err is None:
+                    return "no data"
+                if abs(err) < 0.10:
+                    return "neutral"
+                return "OVER" if err > 0 else "UNDER"
+
+            home_err = _signed_mean(home_rows)
+            away_err = _signed_mean(away_rows)
+            home_err_str = (
+                f"{home_err:+.2f} ({_bias_label(home_err)} bias)"
+                if home_err is not None else "— (no HOME bets yet)"
+            )
+            away_err_str = (
+                f"{away_err:+.2f} ({_bias_label(away_err)} bias)"
+                if away_err is not None else "— (no AWAY bets yet)"
+            )
             print(
                 f"\nPrediction accuracy (KXMLBSPREAD):\n"
-                f"  Mean margin error: {mean_err:.2f} runs\n"
-                f"  HOME correct: {home_wins}/{len(home_rows)}\n"
-                f"  AWAY correct: {away_wins}/{len(away_rows)}"
+                f"  Mean |margin error|: {mean_abs_err:.2f} runs\n"
+                f"  HOME bets: n={len(home_rows)} correct={home_wins}/{len(home_rows)} "
+                f"mean error {home_err_str}\n"
+                f"  AWAY bets: n={len(away_rows)} correct={away_wins}/{len(away_rows)} "
+                f"mean error {away_err_str}"
             )
+
+            # Diagnose: opposite-sign biases ≥ 1.0 in absolute value
+            # are the home-advantage signature; same-sign biases point
+            # at the broader predictor weights. Only fire on n ≥ 5 per
+            # side to avoid early-noise alarms.
+            if (
+                home_err is not None and away_err is not None
+                and len(home_rows) >= 5 and len(away_rows) >= 5
+                and (abs(home_err) >= 1.0 or abs(away_err) >= 1.0)
+            ):
+                if home_err > 0 and away_err < 0:
+                    print(
+                        "  ⚠️  Home advantage constant (+0.3) may be "
+                        "TOO HIGH — HOME over-projected, AWAY under-projected."
+                    )
+                elif home_err < 0 and away_err > 0:
+                    print(
+                        "  ⚠️  Home advantage constant (+0.3) may be "
+                        "TOO LOW — HOME under-projected, AWAY over-projected."
+                    )
+                else:
+                    print(
+                        "  ⚠️  Predictor bias > 1.0 same-sign on both "
+                        "directions — review ERA_WEIGHT / RS differential "
+                        "weights (not the home-advantage constant)."
+                    )
 
     # Trend: most recent N vs preceding N
     print(f"\n=== TREND (last {args.recent_n} vs prior {args.recent_n}) ===")
