@@ -186,6 +186,9 @@ GATE_ACTIVITY_PATH = Path(os.getenv("KALSHI_GATE_ACTIVITY", "/app/data/gate_acti
 PREDICTION_ACCURACY_PATH = Path(os.getenv(
     "KALSHI_PREDICTION_ACCURACY", "/app/data/prediction_accuracy.json"
 ))
+SPREAD_ACCURACY_PATH = Path(os.getenv(
+    "KALSHI_SPREAD_ACCURACY", "/app/data/spread_accuracy.json"
+))
 
 _DASH_SERIES_PREFIXES = (
     "KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD", "KXMLBTEAMTOTAL",
@@ -628,6 +631,43 @@ def _dash_next_spread_candidate(stats: dict) -> dict | None:
     return candidates[0]
 
 
+def _dash_spread_breakdown() -> dict[str, dict[str, int]]:
+    """Read /app/data/spread_accuracy.json and aggregate settled
+    KXMLBSPREAD pilot trades into direction (HOME/AWAY) and line
+    (1.5/2.5) buckets. Each bucket is {wins, losses, total}.
+
+    Source: spread_accuracy.json — kalshi_trader writes one record per
+    settled spread trade with bet_won, spread_team_is_home, and line.
+    Pre-pilot trades that lack the structured projected_margin never
+    enter this file, so the breakdown is naturally scoped to the
+    pilot rollout.
+
+    Returns {} when the file is missing/empty/unparseable — caller
+    renders 'no settled trades yet' in that case."""
+    if not SPREAD_ACCURACY_PATH.exists():
+        return {}
+    try:
+        with SPREAD_ACCURACY_PATH.open() as f:
+            store = json.load(f) or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+    rows = [r for r in store.values() if r.get("bet_won") is not None]
+    if not rows:
+        return {}
+
+    def _tally(filter_fn) -> dict[str, int]:
+        items = [r for r in rows if filter_fn(r)]
+        wins = sum(1 for r in items if r.get("bet_won") is True)
+        return {"wins": wins, "losses": len(items) - wins, "total": len(items)}
+
+    return {
+        "home": _tally(lambda r: r.get("spread_team_is_home") is True),
+        "away": _tally(lambda r: r.get("spread_team_is_home") is False),
+        "line_1.5": _tally(lambda r: r.get("line") == 1.5),
+        "line_2.5": _tally(lambda r: r.get("line") == 2.5),
+    }
+
+
 def _dash_t_minus_30_iso(game_date: str, start_time_utc: str) -> str | None:
     """Compute the T-30min-start eviction UTC ISO from game date + UTC
     start time (HH:MM format from the stats cache). Returns None on
@@ -1007,6 +1047,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     qualifying_games = _dash_qualifying_games(stats_cache, max_rows=5)
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     next_spread = _dash_next_spread_candidate(stats_cache)
+    spread_breakdown = _dash_spread_breakdown()
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
     gate_activity = _dash_gate_activity()
@@ -1504,6 +1545,58 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</div>'
         )
 
+    # KXMLBSPREAD pilot breakdown — splits settled spread bets by
+    # direction (HOME-spread vs AWAY-spread) and by line (1.5 vs 2.5)
+    # so the operator can see which slice of the pilot cohort is
+    # actually performing. Empty for the first ~1-3 days post-rollout
+    # until the cap=1/night pilot accumulates settled trades.
+    sb = spread_breakdown
+    if not sb or sum(b["total"] for b in sb.values()) == 0:
+        spread_breakdown_html = (
+            '<table>'
+            '<thead><tr><th>Slice</th><th>W</th><th>L</th><th>WR</th></tr></thead>'
+            '<tbody><tr><td colspan="4" class="muted">'
+            'no settled KXMLBSPREAD pilot trades yet — '
+            'cap=1/night, expect 1-3 day warm-up'
+            '</td></tr></tbody>'
+            '</table>'
+        )
+    else:
+        rows_html = []
+        for label, key in (
+            ("HOME-spread bets", "home"),
+            ("AWAY-spread bets", "away"),
+            ("Line 1.5 (tail `2`)", "line_1.5"),
+            ("Line 2.5 (tail `3`)", "line_2.5"),
+        ):
+            b = sb.get(key) or {"wins": 0, "losses": 0, "total": 0}
+            if b["total"] == 0:
+                rows_html.append(
+                    f"<tr><td>{label}</td>"
+                    f"<td class='muted'>0</td>"
+                    f"<td class='muted'>0</td>"
+                    f"<td class='muted'>—</td></tr>"
+                )
+                continue
+            wr = b["wins"] / b["total"]
+            wr_cls = (
+                "pos" if wr >= 0.55
+                else "neg" if wr < 0.45
+                else ""
+            )
+            rows_html.append(
+                f"<tr><td>{label}</td>"
+                f"<td>{b['wins']}</td>"
+                f"<td>{b['losses']}</td>"
+                f"<td class='{wr_cls}'>{wr:.0%}</td></tr>"
+            )
+        spread_breakdown_html = (
+            '<table>'
+            '<thead><tr><th>Slice</th><th>W</th><th>L</th><th>WR</th></tr></thead>'
+            f'<tbody>{"".join(rows_html)}</tbody>'
+            '</table>'
+        )
+
     is_live_badge = (
         "<span style='background:#2a9d2a;color:#fff;padding:2px 8px;"
         "border-radius:4px;font-size:0.85em;'>LIVE</span>"
@@ -1659,6 +1752,14 @@ both, the row is flagged red — that's a HIGH-inversion signal.
 
 <h2>Prediction accuracy (KXMLBTOTAL)</h2>
 {prediction_accuracy_html}
+
+<h2>KXMLBSPREAD pilot breakdown</h2>
+<p class="muted" style="margin-top:0;">
+Settled spread bets split by direction (HOME / AWAY) and line (1.5 / 2.5).
+Source: <code>spread_accuracy.json</code> — populated at settlement only for
+pilot-era trades (structured <code>projected_margin</code> required).
+</p>
+{spread_breakdown_html}
 
 <h2>Last 10 trades</h2>
 <table>
