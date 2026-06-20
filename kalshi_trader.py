@@ -104,6 +104,17 @@ _TOTAL_RUNS_RE = re.compile(
 )
 ACCURACY_PROJECTION_MIN = 2.0
 ACCURACY_PROJECTION_MAX = 25.0
+# Spread-prediction accuracy log. Parallel to PREDICTION_ACCURACY_PATH
+# but for KXMLBSPREAD: tracks projected_margin vs actual margin from
+# the spread-team's perspective. Tolerance is tighter (0.75 runs)
+# because margin estimates are signed differentials, so an off-by-one
+# is more painful than an off-by-one on a total.
+SPREAD_ACCURACY_PATH = Path(os.getenv(
+    "KALSHI_SPREAD_ACCURACY", "/app/data/spread_accuracy.json"
+))
+SPREAD_ACCURACY_TOLERANCE_RUNS = 0.75
+SPREAD_ACCURACY_MARGIN_MIN = -15.0
+SPREAD_ACCURACY_MARGIN_MAX = 15.0
 _MLB_STATSAPI = "https://statsapi.mlb.com/api/v1"
 # Weekly drawdown circuit-breaker. Distinct from MAX_DAILY_LOSS — the
 # daily cap blocks new spend mid-day but resets fresh tomorrow. The
@@ -764,6 +775,167 @@ def _fetch_actual_total_runs(ticker: str) -> int | None:
     return None
 
 
+def _fetch_actual_margin(ticker: str) -> tuple[int, str, bool] | None:
+    """For a KXMLBSPREAD ticker, return (margin, spread_team, is_home)
+    where margin = spread_team_score - opposing_score from the final
+    game. Returns None if the ticker isn't parseable, the schedule
+    fetch fails, no game matches, or the game isn't yet final.
+
+    Ticker shape: `KXMLBSPREAD-<YYMONDDHHMM><AWAY><HOME>-<TEAM><N>`.
+    Team abbreviations are variable length, so we enumerate every
+    final game on the date and pick the one whose `away+home` concat
+    suffixes the ticker's middle segment — same trick used by
+    _fetch_actual_total_runs."""
+    if not ticker.startswith("KXMLBSPREAD-"):
+        return None
+    parts = ticker.split("-")
+    if len(parts) < 3:
+        return None
+    middle = parts[1]
+    if len(middle) < 7:
+        return None
+    spread_tail = parts[-1]
+    m_tail = re.match(r"^([A-Z]+)(\d+)$", spread_tail)
+    if not m_tail:
+        return None
+    spread_team = m_tail.group(1)
+    date_token, tail_segment = middle[:7], middle[7:]
+    try:
+        date_iso = datetime.strptime(date_token, "%y%b%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+    try:
+        r = requests.get(
+            f"{_MLB_STATSAPI}/schedule",
+            params={"sportId": 1, "date": date_iso, "hydrate": "team"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        sched = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(
+            f"[WARN] spread-accuracy: schedule fetch failed for {ticker} "
+            f"({date_iso}): {e}",
+            flush=True,
+        )
+        return None
+    for d in (sched or {}).get("dates", []) or []:
+        for g in d.get("games", []) or []:
+            state = (g.get("status") or {}).get("codedGameState", "")
+            if state not in ("F", "FT", "FR"):
+                continue
+            teams = g.get("teams") or {}
+            a_blob = teams.get("away") or {}
+            h_blob = teams.get("home") or {}
+            a_abbr = (a_blob.get("team") or {}).get("abbreviation", "")
+            h_abbr = (h_blob.get("team") or {}).get("abbreviation", "")
+            if not (a_abbr and h_abbr):
+                continue
+            if not tail_segment.endswith(a_abbr + h_abbr):
+                continue
+            a_score = a_blob.get("score")
+            h_score = h_blob.get("score")
+            if not isinstance(a_score, int) or not isinstance(h_score, int):
+                continue
+            if spread_team == h_abbr:
+                return (h_score - a_score, spread_team, True)
+            if spread_team == a_abbr:
+                return (a_score - h_score, spread_team, False)
+            # Spread-team in the tail didn't match either side of this
+            # game — likely a different game on the same date.
+            continue
+    return None
+
+
+def _record_spread_accuracy(entry: dict[str, Any]) -> None:
+    """For settled KXMLBSPREAD trades, compare the projected_margin
+    saved on the entry to the spread-team's actual run margin from
+    MLB statsapi, persist {projected_margin, actual_margin, error,
+    direction, bet_won, ...} keyed by ticker.
+
+    'direction' is CORRECT (|error| ≤ tolerance), OVER (predictor
+    too bullish on spread-team), or UNDER (too bearish).
+    'bet_won' captures whether the actual placed bet would have
+    won at settlement — bookkeeping for the per-direction WR rollup
+    in the Discord embed and dashboard.
+
+    Failure modes (no structured projected_margin, schedule fetch
+    failed, score not yet final) silently skip — passive observability
+    only, never blocks settlement."""
+    ticker = entry.get("ticker", "")
+    if not ticker.startswith("KXMLBSPREAD"):
+        return
+    projected_raw = entry.get("projected_margin")
+    if not isinstance(projected_raw, (int, float)):
+        # Pre-structured-field trades (e.g. the 2026-06-09 MIL@ATH one)
+        # have no way to recover a numeric projection — skip silently.
+        return
+    projected = float(projected_raw)
+    if (
+        projected < SPREAD_ACCURACY_MARGIN_MIN
+        or projected > SPREAD_ACCURACY_MARGIN_MAX
+    ):
+        print(
+            f"[SPREAD-ACCURACY-SKIP] {ticker} projected={projected} "
+            f"out of plausible range "
+            f"({SPREAD_ACCURACY_MARGIN_MIN}..{SPREAD_ACCURACY_MARGIN_MAX})",
+            flush=True,
+        )
+        return
+    result = _fetch_actual_margin(ticker)
+    if result is None:
+        return
+    actual_margin, spread_team, is_home = result
+    error = round(projected - actual_margin, 2)
+    if abs(error) <= SPREAD_ACCURACY_TOLERANCE_RUNS:
+        direction = "CORRECT"
+    elif error > 0:
+        direction = "OVER"
+    else:
+        direction = "UNDER"
+    # Parse N (threshold) from the tail again for line bookkeeping.
+    m_tail = re.match(r"^[A-Z]+(\d+)$", ticker.split("-")[-1])
+    line = (int(m_tail.group(1)) - 0.5) if m_tail else None
+    # bet_won: for BUY YES (the only side enabled in the pilot) the
+    # bet wins if the spread-team's actual margin ≥ N.
+    bet_won: bool | None = None
+    side = (entry.get("side") or "").lower()
+    if line is not None and side == "yes":
+        bet_won = actual_margin >= (line + 0.5)
+    settled_at = entry.get("settled_at") or datetime.now(timezone.utc).isoformat()
+    record = {
+        "projected_margin": projected,
+        "actual_margin": actual_margin,
+        "error": error,
+        "direction": direction,
+        "spread_team": spread_team,
+        "spread_team_is_home": is_home,
+        "line": line,
+        "side": side or None,
+        "bet_won": bet_won,
+        "settled_at": settled_at,
+    }
+    print(
+        f"[SPREAD-ACCURACY] {ticker} projected={projected:+.2f} "
+        f"actual={actual_margin:+d} error={error:+.2f} "
+        f"direction={direction} bet_won={bet_won}",
+        flush=True,
+    )
+    try:
+        store: dict[str, dict] = {}
+        if SPREAD_ACCURACY_PATH.exists():
+            with SPREAD_ACCURACY_PATH.open() as f:
+                store = json.load(f) or {}
+        store[ticker] = record
+        SPREAD_ACCURACY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SPREAD_ACCURACY_PATH.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(store, f, indent=2)
+        tmp.replace(SPREAD_ACCURACY_PATH)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] spread_accuracy write failed: {e}", flush=True)
+
+
 def _record_prediction_accuracy(entry: dict[str, Any]) -> None:
     """For settled KXMLBTOTAL trades, extract projected_total from the
     placement reasoning, fetch the actual game total from MLB statsapi,
@@ -919,6 +1091,19 @@ def _check_settlements() -> None:
         except Exception as e:
             print(
                 f"[WARN] prediction_accuracy unexpected error for "
+                f"{ticker}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+        # Parallel tracker for KXMLBSPREAD: compares the structured
+        # projected_margin (spread-team perspective) to the actual
+        # margin. No-op for non-spread tickers or for pre-structured
+        # legacy spread trades. Wrapped identically so a tracker
+        # exception can't block settlement.
+        try:
+            _record_spread_accuracy(entry)
+        except Exception as e:
+            print(
+                f"[WARN] spread_accuracy unexpected error for "
                 f"{ticker}: {type(e).__name__}: {e}",
                 flush=True,
             )

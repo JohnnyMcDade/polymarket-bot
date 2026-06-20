@@ -224,6 +224,38 @@ def main() -> int:
                 f"  Direction correct: {n_correct}/{len(rows)}"
             )
 
+    # Prediction accuracy (KXMLBSPREAD) — sourced from
+    # /app/data/spread_accuracy.json. Same --since gating as above.
+    # 'HOME/AWAY correct' counts BET WINS (actual_margin ≥ N) split by
+    # whether the spread-team was the home or away side of the matchup.
+    # Mean margin error is the |projected_margin − actual_margin|
+    # average across all spread bets in window.
+    spread_accuracy_path = path.parent / "spread_accuracy.json"
+    if spread_accuracy_path.exists():
+        try:
+            spread_store = json.loads(spread_accuracy_path.read_text()) or {}
+        except (json.JSONDecodeError, OSError):
+            spread_store = {}
+        spread_rows = list(spread_store.values())
+        if args.since:
+            spread_rows = [
+                r for r in spread_rows
+                if (r.get("settled_at") or "")[:10] >= args.since
+            ]
+        if spread_rows:
+            errs = [abs(float(r.get("error", 0))) for r in spread_rows]
+            mean_err = sum(errs) / len(errs)
+            home_rows = [r for r in spread_rows if r.get("spread_team_is_home") is True]
+            away_rows = [r for r in spread_rows if r.get("spread_team_is_home") is False]
+            home_wins = sum(1 for r in home_rows if r.get("bet_won") is True)
+            away_wins = sum(1 for r in away_rows if r.get("bet_won") is True)
+            print(
+                f"\nPrediction accuracy (KXMLBSPREAD):\n"
+                f"  Mean margin error: {mean_err:.2f} runs\n"
+                f"  HOME correct: {home_wins}/{len(home_rows)}\n"
+                f"  AWAY correct: {away_wins}/{len(away_rows)}"
+            )
+
     # Trend: most recent N vs preceding N
     print(f"\n=== TREND (last {args.recent_n} vs prior {args.recent_n}) ===")
     if len(settled) < args.recent_n * 2:
