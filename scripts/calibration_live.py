@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -223,6 +224,68 @@ def main() -> int:
                 f"  UNDER-predictions: {n_under}\n"
                 f"  Direction correct: {n_correct}/{len(rows)}"
             )
+
+            # By-line breakdown: bucket records by ticker tail (line N).
+            # Three buckets — tail 9 (T=8.5), tail 10 (T=9.5), tail 11+
+            # (T=10.5+ pooled — historically the "value tail" losses Rule 1
+            # is meant to suppress). Looks up bet outcome from trades_log
+            # since the accuracy file doesn't carry bet_won today. Tails
+            # below 9 are out-of-cohort and skipped.
+            by_line: dict[str, list[tuple[str, dict]]] = {
+                "T=8.5 (-9)": [],
+                "T=9.5 (-10)": [],
+                "T=10.5+ (-11+)": [],
+            }
+            outcomes_by_ticker = {
+                t.get("ticker", ""): t.get("outcome") for t in trades
+            }
+            for ticker, rec in accuracy_store.items():
+                if args.since and (rec.get("settled_at") or "")[:10] < args.since:
+                    continue
+                m_tail = re.search(r"-(\d+)$", ticker)
+                if not m_tail:
+                    continue
+                n_tail = int(m_tail.group(1))
+                if n_tail == 9:
+                    label = "T=8.5 (-9)"
+                elif n_tail == 10:
+                    label = "T=9.5 (-10)"
+                elif n_tail >= 11:
+                    label = "T=10.5+ (-11+)"
+                else:
+                    continue
+                by_line[label].append((ticker, rec))
+
+            print("\nPrediction accuracy by line (KXMLBTOTAL):")
+            for label, items in by_line.items():
+                if not items:
+                    print(f"  {label}: n=0  (no settled trades in window)")
+                    continue
+                errs_signed = [float(r.get("error", 0)) for _, r in items]
+                mean_signed = sum(errs_signed) / len(errs_signed)
+                if abs(mean_signed) < 0.10:
+                    bias = "neutral"
+                elif mean_signed > 0:
+                    bias = "OVER"
+                else:
+                    bias = "UNDER"
+                wins = sum(
+                    1 for t, _ in items
+                    if outcomes_by_ticker.get(t) == "won"
+                )
+                losses = sum(
+                    1 for t, _ in items
+                    if outcomes_by_ticker.get(t) == "lost"
+                )
+                n_settled = wins + losses
+                wr_str = (
+                    f"{wins}W/{losses}L ({wins/n_settled:.0%} WR)"
+                    if n_settled else "no outcomes yet"
+                )
+                print(
+                    f"  {label}: n={len(items)} "
+                    f"mean error {mean_signed:+.2f} ({bias}) — {wr_str}"
+                )
 
     # Prediction accuracy (KXMLBSPREAD) — sourced from
     # /app/data/spread_accuracy.json. Same --since gating as above.

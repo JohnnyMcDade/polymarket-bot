@@ -44,6 +44,7 @@ keep these shapes — that's the contract.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -912,6 +913,89 @@ def _dash_prediction_accuracy(since: str | None) -> dict:
     }
 
 
+def _dash_prediction_accuracy_by_line(
+    trades: list[dict], since: str | None
+) -> list[dict]:
+    """Bucket KXMLBTOTAL prediction-accuracy records by ticker tail
+    integer. Returns one row per bucket (always 3 rows so the table
+    renders all three even when some are empty):
+      T=8.5 (tail 9), T=9.5 (tail 10), T=10.5+ (tail 11+).
+
+    Each row carries n, signed mean_error, bias label, plus wins/
+    losses joined from trades_log by ticker. WR is computed downstream.
+    Surfaces whether the 2026-06-19 Rule 1 fix is concentrating losses
+    in the high-line bucket (which it's meant to suppress)."""
+    empty_rows = [
+        {"label": "T=8.5 (-9)", "n": 0, "mean_error": None,
+         "bias": None, "wins": 0, "losses": 0},
+        {"label": "T=9.5 (-10)", "n": 0, "mean_error": None,
+         "bias": None, "wins": 0, "losses": 0},
+        {"label": "T=10.5+ (-11+)", "n": 0, "mean_error": None,
+         "bias": None, "wins": 0, "losses": 0},
+    ]
+    if not PREDICTION_ACCURACY_PATH.exists():
+        return empty_rows
+    try:
+        store = json.loads(PREDICTION_ACCURACY_PATH.read_text()) or {}
+    except (json.JSONDecodeError, OSError):
+        return empty_rows
+
+    outcomes_by_ticker = {
+        t.get("ticker", ""): t.get("outcome") for t in trades
+    }
+    buckets: dict[str, list[tuple[str, dict]]] = {
+        "T=8.5 (-9)": [],
+        "T=9.5 (-10)": [],
+        "T=10.5+ (-11+)": [],
+    }
+    for ticker, rec in store.items():
+        if since and since.lower() != "all":
+            if (rec.get("settled_at") or "")[:10] < since:
+                continue
+        m = re.search(r"-(\d+)$", ticker)
+        if not m:
+            continue
+        n_tail = int(m.group(1))
+        if n_tail == 9:
+            label = "T=8.5 (-9)"
+        elif n_tail == 10:
+            label = "T=9.5 (-10)"
+        elif n_tail >= 11:
+            label = "T=10.5+ (-11+)"
+        else:
+            continue
+        buckets[label].append((ticker, rec))
+
+    out: list[dict] = []
+    for label in ("T=8.5 (-9)", "T=9.5 (-10)", "T=10.5+ (-11+)"):
+        items = buckets[label]
+        if not items:
+            out.append({
+                "label": label, "n": 0, "mean_error": None,
+                "bias": None, "wins": 0, "losses": 0,
+            })
+            continue
+        errs = [float(r.get("error", 0)) for _, r in items]
+        mean_err = sum(errs) / len(errs)
+        if abs(mean_err) < 0.10:
+            bias = "neutral"
+        elif mean_err > 0:
+            bias = "OVER"
+        else:
+            bias = "UNDER"
+        wins = sum(
+            1 for t, _ in items if outcomes_by_ticker.get(t) == "won"
+        )
+        losses = sum(
+            1 for t, _ in items if outcomes_by_ticker.get(t) == "lost"
+        )
+        out.append({
+            "label": label, "n": len(items), "mean_error": mean_err,
+            "bias": bias, "wins": wins, "losses": losses,
+        })
+    return out
+
+
 def _dash_btc_status(stats: dict) -> dict:
     """Snapshot of the macro signals that gate KXBTC trading. Returns:
       fng_value (int|None), fng_class (str), momentum_pct (float|None),
@@ -1053,6 +1137,10 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     gate_activity = _dash_gate_activity()
     prediction_accuracy = _dash_prediction_accuracy(
         since if (since and since.lower() != "all") else None
+    )
+    prediction_accuracy_by_line = _dash_prediction_accuracy_by_line(
+        all_trades,
+        since if (since and since.lower() != "all") else None,
     )
     wimbledon = _dash_wimbledon_countdown()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1545,6 +1633,53 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</div>'
         )
 
+    # By-line breakdown — surfaces whether high-line buckets (T=10.5+)
+    # are being suppressed by the post-2026-06-19 Rule 1 fix. If the
+    # fix is working, the -11+ bucket count should trend toward 0 over
+    # time and only the -9 / -10 buckets should accumulate new entries.
+    pa_line_rows = []
+    for b in prediction_accuracy_by_line:
+        if b["n"] == 0:
+            pa_line_rows.append(
+                f"<tr><td>{b['label']}</td>"
+                f"<td class='muted'>0</td>"
+                f"<td class='muted'>—</td>"
+                f"<td class='muted'>—</td>"
+                f"<td class='muted'>—</td></tr>"
+            )
+            continue
+        n_settled = b["wins"] + b["losses"]
+        wr_str = (
+            f"{b['wins']}W/{b['losses']}L "
+            f"({b['wins']/n_settled:.0%})"
+            if n_settled else "—"
+        )
+        err_str = f"{b['mean_error']:+.2f} ({b['bias']})"
+        wr_cls = (
+            "pos" if n_settled and b["wins"] / n_settled >= 0.55
+            else "neg" if n_settled and b["wins"] / n_settled < 0.45
+            else ""
+        )
+        pa_line_rows.append(
+            f"<tr><td>{b['label']}</td>"
+            f"<td>{b['n']}</td>"
+            f"<td>{err_str}</td>"
+            f"<td class='{wr_cls}'>{wr_str}</td>"
+            f"<td class='muted'>{n_settled}</td></tr>"
+        )
+    prediction_accuracy_by_line_html = (
+        '<table>'
+        '<thead><tr>'
+        '<th>Line bucket</th>'
+        '<th>n (accuracy)</th>'
+        '<th>Mean error (signed)</th>'
+        '<th>WR</th>'
+        '<th>n (settled)</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(pa_line_rows)}</tbody>'
+        '</table>'
+    )
+
     # KXMLBSPREAD pilot breakdown — splits settled spread bets by
     # direction (HOME-spread vs AWAY-spread) and by line (1.5 vs 2.5)
     # so the operator can see which slice of the pilot cohort is
@@ -1752,6 +1887,15 @@ both, the row is flagged red — that's a HIGH-inversion signal.
 
 <h2>Prediction accuracy (KXMLBTOTAL)</h2>
 {prediction_accuracy_html}
+<p class="muted" style="margin-top:0;">
+By-line breakdown — tracks whether the 2026-06-19 Rule 1 fix is
+suppressing the high-line bucket (<code>-11+</code>) it was built to catch.
+Mean error is signed (+ = OVER-projected; − = UNDER-projected). WR is
+joined from <code>trades_log.json</code> by ticker; <code>n (settled)</code>
+may be lower than <code>n (accuracy)</code> when an accuracy record exists
+without a settled trade outcome.
+</p>
+{prediction_accuracy_by_line_html}
 
 <h2>KXMLBSPREAD pilot breakdown</h2>
 <p class="muted" style="margin-top:0;">
