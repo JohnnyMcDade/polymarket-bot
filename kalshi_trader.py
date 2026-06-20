@@ -367,6 +367,7 @@ def _is_today_utc(timestamp_iso: str, today: datetime) -> bool:
 # matches, independent prediction inputs, no series-cluster risk.
 SERIES_DAILY_CAPS: dict[str, int] = {
     "KXMLBTOTAL": int(os.getenv("KALSHI_KXMLBTOTAL_DAILY_CAP", "2")),
+    "KXMLBSPREAD": int(os.getenv("KALSHI_KXMLBSPREAD_DAILY_CAP", "1")),
 }
 
 
