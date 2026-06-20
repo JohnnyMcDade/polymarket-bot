@@ -135,6 +135,35 @@ TRADES_LOG_PATH = Path(os.getenv(
 TENNIS_FILTER_ENABLED = os.getenv("KALSHI_TENNIS_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
 TENNIS_MAX_ASK_CENTS = int(os.getenv("KALSHI_TENNIS_MAX_ASK_CENTS", "62"))
 TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
+# Wimbledon-specific tennis filter overrides (active 2026-06-30 → 2026-07-13).
+# Per the SLAM/WIMBLEDON COHORT prompt block (validated 2026-06-14): at the
+# slams, higher-ranked favorites cover at meaningfully higher rates than tour
+# events. To capture that without giving up safety, take CHEAPER asks (55c
+# vs 62c — "only obvious mismatches") on a LOOSER rank gap (30 vs 50 — slam
+# BO5 reduces variance enough that mid-gap favorites are still near-locks).
+# Both env-overridable. End date is start + WIMBLEDON_LENGTH_DAYS - 1.
+WIMBLEDON_START_ISO = os.getenv("KALSHI_WIMBLEDON_START", "2026-06-30")
+WIMBLEDON_LENGTH_DAYS = int(os.getenv("KALSHI_WIMBLEDON_LENGTH_DAYS", "14"))
+TENNIS_WIMBLEDON_MAX_ASK_CENTS = int(
+    os.getenv("KALSHI_TENNIS_WIMBLEDON_MAX_ASK_CENTS", "55")
+)
+TENNIS_WIMBLEDON_MIN_RANK_GAP = int(
+    os.getenv("KALSHI_TENNIS_WIMBLEDON_MIN_RANK_GAP", "30")
+)
+
+
+def _wimbledon_active(now: datetime | None = None) -> bool:
+    """True iff today (UTC) is within the Wimbledon window
+    [WIMBLEDON_START_ISO, +WIMBLEDON_LENGTH_DAYS-1]. Returns False on
+    a malformed env date so the filter stays at standard thresholds
+    rather than failing open or closed."""
+    try:
+        start = datetime.fromisoformat(WIMBLEDON_START_ISO).date()
+    except ValueError:
+        return False
+    end = start + timedelta(days=WIMBLEDON_LENGTH_DAYS - 1)
+    today = (now or datetime.now(timezone.utc)).date()
+    return start <= today <= end
 
 # Grass-court specialist filter. Layered on top of the tennis mispricing
 # filter — only fires when the market title references a grass
@@ -1488,9 +1517,27 @@ def _tennis_filter_passes(
     if pred.get("confidence") != "HIGH":
         return False, f"conf={pred.get('confidence')} != HIGH"
 
+    # Wimbledon-window override (Jun 30 → Jul 13 default). Tighter ask
+    # ceiling AND looser rank gap — only the obvious slam mismatches at
+    # discount prices. Log when applied so the source of a SKIP/PASS is
+    # traceable from the production log.
+    in_wimbledon = _wimbledon_active()
+    if in_wimbledon:
+        max_ask = TENNIS_WIMBLEDON_MAX_ASK_CENTS
+        min_gap = TENNIS_WIMBLEDON_MIN_RANK_GAP
+        print(
+            f"[WIMBLEDON-COHORT] {item.get('ticker','')} "
+            f"max_ask={max_ask}c (vs {TENNIS_MAX_ASK_CENTS}c standard) "
+            f"min_gap={min_gap} (vs {TENNIS_MIN_RANK_GAP} standard)",
+            flush=True,
+        )
+    else:
+        max_ask = TENNIS_MAX_ASK_CENTS
+        min_gap = TENNIS_MIN_RANK_GAP
+
     yes_ask = int(item.get("yes_ask_cents") or 100)
-    if yes_ask > TENNIS_MAX_ASK_CENTS:
-        return False, f"yes_ask={yes_ask}c > {TENNIS_MAX_ASK_CENTS}c"
+    if yes_ask > max_ask:
+        return False, f"yes_ask={yes_ask}c > {max_ask}c"
 
     tennis = stats.get("tennis", {}) or {}
     board_key = "atp_rankings" if is_atp else "wta_rankings"
@@ -1537,8 +1584,8 @@ def _tennis_filter_passes(
         )
 
     gap = no_rank - yes_rank
-    if gap <= TENNIS_MIN_RANK_GAP:
-        return False, f"gap={gap} <= {TENNIS_MIN_RANK_GAP}"
+    if gap <= min_gap:
+        return False, f"gap={gap} <= {min_gap}"
 
     # Grass-event additional gate. 380-day backtest 2026-06-14 showed
     # that on grass tournaments, the higher-ranked player's win rate is
