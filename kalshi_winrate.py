@@ -602,6 +602,27 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
             "value": f"{_w_phrase} — {WIMBLEDON_REGEN_REMINDER}",
             "inline": False,
         })
+    # Last-7-days per-series breakdown — independent of the calibration
+    # window so the operator can spot a single-series collapse before it
+    # contaminates the longer-window aggregate. Sorted by trade count so
+    # the most-active series is first; series with zero settled trades
+    # in the window are omitted.
+    last7_trades, _, _ = _filter_trades_to_last_week(r["trades"])
+    last7_decided = [t for t in last7_trades if t.get("outcome") in ("won", "lost")]
+    last7_by_series = _breakdown(last7_decided, lambda t: _series_of(t.get("ticker", "")))
+    if last7_by_series:
+        rows = sorted(
+            last7_by_series.items(),
+            key=lambda kv: (-kv[1]["decided"], -kv[1]["total_pnl"]),
+        )
+        last7_str = "\n".join(
+            f"`{series:<13}` {stats['wins']}W/{stats['losses']}L "
+            f"{_format_usd(stats['total_pnl'])} ({stats['win_rate']:.0%})"
+            for series, stats in rows
+        )
+    else:
+        last7_str = "— no settled trades in last 7 days"
+
     fields += [
         {"name": "🪟 Window",
          "value": f"{n} of {r['raw_n']} settled",
@@ -626,6 +647,9 @@ def _build_calibration_embed(r: dict[str, Any]) -> dict[str, Any]:
          "inline": False},
         {"name": "🥇 Best Series (by PnL)",
          "value": series_str,
+         "inline": False},
+        {"name": "📊 Last 7 days by series",
+         "value": last7_str,
          "inline": False},
         {"name": "📅 Pace",
          "value": pace_str,
