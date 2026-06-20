@@ -685,6 +685,29 @@ def predict_total(
     return base_total + starter_adj
 
 
+SPREAD_ERA_WEIGHT = 0.5  # margin shift per ERA-point gap between starters
+
+
+def predict_spread(
+    game: Game,
+    home_era: float | None,
+    away_era: float | None,
+    team_stats: dict[int, dict[str, float]],
+) -> float | None:
+    """Predicted home-perspective margin (home_score - away_score).
+    Positive = predicting home wins. Formula = RS-per-game differential
+    + 0.5 × (away_era - home_era) + 0.3 home advantage. The ERA term is
+    signed so a better home pitcher (lower ERA) widens the margin in
+    home's favor."""
+    home = team_stats.get(game.home_team_id)
+    away = team_stats.get(game.away_team_id)
+    if not home or not away or home_era is None or away_era is None:
+        return None
+    rs_diff = home["rs_per_game"] - away["rs_per_game"]
+    era_diff = (away_era - home_era) * SPREAD_ERA_WEIGHT
+    return rs_diff + era_diff + HOME_BAT_BOOST_RUNS
+
+
 def predict_team_total(
     game: Game,
     side: str,
@@ -792,6 +815,77 @@ def run_team_total_backtest(
                 "opp_era": opp_era,
             })
     return rows, skipped
+
+
+def run_spread_backtest(
+    games: list[Game],
+    gamelogs_by_pid: dict[int, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rows: list[dict[str, Any]] = []
+    skipped = {"no_pitcher_data": 0, "no_team_stats": 0}
+    team_stats_cache: dict[str, dict[int, dict[str, float]]] = {}
+    for g in games:
+        as_of = _prev_day(g.date)
+        if as_of not in team_stats_cache:
+            team_stats_cache[as_of] = derive_team_run_stats(games, as_of)
+        team_stats = team_stats_cache[as_of]
+        home_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.home_pitcher_id, []), as_of)
+            if g.home_pitcher_id else None
+        )
+        away_era = (
+            rolling_era_as_of(gamelogs_by_pid.get(g.away_pitcher_id, []), as_of)
+            if g.away_pitcher_id else None
+        )
+        if home_era is None or away_era is None:
+            skipped["no_pitcher_data"] += 1
+            continue
+        predicted = predict_spread(g, home_era, away_era, team_stats)
+        if predicted is None:
+            skipped["no_team_stats"] += 1
+            continue
+        rows.append({
+            "date": g.date,
+            "home_team": g.home_team,
+            "away_team": g.away_team,
+            "predicted_margin": predicted,
+            "actual_margin": g.home_score - g.away_score,
+            "home_era": home_era,
+            "away_era": away_era,
+            "starter_avg_era": (home_era + away_era) / 2.0,
+        })
+    return rows, skipped
+
+
+def _sweep_spread_at_line(
+    rows: list[dict[str, Any]],
+    line: float,
+    delta: float,
+) -> dict[str, Any]:
+    """For a given spread line and δ buffer, count directional bets.
+    HOME-side bet fires when predicted_margin >= +(line+δ) and wins
+    when actual_margin >= line. AWAY-side bet fires when predicted
+    <= -(line+δ) and wins when actual <= -line. Half-integer lines
+    avoid push ties; we still guard with == to be safe."""
+    home_w = home_l = away_w = away_l = skipped = 0
+    for r in rows:
+        p = r["predicted_margin"]
+        a = r["actual_margin"]
+        if a == line or a == -line:
+            continue
+        if p >= line + delta:
+            if a >= line:
+                home_w += 1
+            else:
+                home_l += 1
+        elif p <= -(line + delta):
+            if a <= -line:
+                away_w += 1
+            else:
+                away_l += 1
+        else:
+            skipped += 1
+    return {"home": (home_w, home_l), "away": (away_w, away_l), "skipped": skipped}
 
 
 def _sweep_at_line(
@@ -1181,6 +1275,138 @@ def report_team_total(rows: list[dict[str, Any]], skipped: dict[str, int]) -> No
     print("=" * 78)
 
 
+SPREAD_LINES = (1.5, 2.5, 3.5)
+SPREAD_DELTAS = (0.5, 1.0, 1.5)
+
+
+def report_spread(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
+    print("=" * 78)
+    print(f"KXMLBSPREAD BACKTEST — {len(rows)} games")
+    print("=" * 78)
+    print("Skipped:", skipped)
+    if not rows:
+        print("\nNo rows — try expanding --days or rebuilding the pitcher cache.")
+        return
+
+    preds = [r["predicted_margin"] for r in rows]
+    actuals = [r["actual_margin"] for r in rows]
+    print(
+        f"\nMargin calibration: mean_pred={sum(preds)/len(preds):+.3f}  "
+        f"mean_actual={sum(actuals)/len(actuals):+.3f}  "
+        f"(if mean_pred sign mismatches mean_actual, the home-advantage "
+        f"constant is the first thing to check)"
+    )
+
+    # Naive baseline per spread line: what does always-home-spread and
+    # always-away-spread win? Anything below this is the predictor adding
+    # nothing the market doesn't already know.
+    print("\n--- Naive baselines per spread ---")
+    baselines: dict[float, tuple[float, float]] = {}
+    for line in SPREAD_LINES:
+        n_total = sum(1 for a in actuals if a != line and a != -line)
+        if n_total == 0:
+            continue
+        home_wr = sum(1 for a in actuals if a >= line) / n_total
+        away_wr = sum(1 for a in actuals if a <= -line) / n_total
+        baselines[line] = (home_wr, away_wr)
+        print(
+            f"  line={line:<4} always-HOME={home_wr:.1%}  "
+            f"always-AWAY={away_wr:.1%}  best-trivial={max(home_wr, away_wr):.1%}"
+        )
+
+    # Win-rate sweep by direction (home vs away). ★ = Wilson_lo strictly
+    # above THAT direction's baseline AND lift ≥ +2pp. n ≥ 15 to flag.
+    print("\n--- Win-rate sweep: line × δ (direction-split) ---")
+    print(
+        f"  {'line':<5} {'δ':<5} "
+        f"{'HOME-spread (predicted ≥ line+δ)':<46} "
+        f"{'AWAY-spread (predicted ≤ -line-δ)':<46}"
+    )
+    for line in SPREAD_LINES:
+        home_base, away_base = baselines.get(line, (0.5, 0.5))
+        for d in SPREAD_DELTAS:
+            res = _sweep_spread_at_line(rows, line, d)
+            hw, hl = res["home"]
+            aw, al = res["away"]
+            hn, an = hw + hl, aw + al
+            hwr = hw/hn if hn else 0
+            awr = aw/an if an else 0
+            hwlo = _wilson_lower(hw, hn) if hn else 0
+            awlo = _wilson_lower(aw, an) if an else 0
+            hstar = "★" if hn >= 15 and hwlo > home_base and (hwr - home_base) >= 0.02 else " "
+            astar = "★" if an >= 15 and awlo > away_base and (awr - away_base) >= 0.02 else " "
+            h_cell = (
+                f"n={hn:>3} WR={hwr:>5.1%} wlo={hwlo:>5.1%} "
+                f"lift={(hwr-home_base)*100:+5.1f}pp {hstar}"
+            )
+            a_cell = (
+                f"n={an:>3} WR={awr:>5.1%} wlo={awlo:>5.1%} "
+                f"lift={(awr-away_base)*100:+5.1f}pp {astar}"
+            )
+            print(f"  {line:<5} {d:<5} {h_cell:<46} {a_cell:<46}")
+
+    # Cohort filter: tight starter-ERA cohort. Production proposal is
+    # avg ERA ≤ 3.00 (tighter than KXMLBTOTAL's 3.50) per the request
+    # spec. Sweep direction at the most-common spread line (2.5).
+    print("\n--- Tight cohort (both starters avg ERA ≤ 3.00) at line=2.5, δ=0.5 ---")
+    tight = [r for r in rows if r["starter_avg_era"] <= 3.0]
+    print(f"  cohort size: {len(tight)} games (of {len(rows)} total)")
+    if tight:
+        actual_tight = [r["actual_margin"] for r in tight]
+        n_total_t = sum(1 for a in actual_tight if a != 2.5 and a != -2.5)
+        if n_total_t:
+            home_base_t = sum(1 for a in actual_tight if a >= 2.5) / n_total_t
+            away_base_t = sum(1 for a in actual_tight if a <= -2.5) / n_total_t
+            print(
+                f"  cohort baselines: home-spread={home_base_t:.1%}  "
+                f"away-spread={away_base_t:.1%}"
+            )
+        for d in (0.5, 1.0, 1.5):
+            res = _sweep_spread_at_line(tight, 2.5, d)
+            hw, hl = res["home"]
+            aw, al = res["away"]
+            hn, an = hw + hl, aw + al
+            hwr = hw/hn if hn else 0
+            awr = aw/an if an else 0
+            hwlo = _wilson_lower(hw, hn) if hn else 0
+            awlo = _wilson_lower(aw, an) if an else 0
+            print(
+                f"  δ={d:<4} HOME n={hn:>3} WR={hwr:>5.1%} wlo={hwlo:>5.1%}  "
+                f"|  AWAY n={an:>3} WR={awr:>5.1%} wlo={awlo:>5.1%}"
+            )
+
+    # Verdict block
+    print("\n--- VERDICT ---")
+    starred = False
+    for line in SPREAD_LINES:
+        home_base, away_base = baselines.get(line, (0.5, 0.5))
+        for d in SPREAD_DELTAS:
+            res = _sweep_spread_at_line(rows, line, d)
+            for side, (w, l), base in (
+                ("HOME", res["home"], home_base),
+                ("AWAY", res["away"], away_base),
+            ):
+                n = w + l
+                if n < 15:
+                    continue
+                wr = w/n
+                wlo = _wilson_lower(w, n)
+                if wlo > base and (wr - base) >= 0.02:
+                    starred = True
+                    print(
+                        f"  ★ {side}-spread line={line} δ={d}  "
+                        f"n={n} WR={wr:.1%} wlo={wlo:.1%} vs baseline {base:.1%}"
+                    )
+    if not starred:
+        print(
+            "  NO statistically robust signal found — at every (line, δ) "
+            "combo the predictor's Wilson 95% lower bound sits at or "
+            "below the trivial direction-baseline. Do NOT enable "
+            "KXMLBSPREAD on the strength of this backtest alone."
+        )
+    print("=" * 78)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1193,10 +1419,11 @@ def main() -> None:
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument(
         "--mode",
-        choices=("winner", "total", "team-total", "all"),
+        choices=("winner", "total", "team-total", "spread", "all"),
         default="winner",
-        help="winner (default, original game-winner backtest), total "
-             "(KXMLBTOTAL), team-total (KXMLBTEAMTOTAL), or all three.",
+        help="winner (default, KXMLBGAME), total (KXMLBTOTAL), "
+             "team-total (KXMLBTEAMTOTAL), spread (KXMLBSPREAD run-line), "
+             "or all four.",
     )
     args = parser.parse_args()
 
@@ -1261,6 +1488,12 @@ def main() -> None:
         rows_tt, skipped_tt = run_team_total_backtest(games, gamelogs_by_pid)
         print()
         report_team_total(rows_tt, skipped_tt)
+
+    if args.mode in ("spread", "all"):
+        print("\nRunning KXMLBSPREAD backtest...", flush=True)
+        rows_s, skipped_s = run_spread_backtest(games, gamelogs_by_pid)
+        print()
+        report_spread(rows_s, skipped_s)
 
 
 if __name__ == "__main__":
