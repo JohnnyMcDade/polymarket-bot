@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -41,7 +42,10 @@ KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 HOME_ADVANTAGE_RUNS = 0.3
 ERA_WEIGHT = 0.5
 COHORT_LINES = (1.5, 2.5)
-DELTA = 1.0  # PROJECTED_MARGIN must clear (line + DELTA) in spread-team's favor
+# δ threshold (PROJECTED_MARGIN must clear `line + DELTA` in spread-team's
+# favor). Same env var as the production gate so the scout and the live
+# bot agree on which tickers qualify. Default 0.75 per the 2026-06-20 sweep.
+DELTA = float(os.getenv("KALSHI_SPREAD_DELTA", "0.75"))
 
 
 def fetch_kxmlbspread_markets(limit: int = 200) -> list[dict]:

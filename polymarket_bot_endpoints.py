@@ -547,7 +547,11 @@ def _dash_next_buy_no_candidate(stats: dict) -> dict | None:
 _SPREAD_HOME_ADV = 0.3
 _SPREAD_ERA_WEIGHT = 0.5
 _SPREAD_COHORT_LINES = (1.5, 2.5)
-_SPREAD_DELTA = 1.0
+# Mirror of kalshi_edge.SPREAD_DELTA — same env var so the dashboard
+# candidate card and the production gate can't drift apart. Default
+# 0.75 per the 2026-06-20 backtest that validated δ=0.75 cells as
+# Wilson-stable at line 1.5 (both directions) and 2.5 HOME.
+_SPREAD_DELTA = float(os.getenv("KALSHI_SPREAD_DELTA", "0.75"))
 
 
 def _dash_next_spread_candidate(stats: dict) -> dict | None:

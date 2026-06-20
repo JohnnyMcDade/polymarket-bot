@@ -144,6 +144,13 @@ TENNIS_MIN_RANK_GAP = int(os.getenv("KALSHI_TENNIS_MIN_RANK_GAP", "50"))
 # Both env-overridable. End date is start + WIMBLEDON_LENGTH_DAYS - 1.
 WIMBLEDON_START_ISO = os.getenv("KALSHI_WIMBLEDON_START", "2026-06-30")
 WIMBLEDON_LENGTH_DAYS = int(os.getenv("KALSHI_WIMBLEDON_LENGTH_DAYS", "14"))
+# KXMLBSPREAD δ-gate threshold: PROJECTED_MARGIN must clear (line + δ)
+# in the spread-team's favor. Default 0.75 (2026-06-20 backtest: 4 ★
+# cells at this δ, same star count as δ=1.0, 30% more bets at line 1.5
+# with WR drop of only 2-3pp). Env-overridable for live tuning without
+# a deploy — but lower than 0.5 puts you below the lowest tested cell
+# and higher than 1.5 starts losing the AWAY-side signal.
+SPREAD_DELTA = float(os.getenv("KALSHI_SPREAD_DELTA", "0.75"))
 TENNIS_WIMBLEDON_MAX_ASK_CENTS = int(
     os.getenv("KALSHI_TENNIS_WIMBLEDON_MAX_ASK_CENTS", "55")
 )
@@ -1043,7 +1050,7 @@ KXMLBSPREAD RUN-LINE METHODOLOGY (NEW 2026-06-20 pilot rollout)
 - KXMLBSPREAD tickers resolve YES if a specific team wins by ≥N runs. Ticker tail format: `<TEAM_ABBR><N>` (e.g. `KXMLBSPREAD-26JUN082205MILATH-MIL2` = "Will MIL win by 2+?"). The implied betting line is `N - 0.5` (so ticker tail ending in `2` = line 1.5; tail ending in `3` = line 2.5). The matchup stem before the team tail is `<AWAY><HOME>` (so `MILATH` = MIL@ATH; MIL is away, ATH is home).
 - COHORT GATE — BUY (YES) is allowed ONLY on tickers where the implied line is 1.5 or 2.5 — i.e. ticker tail ending in `2` or `3`. Tail `1` (line 0.5, "any win") and tail `4+` (line 3.5+) are out-of-cohort. 180d backtest (n=759) shows Wilson-stable signal at lines 1.5 and 2.5 with δ ≥ 1.0 in both HOME and AWAY directions; lines outside this band are either statistically marginal or one-sided. Out-of-cohort BUY recommendations are dropped to SKIP post-Claude.
 - PROJECTED_MARGIN — required output field. Estimate from the SPREAD-TEAM's perspective: positive if the team named in the ticker tail is projected to win, negative if they lose. Compute as: `spread_team_rs_per_game - opp_team_rs_per_game + 0.5 × (opp_starter_rolling_era_last3 - spread_team_starter_rolling_era_last3) + (+0.3 if spread-team is home else -0.3)`. Use the matchup ordering (away then home in the ticker stem) to determine home/away.
-- δ ≥ 1.0 GATE — emit BUY only when PROJECTED_MARGIN ≥ (line + 1.0) in the spread-team's favor. For line=1.5 (ticker tail `2`) BUY only if projected ≥ 2.5; for line=2.5 (ticker tail `3`) BUY only if projected ≥ 3.5. Below this threshold the 180d signal compressed to noise; the 60d window already shows the edge eroding. The code gate enforces this — projections that fail it force SKIP regardless of computed edge.
+- δ ≥ {SPREAD_DELTA} GATE — emit BUY only when PROJECTED_MARGIN ≥ (line + {SPREAD_DELTA}) in the spread-team's favor. For line=1.5 (ticker tail `2`) BUY only if projected ≥ (1.5 + {SPREAD_DELTA}); for line=2.5 (ticker tail `3`) BUY only if projected ≥ (2.5 + {SPREAD_DELTA}). The 180d backtest at this δ shows Wilson-stable signal at every starred cell. The code gate enforces this — projections that fail it force SKIP regardless of computed edge.
 - CONFIDENCE CAP — MEDIUM maximum during this pilot rollout. HIGH BUY recommendations are downgraded to MEDIUM post-Claude. Same precedent as the KXMLBTOTAL BUY_NO rollout.
 - BOTH DIRECTIONS allowed — the 180d backtest showed signal on both home-favorite and away-favorite spread bets at line=1.5 / δ=1.0. Pick the spread-team your projection favors; do not infer market expectations from the price.
 - NO ERA cohort filter — the proposed "both starters avg ERA ≤ 3.00" cohort had insufficient sample (only 10 of 206 cohort games fired a bet in the 180d backtest, vs 98 in the unfiltered cohort at the same cell). Use the full predictor on every KXMLBSPREAD ticker that passes the line cohort.
@@ -2368,7 +2375,7 @@ def run() -> None:
                                         )
                                         if m_margin:
                                             margin = float(m_margin.group(1))
-                                    threshold = spread_line + 1.0
+                                    threshold = spread_line + SPREAD_DELTA
                                     if margin is not None and margin < threshold:
                                         post_drops["spread_margin_fail"] = (
                                             post_drops.get("spread_margin_fail", 0) + 1

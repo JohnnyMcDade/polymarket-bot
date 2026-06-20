@@ -1276,7 +1276,7 @@ def report_team_total(rows: list[dict[str, Any]], skipped: dict[str, int]) -> No
 
 
 SPREAD_LINES = (1.5, 2.5, 3.5)
-SPREAD_DELTAS = (0.5, 1.0, 1.5)
+SPREAD_DELTAS = (0.5, 0.75, 1.0, 1.5)
 
 
 def report_spread(rows: list[dict[str, Any]], skipped: dict[str, int]) -> None:
