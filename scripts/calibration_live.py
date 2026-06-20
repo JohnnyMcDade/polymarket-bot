@@ -321,6 +321,47 @@ def main() -> int:
                 print(f"    Pre-fix:  {_format_phase(phases['pre'])}")
                 print(f"    Post-fix: {_format_phase(phases['post'])}")
 
+    # Hourly KXMLBTOTAL WR — bucket settled trades by placement hour
+    # (UTC) in four six-hour windows. n is small per bucket given the
+    # cap=2/night cadence, so a single hot/cold streak in any bucket
+    # can dominate the read. Sample-size column makes that explicit.
+    # Sourced from `trades` (same --since filter as the calibration
+    # window above) restricted to KXMLBTOTAL won/lost.
+    kxmlb_settled = [
+        t for t in trades
+        if (t.get("ticker") or "").startswith("KXMLBTOTAL")
+        and t.get("outcome") in ("won", "lost")
+    ]
+    if kxmlb_settled:
+        hour_buckets = [
+            (0, 6, "00:00-06:00 UTC"),
+            (6, 12, "06:00-12:00 UTC"),
+            (12, 18, "12:00-18:00 UTC"),
+            (18, 24, "18:00-24:00 UTC"),
+        ]
+        def _bucket_of(ts: str) -> int | None:
+            if not ts or len(ts) < 13:
+                return None
+            try:
+                return int(ts[11:13])
+            except ValueError:
+                return None
+
+        print("\nKXMLBTOTAL win rate by placement hour (UTC) — sample sizes small, exploratory only:")
+        for start, end, label in hour_buckets:
+            items = [
+                t for t in kxmlb_settled
+                if (h := _bucket_of(t.get("timestamp") or "")) is not None
+                and start <= h < end
+            ]
+            if not items:
+                print(f"  {label}: n=0")
+                continue
+            wins = sum(1 for t in items if t.get("outcome") == "won")
+            losses = len(items) - wins
+            wr = wins / len(items)
+            print(f"  {label}: {wins}W/{losses}L ({wr:.0%}) — n={len(items)}")
+
     # Prediction accuracy (KXMLBSPREAD) — sourced from
     # /app/data/spread_accuracy.json. Same --since gating as above.
     # 'HOME/AWAY correct' counts BET WINS (actual_margin ≥ N) split by
