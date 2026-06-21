@@ -1608,7 +1608,18 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         # Orange-tint the BUY_NO sub-row to match the Discord embed color
         # and signal at a glance that it's a side-stratified cohort, not
         # a different series.
-        row_class = " class='side-no-row'" if r.get("side") == "no" else ""
+        wr_pct = r["wr"] * 100
+        pnl = r["pnl"]
+        if wr_pct < 45 and pnl < 0:
+            health_cls = "health-red"
+        elif wr_pct >= 55 and pnl > 0:
+            health_cls = "health-green"
+        else:
+            health_cls = "health-yellow"
+        classes = [health_cls]
+        if r.get("side") == "no":
+            classes.append("side-no-row")
+        row_class = f" class='{' '.join(classes)}'"
         series_table_rows.append(
             f"<tr{row_class}>"
             f"<td>{r['series']}</td>"
@@ -1939,6 +1950,9 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
   .side-no-row td:first-child {{ color: #8a4416; font-weight: 600; }}
   .conf-inverted {{ background: #fdecea; }}
   .conf-inverted td:first-child {{ color: #b22222; font-weight: 700; }}
+  .health-green {{ background: #ecf7ec; }}
+  .health-yellow {{ background: #fdf6e0; }}
+  .health-red {{ background: #fbe9e7; }}
   .trade-cards {{ display: flex; gap: 1em; flex-wrap: wrap; margin: 0.5em 0 1.5em; }}
   .trade-card {{ flex: 1 1 0; min-width: 280px; padding: 12px 16px;
                  border-radius: 6px; border: 1px solid #e5e5e9;
