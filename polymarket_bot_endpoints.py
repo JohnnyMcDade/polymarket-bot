@@ -1269,10 +1269,10 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_spread = _dash_next_spread_candidate(stats_cache)
     spread_breakdown = _dash_spread_breakdown()
     streak = _dash_kxmlbtotal_streak(all_trades)
+    gate_activity = _dash_gate_activity()
     api_cost = _dash_api_cost_estimate(gate_activity.get("cycles_in_window"))
     btc_status = _dash_btc_status(stats_cache)
     recalib_status = _dash_recalib_status()
-    gate_activity = _dash_gate_activity()
     prediction_accuracy = _dash_prediction_accuracy(
         since if (since and since.lower() != "all") else None
     )
