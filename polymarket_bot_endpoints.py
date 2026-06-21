@@ -705,7 +705,9 @@ def _dash_api_cost_estimate(cycles_in_window: int | None) -> dict[str, Any]:
     }
 
 
-def _dash_kxmlbtotal_streak(trades: list[dict]) -> dict[str, Any]:
+def _dash_kxmlbtotal_streak(
+    trades: list[dict], side: str | None = None
+) -> dict[str, Any]:
     """Walk settled KXMLBTOTAL trades backward from the most recent to
     find the current consecutive same-outcome streak. Returns
     {direction: 'win'|'loss'|None, count: int, since_iso: str|None}.
@@ -713,11 +715,15 @@ def _dash_kxmlbtotal_streak(trades: list[dict]) -> dict[str, Any]:
     'win' = the latest streak is wins; 'loss' = the latest streak is
     losses; None when no settled KXMLBTOTAL trades exist. The
     `since_iso` field is the timestamp of the trade that *started*
-    the streak — useful for surfacing "started ~2 days ago" context."""
+    the streak — useful for surfacing "started ~2 days ago" context.
+
+    When `side` is "yes" or "no", restrict to trades on that side
+    (trades default to "yes" when the side field is missing)."""
     settled = [
         t for t in trades
         if (t.get("ticker") or "").startswith("KXMLBTOTAL")
         and t.get("outcome") in ("won", "lost")
+        and (side is None or (t.get("side") or "yes") == side)
     ]
     if not settled:
         return {"direction": None, "count": 0, "since_iso": None}
@@ -1268,7 +1274,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     next_buy_no = _dash_next_buy_no_candidate(stats_cache)
     next_spread = _dash_next_spread_candidate(stats_cache)
     spread_breakdown = _dash_spread_breakdown()
-    streak = _dash_kxmlbtotal_streak(all_trades)
+    streak_yes = _dash_kxmlbtotal_streak(all_trades, side="yes")
+    streak_no = _dash_kxmlbtotal_streak(all_trades, side="no")
     gate_activity = _dash_gate_activity()
     api_cost = _dash_api_cost_estimate(gate_activity.get("cycles_in_window"))
     btc_status = _dash_btc_status(stats_cache)
@@ -1978,12 +1985,22 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     <span class="value">{gl['passes']} / {gl['total']}</span>
   </div>
   <div class="card">
-    <span class="label">KXMLBTOTAL streak</span>
-    <span class="value{' pos' if streak['direction']=='win' else ' neg' if streak['direction']=='loss' else ''}">{
-      f"🔥 {streak['count']}-game win streak"
-      if streak['direction']=='win'
-      else (f"❄️ {streak['count']}-game losing streak"
-            if streak['direction']=='loss'
+    <span class="label">KXMLBTOTAL YES</span>
+    <span class="value{' pos' if streak_yes['direction']=='win' else ' neg' if streak_yes['direction']=='loss' else ''}">{
+      f"🔥 {streak_yes['count']}-game win streak"
+      if streak_yes['direction']=='win'
+      else (f"❄️ {streak_yes['count']}-game losing streak"
+            if streak_yes['direction']=='loss'
+            else '—')
+    }</span>
+  </div>
+  <div class="card">
+    <span class="label">KXMLBTOTAL NO</span>
+    <span class="value{' pos' if streak_no['direction']=='win' else ' neg' if streak_no['direction']=='loss' else ''}">{
+      f"🔥 {streak_no['count']}-game win streak"
+      if streak_no['direction']=='win'
+      else (f"❄️ {streak_no['count']}-game losing streak"
+            if streak_no['direction']=='loss'
             else '—')
     }</span>
   </div>
