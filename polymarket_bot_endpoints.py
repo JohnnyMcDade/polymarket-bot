@@ -43,7 +43,7 @@ keep these shapes — that's the contract.
 
 from __future__ import annotations
 
-import html
+import html as _html
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -2032,8 +2032,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             reasoning_cell = (
                 f"<details class='reasoning'>"
                 f"<summary>view ({len(reasoning)}c)</summary>"
-                f"<div class='reasoning-meta'>{html.escape(ticker)}</div>"
-                f"<pre class='reasoning-body'>{html.escape(reasoning)}</pre>"
+                f"<div class='reasoning-meta'>{_html.escape(ticker)}</div>"
+                f"<pre class='reasoning-body'>{_html.escape(reasoning)}</pre>"
                 f"</details>"
             )
         else:
