@@ -1859,7 +1859,38 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             )
         cyc_n = gate_activity["cycles_in_window"]
         upd = (gate_activity["updated_at"] or "")[:19].replace("T", " ")
+
+        # Effectiveness rollup — gates whose firing means a BUY was
+        # prevented (vs gates labeled "context" in the spec above).
+        # Each block ≈ one bad $1 trade we would have placed, so the
+        # estimate is just $1 × blocked at the current pilot stake.
+        _blocking_keys = (
+            "rule1_self_enforced",
+            "rule1_violation",
+            "edge_sanity_fail",
+            "buy_no_ineligible",
+            "buy_no_projection_fail",
+        )
+        totals = gate_activity["totals_24h"]
+        rule1_self = int(totals.get("rule1_self_enforced", 0))
+        rule1_code = int(totals.get("rule1_violation", 0))
+        edge_sanity = int(totals.get("edge_sanity_fail", 0))
+        blocked_total = sum(int(totals.get(k, 0)) for k in _blocking_keys)
+        pnl_saved = blocked_total  # $1 per trade pilot stake
+        effectiveness_html = (
+            f'<div class="highlight highlight-muted" '
+            f'style="margin-bottom:8px;">'
+            f'🛡️ <strong>Gate effectiveness (24h):</strong> '
+            f'Rule 1 self-enforced <strong>{rule1_self}</strong> · '
+            f'Rule 1 code <strong>{rule1_code}</strong> · '
+            f'Edge sanity <strong>{edge_sanity}</strong> → '
+            f'Gates blocked ~<strong>{blocked_total}</strong> bad trades. '
+            f'Est. PnL saved: ~<strong>${pnl_saved}</strong> at $1/trade.'
+            f'</div>'
+        )
+
         gate_activity_html = (
+            f'{effectiveness_html}'
             f'<p class="muted" style="margin-top:0;">'
             f'Rolling 24h post-Claude drop counts across '
             f'<strong>{cyc_n}</strong> cycle(s). '
