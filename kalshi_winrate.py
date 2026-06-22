@@ -291,6 +291,15 @@ def _compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     by_series = _breakdown(decided, lambda t: _series_of(t.get("ticker", "")))
     by_confidence = _breakdown(decided, lambda t: t.get("confidence") or "UNKNOWN")
 
+    decided_sorted = sorted(
+        decided,
+        key=lambda t: str(t.get("settled_at") or t.get("timestamp") or ""),
+    )
+    last10 = decided_sorted[-10:]
+    by_confidence_last10 = _breakdown(
+        last10, lambda t: t.get("confidence") or "UNKNOWN"
+    )
+
     return {
         "total_trades": len(trades),
         "decided": len(decided),
@@ -308,6 +317,8 @@ def _compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
         "worst": worst,
         "by_series": by_series,
         "by_confidence": by_confidence,
+        "by_confidence_last10": by_confidence_last10,
+        "last10_n": len(last10),
     }
 
 
@@ -322,6 +333,22 @@ def _format_breakdown(breakdown: dict[str, dict[str, Any]], limit: int = 6) -> s
             f"({b['wins']}W/{b['losses']}L) "
             f"{_format_usd(b['total_pnl'])} edge={b['avg_edge']*100:+.0f}%"
         )
+    return "\n".join(lines)
+
+
+def _format_confidence_trend(breakdown: dict[str, dict[str, Any]]) -> str:
+    if not breakdown:
+        return "—"
+    order = ["HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+    items = sorted(
+        breakdown.items(),
+        key=lambda kv: (order.index(kv[0]) if kv[0] in order else len(order), kv[0]),
+    )
+    lines = []
+    for k, b in items:
+        n = b["decided"]
+        noun = "trade" if n == 1 else "trades"
+        lines.append(f"{k}: {n} {noun} ({b['win_rate']:.0%} WR)")
     return "\n".join(lines)
 
 
@@ -390,6 +417,9 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
         {"name": "🥶 Worst Trade", "value": _trade_line(s["worst"]), "inline": False},
         {"name": "📋 By Series", "value": _format_breakdown(s["by_series"]) or "—", "inline": False},
         {"name": "🎯 By Confidence", "value": _format_breakdown(s["by_confidence"]) or "—", "inline": False},
+        {"name": f"📈 Last {s.get('last10_n', 0)} trades — confidence",
+         "value": _format_confidence_trend(s.get("by_confidence_last10") or {}),
+         "inline": False},
     ]
 
     if s["decided"] == 0:
