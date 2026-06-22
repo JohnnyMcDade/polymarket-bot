@@ -43,6 +43,41 @@ SERIES_TICKER = "KXNFLWINS"
 PAGE_LIMIT = 200
 NFL_TEAM_COUNT = 32
 
+# Maps the trailing team code (as it appears in the Kalshi event
+# ticker, e.g. "27IND" → "IND") to division. Kalshi uses the standard
+# 3-letter abbreviations except a handful (JAX may be JAC, WAS may be
+# WSH) — both spellings included so the lookup never misses.
+NFL_DIVISIONS: dict[str, list[str]] = {
+    "AFC East":  ["BUF", "MIA", "NE",  "NYJ"],
+    "AFC North": ["BAL", "CIN", "CLE", "PIT"],
+    "AFC South": ["HOU", "IND", "JAX", "TEN"],
+    "AFC West":  ["DEN", "KC",  "LV",  "LAC"],
+    "NFC East":  ["DAL", "NYG", "PHI", "WAS"],
+    "NFC North": ["CHI", "DET", "GB",  "MIN"],
+    "NFC South": ["ATL", "CAR", "NO",  "TB"],
+    "NFC West":  ["ARI", "LAR", "SF",  "SEA"],
+}
+# Alternate abbreviations Kalshi has been observed to use. Maps the
+# variant → canonical so division grouping doesn't drop a team when
+# the listing uses an alias.
+ABBR_ALIASES: dict[str, str] = {
+    "JAC": "JAX",
+    "WSH": "WAS",
+    "LA":  "LAR",  # ambiguous historically; current LA = Rams
+}
+
+TEAM_TO_DIVISION: dict[str, str] = {
+    team: div for div, teams in NFL_DIVISIONS.items() for team in teams
+}
+
+
+def division_of(abbr: str) -> str:
+    """Map team abbreviation → division name. Returns "Unknown" when
+    Kalshi lists a team code we don't recognize (printed in its own
+    "Unknown" bucket so unmapped teams aren't silently dropped)."""
+    canonical = ABBR_ALIASES.get(abbr, abbr)
+    return TEAM_TO_DIVISION.get(canonical, "Unknown")
+
 
 def fetch_all_markets() -> list[dict[str, Any]]:
     """Pull every open KXNFLWINS market across all pages. ~32 teams ×
@@ -140,6 +175,7 @@ def main() -> int:
         impl = implied_win_total(ms_sorted)
         teams.append({
             "team": abbr,
+            "division": division_of(abbr),
             "event_ticker": event,
             "strikes": [
                 {
@@ -174,30 +210,56 @@ def main() -> int:
     print(header)
     print()
 
+    # Group teams by division for display. Iterate NFL_DIVISIONS in
+    # declaration order (AFC East, North, …, NFC West) so the layout
+    # is stable across runs; anything Kalshi lists under an unmapped
+    # code lands in a trailing "Unknown" bucket.
+    by_division: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for t in teams:
-        impl = t["implied_win_total"]
-        impl_ask = t["implied_yes_ask"]
-        if impl is not None:
-            tag = f"implied o/u {impl - 0.5:.1f} (yes_ask ${impl_ask:.2f} @ {impl}+ wins)"
-        else:
-            tag = "no quotes"
-        print(f"--- {t['team']:>3} ({t['event_ticker']})  {tag}")
-        # strikes table: strike | yes_ask | no_ask | vol | OI
-        print(
-            f"     {'strike':<8}{'yes_ask':>10}{'yes_bid':>10}"
-            f"{'no_ask':>10}{'volume':>10}{'OI':>10}"
-        )
-        for s in t["strikes"]:
-            ya = f"${s['yes_ask']:.2f}" if s["yes_ask"] is not None else "—"
-            yb = f"${s['yes_bid']:.2f}" if s["yes_bid"] is not None else "—"
-            na = f"${s['no_ask']:.2f}" if s["no_ask"] is not None else "—"
-            marker = "  ← implied" if s["strike"] == impl else ""
+        by_division[t["division"]].append(t)
+    division_order = list(NFL_DIVISIONS.keys())
+    if "Unknown" in by_division:
+        division_order.append("Unknown")
+
+    for division in division_order:
+        ts = by_division.get(division) or []
+        if not ts:
+            continue
+        # Use canonical codes (apply ABBR_ALIASES) so an alias like
+        # JAC doesn't show JAX as missing despite being effectively listed.
+        listed_codes = {ABBR_ALIASES.get(t["team"], t["team"]) for t in ts}
+        expected = set(NFL_DIVISIONS.get(division, []))
+        missing_in_div = sorted(expected - listed_codes) if expected else []
+        head = f"=== {division}  ({len(ts)}/4 listed)"
+        if missing_in_div:
+            head += f"  missing: {', '.join(missing_in_div)}"
+        print(head)
+        for t in ts:
+            impl = t["implied_win_total"]
+            impl_ask = t["implied_yes_ask"]
+            if impl is not None:
+                tag = (
+                    f"implied o/u {impl - 0.5:.1f} "
+                    f"(yes_ask ${impl_ask:.2f} @ {impl}+ wins)"
+                )
+            else:
+                tag = "no quotes"
+            print(f"--- {t['team']:>3} ({t['event_ticker']})  {tag}")
             print(
-                f"     {str(s['strike']) + '+':<8}{ya:>10}{yb:>10}{na:>10}"
-                f"{s['volume_fp']:>10.0f}{s['open_interest_fp']:>10.0f}"
-                f"{marker}"
+                f"     {'strike':<8}{'yes_ask':>10}{'yes_bid':>10}"
+                f"{'no_ask':>10}{'volume':>10}{'OI':>10}"
             )
-        print()
+            for s in t["strikes"]:
+                ya = f"${s['yes_ask']:.2f}" if s["yes_ask"] is not None else "—"
+                yb = f"${s['yes_bid']:.2f}" if s["yes_bid"] is not None else "—"
+                na = f"${s['no_ask']:.2f}" if s["no_ask"] is not None else "—"
+                marker = "  ← implied" if s["strike"] == impl else ""
+                print(
+                    f"     {str(s['strike']) + '+':<8}{ya:>10}{yb:>10}{na:>10}"
+                    f"{s['volume_fp']:>10.0f}{s['open_interest_fp']:>10.0f}"
+                    f"{marker}"
+                )
+            print()
 
     if not team_filter and len(by_event) < NFL_TEAM_COUNT:
         listed = {team_abbr_from_event(e) for e in by_event}
