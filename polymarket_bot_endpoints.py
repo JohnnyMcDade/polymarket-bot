@@ -774,28 +774,34 @@ def _dash_api_cost_estimate(cycles_in_window: int | None) -> dict[str, Any]:
     }
 
 
-def _dash_kxmlbtotal_streak(
-    trades: list[dict], side: str | None = None
+def _dash_series_streak(
+    trades: list[dict],
+    series_prefix: str,
+    side: str | None = None,
 ) -> dict[str, Any]:
-    """Walk settled KXMLBTOTAL trades backward from the most recent to
+    """Walk settled trades for a series backward from the most recent to
     find the current consecutive same-outcome streak. Returns
-    {direction: 'win'|'loss'|None, count: int, since_iso: str|None}.
+    {direction: 'win'|'loss'|None, count: int, since_iso: str|None,
+     pending: int}.
 
     'win' = the latest streak is wins; 'loss' = the latest streak is
-    losses; None when no settled KXMLBTOTAL trades exist. The
-    `since_iso` field is the timestamp of the trade that *started*
-    the streak — useful for surfacing "started ~2 days ago" context.
+    losses; None when no settled trades on this series exist. The
+    `since_iso` field is the timestamp of the trade that *started* the
+    streak. `pending` counts open trades on this series so callers can
+    render a "N trade pending" state before any settle.
 
     When `side` is "yes" or "no", restrict to trades on that side
     (trades default to "yes" when the side field is missing)."""
-    settled = [
+    series_trades = [
         t for t in trades
-        if (t.get("ticker") or "").startswith("KXMLBTOTAL")
-        and t.get("outcome") in ("won", "lost")
+        if (t.get("ticker") or "").startswith(series_prefix)
         and (side is None or (t.get("side") or "yes") == side)
     ]
+    settled = [t for t in series_trades if t.get("outcome") in ("won", "lost")]
+    pending = sum(1 for t in series_trades if t.get("outcome") == "pending")
     if not settled:
-        return {"direction": None, "count": 0, "since_iso": None}
+        return {"direction": None, "count": 0, "since_iso": None,
+                "pending": pending}
     settled.sort(key=lambda t: t.get("timestamp") or "")
     latest = settled[-1]
     streak_outcome = latest.get("outcome")
@@ -812,7 +818,14 @@ def _dash_kxmlbtotal_streak(
         "direction": direction,
         "count": count,
         "since_iso": streak_start.get("timestamp"),
+        "pending": pending,
     }
+
+
+def _dash_kxmlbtotal_streak(
+    trades: list[dict], side: str | None = None
+) -> dict[str, Any]:
+    return _dash_series_streak(trades, "KXMLBTOTAL", side=side)
 
 
 def _dash_spread_breakdown() -> dict[str, dict[str, int]]:
@@ -1347,6 +1360,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     spread_breakdown = _dash_spread_breakdown()
     streak_yes = _dash_kxmlbtotal_streak(all_trades, side="yes")
     streak_no = _dash_kxmlbtotal_streak(all_trades, side="no")
+    streak_spread = _dash_series_streak(all_trades, "KXMLBSPREAD")
     gate_activity = _dash_gate_activity()
     api_cost = _dash_api_cost_estimate(gate_activity.get("cycles_in_window"))
     btc_status = _dash_btc_status(stats_cache)
@@ -2135,6 +2149,18 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
       else (f"❄️ {streak_no['count']}-game losing streak"
             if streak_no['direction']=='loss'
             else '—')
+    }</span>
+  </div>
+  <div class="card">
+    <span class="label">📐 KXMLBSPREAD</span>
+    <span class="value{' pos' if streak_spread['direction']=='win' else ' neg' if streak_spread['direction']=='loss' else ''}">{
+      f"🔥 {streak_spread['count']}-game win streak"
+      if streak_spread['direction']=='win'
+      else (f"❄️ {streak_spread['count']}-game losing streak"
+            if streak_spread['direction']=='loss'
+            else (f"{streak_spread['pending']} trade{'s' if streak_spread['pending']!=1 else ''} pending"
+                  if streak_spread['pending'] > 0
+                  else '—'))
     }</span>
   </div>
   <div class="card">
