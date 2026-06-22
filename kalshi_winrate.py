@@ -300,6 +300,8 @@ def _compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
         last10, lambda t: t.get("confidence") or "UNKNOWN"
     )
 
+    daily = _daily_pnl_summary(decided)
+
     return {
         "total_trades": len(trades),
         "decided": len(decided),
@@ -319,6 +321,83 @@ def _compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
         "by_confidence": by_confidence,
         "by_confidence_last10": by_confidence_last10,
         "last10_n": len(last10),
+        "daily": daily,
+    }
+
+
+def _trade_settled_date(t: dict[str, Any]) -> str | None:
+    """UTC date (YYYY-MM-DD) on which the trade settled. Prefers
+    `settled_at` (when the outcome was written); falls back to
+    `timestamp` (trade placement) for older log entries that didn't
+    carry settled_at. Returns None when neither is parseable so the
+    caller skips the trade from the date-windowed summary rather
+    than mis-bucketing it."""
+    raw = t.get("settled_at") or t.get("timestamp")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(raw).replace("Z", "+00:00")
+        ).astimezone(timezone.utc).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _daily_pnl_summary(decided: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the daily/weekly P&L panel shown in the 7AM embed:
+      - yesterday: W/L/PnL count for the UTC day that just ended
+      - rolling7: win rate over the trailing 7 UTC days, plus a
+        delta vs the prior 7 (positive = trending up)
+      - best_week / worst_week: best and worst single trade in the
+        trailing 7 UTC days
+    All windows are anchored on `today - 1` UTC so the 7AM embed
+    summarizes the just-completed trading day, not the in-progress
+    one."""
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    yesterday_iso = yesterday.strftime("%Y-%m-%d")
+    week_start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    prior_week_start = (today - timedelta(days=14)).strftime("%Y-%m-%d")
+
+    yesterday_trades: list[dict[str, Any]] = []
+    week_trades: list[dict[str, Any]] = []
+    prior_week_trades: list[dict[str, Any]] = []
+
+    for t in decided:
+        d = _trade_settled_date(t)
+        if not d:
+            continue
+        if d == yesterday_iso:
+            yesterday_trades.append(t)
+        if week_start <= d <= yesterday_iso:
+            week_trades.append(t)
+        elif prior_week_start <= d < week_start:
+            prior_week_trades.append(t)
+
+    def _bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        wins = sum(1 for r in rows if r["outcome"] == "won")
+        losses = sum(1 for r in rows if r["outcome"] == "lost")
+        pnl = sum(float(r.get("pnl", 0)) for r in rows)
+        wr = wins / len(rows) if rows else 0.0
+        return {"n": len(rows), "wins": wins, "losses": losses, "pnl": pnl, "wr": wr}
+
+    y = _bucket(yesterday_trades)
+    w = _bucket(week_trades)
+    pw = _bucket(prior_week_trades)
+
+    best_week = max(week_trades, key=lambda t: float(t.get("pnl", 0)), default=None)
+    worst_week = min(week_trades, key=lambda t: float(t.get("pnl", 0)), default=None)
+
+    wr_delta_pp = (w["wr"] - pw["wr"]) * 100 if pw["n"] > 0 else None
+
+    return {
+        "yesterday": y,
+        "yesterday_date": yesterday_iso,
+        "rolling7": w,
+        "prior7": pw,
+        "wr_delta_pp": wr_delta_pp,
+        "best_week": best_week,
+        "worst_week": worst_week,
     }
 
 
@@ -334,6 +413,57 @@ def _format_breakdown(breakdown: dict[str, dict[str, Any]], limit: int = 6) -> s
             f"{_format_usd(b['total_pnl'])} edge={b['avg_edge']*100:+.0f}%"
         )
     return "\n".join(lines)
+
+
+def _format_daily_pnl(daily: dict[str, Any]) -> str:
+    """Multi-line block: yesterday + rolling-7 + best/worst-of-week.
+    Designed to fit one Discord embed field (≤1024 chars). Trimmed
+    market titles to keep alignment readable on mobile."""
+    y = daily["yesterday"]
+    w = daily["rolling7"]
+    delta = daily.get("wr_delta_pp")
+
+    if y["n"] == 0:
+        yesterday_line = f"Yesterday ({daily['yesterday_date']}): no trades settled"
+    else:
+        yesterday_line = (
+            f"Yesterday ({daily['yesterday_date']}): "
+            f"{y['wins']}W / {y['losses']}L · "
+            f"{_format_usd(y['pnl'])} · {y['wr']:.0%} WR"
+        )
+
+    if delta is None:
+        trend = ""
+    elif delta > 0.5:
+        trend = f" (📈 +{delta:.1f}pp vs prior 7d)"
+    elif delta < -0.5:
+        trend = f" (📉 {delta:.1f}pp vs prior 7d)"
+    else:
+        trend = f" (≈ flat vs prior 7d)"
+
+    if w["n"] == 0:
+        rolling_line = "7-day rolling: no trades"
+    else:
+        rolling_line = (
+            f"7-day rolling: {w['wins']}W / {w['losses']}L · "
+            f"{_format_usd(w['pnl'])} · {w['wr']:.0%} WR{trend}"
+        )
+
+    def _trade_line(t: dict[str, Any] | None) -> str:
+        if not t:
+            return "—"
+        title = (t.get("title") or t.get("ticker") or "?")[:50]
+        return f"{title} → {_format_usd(float(t.get('pnl', 0)))}"
+
+    best = _trade_line(daily.get("best_week"))
+    worst = _trade_line(daily.get("worst_week"))
+
+    return (
+        f"{yesterday_line}\n"
+        f"{rolling_line}\n"
+        f"🥇 Best of week: {best}\n"
+        f"🥶 Worst of week: {worst}"
+    )
 
 
 def _format_confidence_trend(breakdown: dict[str, dict[str, Any]]) -> str:
@@ -415,6 +545,9 @@ def _build_embed(s: dict[str, Any]) -> dict[str, Any]:
         {"name": "Δ", "value": f"{(s['avg_edge_wins']-s['avg_edge_losses'])*100:+.1f}%", "inline": True},
         {"name": "🥇 Best Trade", "value": _trade_line(s["best"]), "inline": False},
         {"name": "🥶 Worst Trade", "value": _trade_line(s["worst"]), "inline": False},
+        {"name": "📅 Daily P&L",
+         "value": _format_daily_pnl(s["daily"]) if s.get("daily") else "—",
+         "inline": False},
         {"name": "📋 By Series", "value": _format_breakdown(s["by_series"]) or "—", "inline": False},
         {"name": "🎯 By Confidence", "value": _format_breakdown(s["by_confidence"]) or "—", "inline": False},
         {"name": f"📈 Last {s.get('last10_n', 0)} trades — confidence",
