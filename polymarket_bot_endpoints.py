@@ -561,6 +561,91 @@ _DASH_STADIUM: dict[str, str] = {
 }
 
 
+_MLB_TEAM_ABBRS: frozenset[str] = frozenset(_DASH_STADIUM.keys())
+
+
+def _dash_matchup_from_ticker(ticker: str) -> tuple[str, str] | None:
+    """Parse an MLB ticker to (away, home) by enumerating known team
+    abbrs. Handles KXMLBTOTAL (`-26JUN18STLKC-9`) and KXMLBSPREAD
+    (`-26JUN201610MILATL-MIL2`) — KXMLBTOTAL has only date in the
+    middle segment, KXMLBSPREAD prepends HHMM. Returns None for any
+    ticker that doesn't decompose into two known abbrs (KXMLBGAME,
+    non-MLB series, malformed inputs), so callers can short-circuit.
+
+    Used by the cross-series correlation guard: KXMLBTOTAL and
+    KXMLBSPREAD trades on the same (away, home) game are not
+    independent (a runs blowout drives both), so flag overlaps."""
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    middle = parts[1]
+    # Strip the date+optional-time prefix. KXMLBTOTAL date is YYMMMDD
+    # (7 chars); KXMLBSPREAD adds HHMM (11 chars total). Strip the
+    # longer prefix first when it ends in digits; fall back to the
+    # 7-char prefix.
+    rest = middle
+    for plen in (11, 7):
+        if len(middle) > plen:
+            candidate = middle[:plen]
+            # YYMMMDD or YYMMMDDHHMM: digits + 3 month-letters + digits.
+            if (
+                candidate[:2].isdigit()
+                and candidate[2:5].isalpha()
+                and candidate[5:7].isdigit()
+                and (plen == 7 or candidate[7:11].isdigit())
+            ):
+                rest = middle[plen:]
+                break
+    # `rest` now holds AWAYHOME (e.g. "STLKC", "MILATL"). Team abbrs
+    # are 2 or 3 chars; try all (away_len, home_len) splits that land
+    # on known abbrs. If multiple split positions are valid we prefer
+    # the longer-away split (matches the ordering Kalshi uses).
+    for away_len in (3, 2):
+        if len(rest) <= away_len:
+            continue
+        away = rest[:away_len]
+        home = rest[away_len:]
+        if away in _MLB_TEAM_ABBRS and home in _MLB_TEAM_ABBRS:
+            return (away, home)
+    return None
+
+
+def _dash_series_correlation_guard(trades: list[dict]) -> list[dict]:
+    """Flag matchups where BOTH KXMLBTOTAL and KXMLBSPREAD have a
+    pending or settled bet from today. The runs total and the run-line
+    aren't independent (a 10-2 blowout drives the spread to cover and
+    the total over), so doubling up on the same game amplifies game-
+    specific variance — worth a visible warning even if we don't block
+    it.
+
+    Returns one row per correlated matchup with the contributing
+    tickers; empty list when nothing today overlaps."""
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    by_matchup: dict[tuple[str, str], dict[str, list[str]]] = {}
+    for t in trades:
+        ts = (t.get("timestamp") or "")[:10]
+        if ts != today_iso:
+            continue
+        series = _dash_series_of(t.get("ticker", ""))
+        if series not in {"KXMLBTOTAL", "KXMLBSPREAD"}:
+            continue
+        mu = _dash_matchup_from_ticker(t.get("ticker", ""))
+        if mu is None:
+            continue
+        bucket = by_matchup.setdefault(mu, {"KXMLBTOTAL": [], "KXMLBSPREAD": []})
+        bucket[series].append(t.get("ticker", ""))
+    out: list[dict] = []
+    for (away, home), bucket in by_matchup.items():
+        if bucket["KXMLBTOTAL"] and bucket["KXMLBSPREAD"]:
+            out.append({
+                "matchup": f"{away}@{home}",
+                "total_tickers": sorted(set(bucket["KXMLBTOTAL"])),
+                "spread_tickers": sorted(set(bucket["KXMLBSPREAD"])),
+            })
+    out.sort(key=lambda r: r["matchup"])
+    return out
+
+
 def _dash_utc_to_az_str(utc_hhmm: str) -> str:
     """Convert a 'HH:MM' UTC time string to Arizona local 12-hour clock.
     Arizona doesn't observe DST so it's MST year-round = UTC-7. Returns
@@ -1629,6 +1714,35 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</div>'
         )
 
+    # Cross-series correlation guard. KXMLBTOTAL and KXMLBSPREAD on the
+    # same game share game-specific variance (a blowout drives both), so
+    # any matchup with both today gets a visible warning. all_trades
+    # because the bot may have placed before midnight UTC and the user is
+    # viewing during the windowed-since slice.
+    correlated = _dash_series_correlation_guard(all_trades)
+    if correlated:
+        rows = []
+        for c in correlated:
+            tot = ", ".join(f"<code>{t}</code>" for t in c["total_tickers"])
+            spr = ", ".join(f"<code>{t}</code>" for t in c["spread_tickers"])
+            rows.append(
+                f'<div style="margin-top:4px;">'
+                f'<strong>{c["matchup"]}</strong>: '
+                f'KXMLBTOTAL = {tot} · KXMLBSPREAD = {spr}'
+                f'</div>'
+            )
+        correlation_html = (
+            f'<div class="highlight highlight-red">'
+            f'⚠️ <strong>Correlated bets today</strong> '
+            f'({len(correlated)} matchup{"" if len(correlated)==1 else "s"} '
+            f'with both KXMLBTOTAL and KXMLBSPREAD positions — game-specific '
+            f'variance is doubled):'
+            f'{"".join(rows)}'
+            f'</div>'
+        )
+    else:
+        correlation_html = ""
+
     # Next-milestone card. Built from go_live_criteria.json so the targets
     # here can't drift from what calibration.py / kalshi_winrate.py check.
     # Hidden when no criteria file present (don't guess targets); shows a
@@ -2140,6 +2254,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 {btc_html}
 {recalib_html}
 {wimbledon_html}
+{correlation_html}
 
 <div class="summary">
   <div class="card">
