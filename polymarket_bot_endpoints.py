@@ -43,6 +43,7 @@ keep these shapes — that's the contract.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -189,6 +190,9 @@ PREDICTION_ACCURACY_PATH = Path(os.getenv(
 ))
 SPREAD_ACCURACY_PATH = Path(os.getenv(
     "KALSHI_SPREAD_ACCURACY", "/app/data/spread_accuracy.json"
+))
+GO_LIVE_CRITERIA_PATH = Path(os.getenv(
+    "KALSHI_GO_LIVE_CRITERIA", "/app/data/go_live_criteria.json"
 ))
 # Placement date that gates pre/post Rule 1 enforcement. See
 # scripts/calibration_live.py for the matching constant; same source-of-truth
@@ -413,6 +417,71 @@ def _dash_go_live(state: dict) -> dict:
         "total": int(latest.get("total") or 4),
         "last_report_date": state.get("last_report_date") or "—",
     }
+
+
+def _dash_load_criteria() -> dict:
+    """Read go_live_criteria.json. Same shape calibration.py consumes:
+    `criteria.min_settled_trades`, `criteria.min_win_rate`,
+    `criteria.require_pnl_positive`. Returns {} when the file is
+    missing/unreadable so callers can short-circuit."""
+    if not GO_LIVE_CRITERIA_PATH.exists():
+        return {}
+    try:
+        with GO_LIVE_CRITERIA_PATH.open() as f:
+            return json.load(f) or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _dash_next_milestone(
+    overall: dict, criteria: dict
+) -> list[dict] | None:
+    """Build the next-milestone bullet list comparing current overall
+    stats against go_live_criteria.json targets. Returns one row per
+    criterion still pending; an empty list means every milestone is
+    already cleared (renderer shows a 'ready for evaluation' message).
+    Returns None when the criteria file is missing so the dashboard
+    can hide the card entirely instead of guessing targets."""
+    if not criteria:
+        return None
+    c = criteria.get("criteria") or {}
+    min_n = int(c.get("min_settled_trades", 50))
+    min_wr = float(c.get("min_win_rate", 0.55))
+    req_pnl = bool(c.get("require_pnl_positive", True))
+
+    n = overall["n"]
+    wr = overall["wr"]
+    pnl = overall["pnl"]
+
+    out: list[dict] = []
+
+    trades_short = max(0, min_n - n)
+    if trades_short > 0:
+        out.append({
+            "icon": "📈",
+            "text": f"Need {trades_short} more trade{'s' if trades_short != 1 else ''} to hit {min_n}",
+        })
+
+    wr_pct = wr * 100
+    target_pct = min_wr * 100
+    wr_gap = target_pct - wr_pct
+    if wr_gap > 0:
+        out.append({
+            "icon": "🎯",
+            "text": (
+                f"Win rate {wr_pct:.1f}% — need +{wr_gap:.1f}pp to hit "
+                f"{target_pct:.0f}%"
+            ),
+        })
+
+    if req_pnl and pnl <= 0:
+        needed = max(0.01, -pnl + 0.01)
+        out.append({
+            "icon": "💰",
+            "text": f"Need +${needed:.2f} profit to go positive",
+        })
+
+    return out
 
 
 # Default cut-off matches the calibration window in go_live_criteria.json
@@ -1261,6 +1330,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     else:
         trades = all_trades
     overall = _dash_overall(trades)
+    criteria = _dash_load_criteria()
+    milestones = _dash_next_milestone(overall, criteria)
     series_rows = _dash_compute_per_series(trades)
     confidence_rows = _dash_compute_per_confidence(trades)
     recent = _dash_recent_table(trades, limit=10)
@@ -1544,6 +1615,30 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f'</div>'
         )
 
+    # Next-milestone card. Built from go_live_criteria.json so the targets
+    # here can't drift from what calibration.py / kalshi_winrate.py check.
+    # Hidden when no criteria file present (don't guess targets); shows a
+    # green "ready" state when every remaining gap is zero.
+    if milestones is None:
+        next_milestone_html = ""
+    elif not milestones:
+        next_milestone_html = (
+            '<div class="highlight highlight-green">'
+            '🎉 <strong>All go-live milestones cleared</strong> — '
+            'next calibration report should fire the auto-live check.'
+            '</div>'
+        )
+    else:
+        bullets = "".join(
+            f'<li>{m["icon"]} {m["text"]}</li>' for m in milestones
+        )
+        next_milestone_html = (
+            '<div class="highlight highlight-muted">'
+            '<strong>Next milestone:</strong>'
+            f'<ul style="margin:6px 0 0 0; padding-left:20px;">{bullets}</ul>'
+            '</div>'
+        )
+
     pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
 
     # Build the qualifying-games table HTML. If no rows, show a hint
@@ -1686,6 +1781,18 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
         pn_str, pn_cls = _dash_fmt_pnl(pnl_v)
         oc_class = {"won": "pos", "lost": "neg"}.get(outcome, "muted")
         paper = " 📄" if t.get("paper") else " 💰"
+        reasoning = (t.get("reasoning") or "").strip()
+        ticker = t.get("ticker", "")
+        if reasoning:
+            reasoning_cell = (
+                f"<details class='reasoning'>"
+                f"<summary>view ({len(reasoning)}c)</summary>"
+                f"<div class='reasoning-meta'>{html.escape(ticker)}</div>"
+                f"<pre class='reasoning-body'>{html.escape(reasoning)}</pre>"
+                f"</details>"
+            )
+        else:
+            reasoning_cell = "<span class='muted'>—</span>"
         recent_table_rows.append(
             f"<tr>"
             f"<td>{ts}</td>"
@@ -1694,6 +1801,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             f"<td>{edge_str}</td>"
             f"<td class='{oc_class}'>{outcome}</td>"
             f"<td class='{pn_cls}'>{pn_str}</td>"
+            f"<td>{reasoning_cell}</td>"
             f"</tr>"
         )
 
@@ -1966,6 +2074,17 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
   .trade-card-pitchers {{ color: #444; font-size: 0.88em; margin-bottom: 4px; }}
   .trade-card-evict {{ font-size: 0.88em; color: #333; }}
   .trade-card-empty {{ color: #888; font-style: italic; }}
+  details.reasoning summary {{ cursor: pointer; color: #1a4fb5;
+                               font-size: 0.85em; user-select: none; }}
+  details.reasoning summary:hover {{ text-decoration: underline; }}
+  details.reasoning[open] summary {{ color: #555; }}
+  .reasoning-meta {{ font-family: monospace; font-size: 0.78em;
+                     color: #666; margin: 6px 0 4px; }}
+  .reasoning-body {{ background: #fafafa; border: 1px solid #e5e5e9;
+                     border-radius: 4px; padding: 8px 10px;
+                     font-size: 0.82em; line-height: 1.45;
+                     white-space: pre-wrap; max-width: 640px;
+                     max-height: 320px; overflow: auto; margin: 0; }}
 </style>
 </head>
 <body>
@@ -2027,6 +2146,8 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     }</span>
   </div>
 </div>
+
+{next_milestone_html}
 
 <h2>Cumulative P&amp;L</h2>
 {svg}
@@ -2101,12 +2222,16 @@ pilot-era trades (structured <code>projected_margin</code> required).
 {spread_breakdown_html}
 
 <h2>Last 10 trades</h2>
+<p class="muted" style="margin-top:0;">
+Click <em>view</em> in the Reasoning column to expand Claude's full prediction
+for that trade — projected total, edge math, gate citations.
+</p>
 <table>
 <thead>
-<tr><th>Date</th><th>Series</th><th>Side</th><th>Edge</th><th>Result</th><th>P&amp;L</th></tr>
+<tr><th>Date</th><th>Series</th><th>Side</th><th>Edge</th><th>Result</th><th>P&amp;L</th><th>Reasoning</th></tr>
 </thead>
 <tbody>
-{"".join(recent_table_rows) or "<tr><td colspan='6' class='muted'>no trades yet</td></tr>"}
+{"".join(recent_table_rows) or "<tr><td colspan='7' class='muted'>no trades yet</td></tr>"}
 </tbody>
 </table>
 

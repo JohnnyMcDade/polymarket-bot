@@ -1392,6 +1392,7 @@ def _check_recalibration_demote() -> tuple[bool, str]:
 
 
 _GRASS_SPECIALISTS_CACHE: dict[str, float] | None = None
+_WIMBLEDON_SEEDS_CACHE: dict[str, int] | None = None
 
 
 def _load_grass_specialists() -> dict[str, float]:
@@ -1401,19 +1402,27 @@ def _load_grass_specialists() -> dict[str, float]:
     Loaded once from data/grass_specialists.json; cached for the
     process lifetime. Empty dict on any failure (filter gracefully
     skips when data is unavailable rather than blocking trades)."""
-    global _GRASS_SPECIALISTS_CACHE
+    global _GRASS_SPECIALISTS_CACHE, _WIMBLEDON_SEEDS_CACHE
     if _GRASS_SPECIALISTS_CACHE is not None:
         return _GRASS_SPECIALISTS_CACHE
     try:
         with GRASS_SPECIALISTS_PATH.open() as f:
             data = json.load(f)
+        players = data.get("players") or {}
         _GRASS_SPECIALISTS_CACHE = {
             name: float(info.get("delta_pp", 0.0))
-            for name, info in (data.get("players") or {}).items()
+            for name, info in players.items()
         }
+        _WIMBLEDON_SEEDS_CACHE = {
+            name: int(info["wimbledon_seed"])
+            for name, info in players.items()
+            if isinstance(info.get("wimbledon_seed"), (int, float))
+        }
+        seeded_n = len(_WIMBLEDON_SEEDS_CACHE)
         print(
             f"[edge] loaded {len(_GRASS_SPECIALISTS_CACHE)} grass "
-            f"specialists from {GRASS_SPECIALISTS_PATH}",
+            f"specialists ({seeded_n} Wimbledon-seeded) from "
+            f"{GRASS_SPECIALISTS_PATH}",
             flush=True,
         )
     except Exception as e:
@@ -1423,7 +1432,17 @@ def _load_grass_specialists() -> dict[str, float]:
             flush=True,
         )
         _GRASS_SPECIALISTS_CACHE = {}
+        _WIMBLEDON_SEEDS_CACHE = {}
     return _GRASS_SPECIALISTS_CACHE
+
+
+def _wimbledon_seed_of(player: str) -> int | None:
+    """Return the player's current Wimbledon seed number (1-32), or
+    None if unseeded or seedings haven't been fetched yet. Reads the
+    same cache as _load_grass_specialists; call that first."""
+    if _WIMBLEDON_SEEDS_CACHE is None:
+        _load_grass_specialists()
+    return (_WIMBLEDON_SEEDS_CACHE or {}).get(player)
 
 
 def _is_grass_event(title: str) -> bool:
@@ -1434,6 +1453,13 @@ def _is_grass_event(title: str) -> bool:
     out events with unknown surface to fail safe (filter doesn't fire)."""
     t = (title or "").lower()
     return any(g in t for g in GRASS_TOURNAMENTS)
+
+
+def _is_wimbledon_event(title: str) -> bool:
+    """True iff the title is Wimbledon specifically. Used to gate the
+    Wimbledon-seed annotation on grass-filter passes (seeds at Halle
+    or Queens are different draws and shouldn't be cross-applied)."""
+    return "wimbledon" in (title or "").lower()
 
 
 def _btc_filter_passes(
@@ -1621,9 +1647,16 @@ def _tennis_filter_passes(
                 f"({yes_player}={yes_delta:+.1f}pp, "
                 f"{no_player}={no_delta:+.1f}pp)"
             )
+        yes_seed = _wimbledon_seed_of(yes_player)
+        no_seed = _wimbledon_seed_of(no_player)
+        seed_note = ""
+        if yes_seed is not None and _is_wimbledon_event(item.get("title", "")):
+            opp_seed = f" vs seed #{no_seed}" if no_seed else " vs unseeded"
+            seed_note = f" [Wimbledon seed #{yes_seed}{opp_seed}]"
         return True, (
             f"YES={yes_player}(#{yes_rank}) vs {no_player}(#{no_rank}) "
             f"gap={gap} ask={yes_ask}c [grass-spec diff +{diff:.1f}pp]"
+            f"{seed_note}"
         )
 
     return True, (
