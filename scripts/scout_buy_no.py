@@ -35,6 +35,14 @@ import requests
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 ERA_CAP = 3.50
 
+# Cohort baseline YES probability for the data-stable cell (-9 ticker,
+# both starters ERA < 3.50). 180d backtest n=25, UNDER win-rate 80% →
+# YES win-rate 20%. The live bot tightens this with Claude's runtime
+# projected_total; the scout uses the pure cohort prior as an
+# always-available approximation so we can flag price dislocations
+# before pitcher news/projection refines the read.
+COHORT_YES_PROB = 0.20
+
 
 def fetch_kxmlbtotal_markets(limit: int = 200) -> list[dict]:
     """Fetch one page of open KXMLBTOTAL markets. 200 is generous enough
@@ -109,7 +117,10 @@ def main() -> int:
     # Map (away, home) → set of available tails. Variable-length team
     # abbrs (SF, KC are 2-char) mean we test endswith(away+home)
     # against the ticker's middle segment rather than parsing offsets.
+    # Also map (away, home, tail) → full market dict so the efficiency
+    # check below can read yes_ask / no_ask without a second API hop.
     available_tails: dict[tuple[str, str], set[str]] = {}
+    markets_by_key: dict[tuple[str, str, str], dict] = {}
     for m in tickers_on_date:
         ticker = m.get("ticker", "")
         parts = ticker.split("-")
@@ -122,6 +133,7 @@ def main() -> int:
             if ah and middle.endswith(ah):
                 key = (g["away"], g["home"])
                 available_tails.setdefault(key, set()).add(tail)
+                markets_by_key[(g["away"], g["home"], tail)] = m
                 break
 
     print(
@@ -147,6 +159,9 @@ def main() -> int:
             available_tails.get((away, home), set()) & {"9"},
             key=int,
         )
+        market_9 = markets_by_key.get((away, home, "9"))
+        yes_ask = market_9.get("yes_ask") if market_9 else None
+        no_ask = market_9.get("no_ask") if market_9 else None
         row = {
             "matchup": f"{away}@{home}",
             "start": (g.get("start_time_utc") or "?") + " UTC",
@@ -155,6 +170,8 @@ def main() -> int:
             "ap_era": ap_era,
             "hp_era": hp_era,
             "cohort_tails": cohort_tails,
+            "yes_ask": yes_ask,
+            "no_ask": no_ask,
         }
         if ap_era is None or hp_era is None:
             no_data.append(row)
@@ -167,6 +184,27 @@ def main() -> int:
         else:
             not_qualifying.append(row)
 
+    def fmt_efficiency(r: dict) -> str:
+        """Format the cohort-vs-market line for the -9 ticker. Empty
+        string when prices aren't on the row (non-qualifying matchup
+        or Kalshi response missing the bid/ask)."""
+        y, n = r.get("yes_ask"), r.get("no_ask")
+        if y is None and n is None:
+            return ""
+        our_yes_pct = COHORT_YES_PROB * 100
+        our_no_pct = (1 - COHORT_YES_PROB) * 100
+        bits = [f"\n    cohort YES: {our_yes_pct:.0f}%"]
+        if y is not None:
+            edge_yes = COHORT_YES_PROB - (y / 100)
+            bits.append(f"vs market YES ask {y}¢ → YES edge {edge_yes*100:+.1f}%")
+        if n is not None:
+            edge_no = (1 - COHORT_YES_PROB) - (n / 100)
+            bits.append(
+                f"| cohort NO {our_no_pct:.0f}% vs market NO ask {n}¢ "
+                f"→ NO edge {edge_no*100:+.1f}%"
+            )
+        return "  ".join(bits)
+
     def fmt_row(r: dict) -> str:
         tails_str = (
             ",".join(f"-{t}" for t in r["cohort_tails"]) or "—"
@@ -176,6 +214,7 @@ def main() -> int:
         return (
             f"  {r['matchup']:<9} {r['start']:<10}  "
             f"away: {ap:<32}  home: {hp:<32}  cohort: {tails_str}"
+            f"{fmt_efficiency(r)}"
         )
 
     def section(title: str, rows: list[dict]) -> None:
