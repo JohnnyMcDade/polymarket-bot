@@ -37,6 +37,9 @@ from pathlib import Path
 
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _kalshi_local_snapshot import load_local_markets  # noqa: E402
+
 
 KALSHI_MARKETS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 HOME_ADVANTAGE_RUNS = 0.3
@@ -123,8 +126,17 @@ def main() -> int:
     try:
         markets = fetch_kxmlbspread_markets()
     except requests.RequestException as e:
-        print(f"[ERROR] Kalshi API fetch failed: {e}", file=sys.stderr)
-        return 1
+        local, src = load_local_markets("KXMLBSPREAD")
+        if not local:
+            print(f"[ERROR] Kalshi API fetch failed: {e}", file=sys.stderr)
+            print("[ERROR] No local snapshot available either.", file=sys.stderr)
+            return 1
+        print(
+            f"[WARN] Kalshi API unreachable ({e}); using local snapshot "
+            f"from {src} ({len(local)} markets).",
+            file=sys.stderr,
+        )
+        markets = local
 
     tickers_on_date = [m for m in markets if date_tok in m.get("ticker", "")]
 

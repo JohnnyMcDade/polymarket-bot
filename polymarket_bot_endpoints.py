@@ -484,6 +484,79 @@ def _dash_next_milestone(
     return out
 
 
+def _dash_recent_trend(
+    trades: list[dict], overall: dict, criteria: dict, recent_n: int = 5
+) -> dict | None:
+    """Compute the "time to profitability" estimate shown next to the
+    next-milestone card. Compares the last `recent_n` decided trades'
+    win rate against the overall window's WR and against the go-live
+    target, then back-solves how many more trades at the recent pace
+    would lift the windowed WR to target.
+
+    Returns None when criteria are missing or there aren't enough
+    decided trades to compute (n < 1 or recent_n cohort empty)."""
+    if not criteria:
+        return None
+    c = criteria.get("criteria") or {}
+    target_wr = float(c.get("min_win_rate", 0.55))
+
+    decided = [t for t in trades if t.get("outcome") in ("won", "lost")]
+    if not decided:
+        return None
+    decided_sorted = sorted(
+        decided,
+        key=lambda t: str(t.get("settled_at") or t.get("timestamp") or ""),
+    )
+    recent = decided_sorted[-recent_n:]
+    if not recent:
+        return None
+
+    recent_wins = sum(1 for t in recent if t["outcome"] == "won")
+    recent_losses = len(recent) - recent_wins
+    recent_wr = recent_wins / len(recent)
+
+    overall_wr = float(overall.get("wr") or 0.0)
+    delta = recent_wr - overall_wr
+    if delta > 0.05:
+        trend = "up"
+    elif delta < -0.05:
+        trend = "down"
+    else:
+        trend = "flat"
+
+    n = int(overall.get("n") or 0)
+    eta_trades: int | None
+    eta_caveat = ""
+    if overall_wr >= target_wr:
+        eta_trades = 0
+    elif recent_wr <= target_wr + 1e-6:
+        # Algebra (target_wr * (n+k) ≤ n*overall_wr + k*recent_wr)
+        # has no positive solution when recent ≤ target — the
+        # rolling WR would never climb. Surface a caveat instead
+        # of an infinity/negative number.
+        eta_trades = None
+        eta_caveat = (
+            f"recent {recent_wr:.0%} ≤ target {target_wr:.0%} — "
+            f"need to improve before this estimate is meaningful"
+        )
+    else:
+        numerator = n * (target_wr - overall_wr)
+        denominator = recent_wr - target_wr
+        eta_trades = max(1, int(round(numerator / denominator)))
+
+    return {
+        "recent_n": len(recent),
+        "recent_wins": recent_wins,
+        "recent_losses": recent_losses,
+        "recent_wr": recent_wr,
+        "trend": trend,
+        "target_wr": target_wr,
+        "overall_wr": overall_wr,
+        "eta_trades": eta_trades,
+        "eta_caveat": eta_caveat,
+    }
+
+
 # Default cut-off matches the calibration window in go_live_criteria.json
 # (registered 2026-06-11 with since_date 2026-06-07). Trades before that
 # pre-date the KALSHI_MAX_EDGE cap from 24ae529 + the KXBTC bucket filter
@@ -1430,6 +1503,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
     overall = _dash_overall(trades)
     criteria = _dash_load_criteria()
     milestones = _dash_next_milestone(overall, criteria)
+    trend = _dash_recent_trend(trades, overall, criteria, recent_n=5)
     series_rows = _dash_compute_per_series(trades)
     confidence_rows = _dash_compute_per_confidence(trades)
     recent = _dash_recent_table(trades, limit=10)
@@ -1765,6 +1839,49 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
             '<strong>Next milestone:</strong>'
             f'<ul style="margin:6px 0 0 0; padding-left:20px;">{bullets}</ul>'
             '</div>'
+        )
+
+    # Time-to-profitability estimate. Hidden alongside the milestone
+    # card when criteria are missing. Recent-window WR plus a trend
+    # arrow gives the operator a "are we converging or diverging" read
+    # at a glance; the eta_trades back-solves how many more trades at
+    # the recent pace would lift overall WR to target.
+    if trend is None:
+        trend_html = ""
+    else:
+        trend_icon = {"up": "📈", "down": "📉", "flat": "→"}[trend["trend"]]
+        trend_word = {"up": "trending up", "down": "trending down", "flat": "flat"}[
+            trend["trend"]
+        ]
+        recent_line = (
+            f"Last {trend['recent_n']} trades: "
+            f"{trend['recent_wins']}W/{trend['recent_losses']}L "
+            f"= {trend['recent_wr']:.0%} — {trend_icon} {trend_word}"
+        )
+        target_pct = trend["target_wr"] * 100
+        overall_pct = trend["overall_wr"] * 100
+        target_line = (
+            f"At {overall_pct:.1f}% WR you need {target_pct:.0f}%+ to go live"
+        )
+        if trend["eta_trades"] is None:
+            eta_line = (
+                f"<span class='muted'>{trend['eta_caveat']}</span>"
+            )
+        elif trend["eta_trades"] == 0:
+            eta_line = "✅ overall WR already at/above target"
+        else:
+            eta_line = (
+                f"Est. go-live: <strong>~{trend['eta_trades']} more trades</strong> "
+                f"at this pace"
+            )
+        trend_html = (
+            '<div class="highlight highlight-muted">'
+            '<strong>Time to profitability:</strong>'
+            '<ul style="margin:6px 0 0 0; padding-left:20px;">'
+            f'<li>{target_line}</li>'
+            f'<li>{recent_line}</li>'
+            f'<li>{eta_line}</li>'
+            '</ul></div>'
         )
 
     pnl_str, pnl_cls = _dash_fmt_pnl(overall["pnl"])
@@ -2320,6 +2437,7 @@ def dashboard(since: str = _DASH_DEFAULT_SINCE) -> HTMLResponse:
 </div>
 
 {next_milestone_html}
+{trend_html}
 
 <h2>Cumulative P&amp;L</h2>
 {svg}
