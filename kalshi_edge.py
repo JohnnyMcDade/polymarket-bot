@@ -1019,12 +1019,13 @@ MLB FACTS BLOCK (PER-MARKET INJECTION)
 KXMLBTOTAL PARK / UMPIRE / WEATHER SIGNALS (NEW 2026-06-15)
 - PARK_FACTOR is the home stadium's run-scoring index normalized to ~1.0 league average. >1.03 = high-run park, <0.97 = pitcher's park. Multiply your baseline expected total by the park factor when projecting runs for KXMLBTOTAL / KXMLBTEAMTOTAL: a baseline 8.5-run projection at Coors (1.32) becomes ~11.2, at Petco (0.85) becomes ~7.2. Park factor effect compounds with starter quality — an elite arm at Coors still allows more runs than an average arm at Petco.
 - HOME_PLATE_UMP is the assigned home plate umpire's name when known (populates a few hours pre-game; absent at morning evaluation time). When known and the name matches a famously tight-strike-zone ump (e.g. Hunter Wendelstedt, Doug Eddings — small zones inflate K rates and walk rates simultaneously) or a famously generous zone (e.g. Joe West historically — though retired, illustrative), shade your expected total down 0.2-0.4 runs for tight zones and up 0.2-0.4 runs for generous zones. Do NOT apply this adjustment when the umpire field is absent or empty — never invent an umpire bias.
-- WEATHER carries temp_f / wind / cond at the ballpark. Apply these rules:
-    - Temp < 50°F → cold air kills carry; shade expected total DOWN 0.3-0.5 runs.
-    - Temp > 80°F → warm air boosts carry; shade UP 0.2-0.4 runs.
-    - Wind > 15mph blowing OUT (S/SW/W at most parks, but check by ballpark) → shade UP 0.5-0.8 runs. Wrigley Field is THE classic wind-aided park.
-    - Wind > 15mph blowing IN → shade DOWN 0.4-0.6 runs.
-    - Light rain or fog in cond → modest DOWN shade (0.2 runs) plus heightened postponement risk for very-near-close markets; if game_time is < 60min away and cond mentions rain, SKIP rather than guess at a delay.
+- WEATHER carries temp_f / wind_mph / wind_dir / cond at the ballpark. Apply these specific run-adjustments to your projected_total — they are additive, not ranges to pick from. Show the math in your reasoning (e.g. "baseline 8.7 + wind_out 0.8 = 9.5").
+    - Wind > 15mph blowing OUT (S/SW/W at most parks; Wrigley is the canonical wind-aided park) → ADD +0.8 runs.
+    - Wind > 15mph blowing IN → SUBTRACT -0.8 runs.
+    - Temp < 50°F → cold air kills carry → SUBTRACT -0.5 runs.
+    - Temp > 80°F → warm air boosts carry → ADD +0.3 runs.
+    - Light rain or fog in cond → SUBTRACT -0.2 runs, and if game_time is < 60min away with rain in cond, SKIP rather than guess at a delay.
+    - Wind 8–15mph or temp 50–80°F → no adjustment; the signal is too noisy at those margins.
 - These three signals are SUPPLEMENTARY — they tune the prediction but never override the rolling-ERA + bullpen + H2H foundation. A 2.50 rolling-ERA elite arm at Coors with strong tailwind is still your best UNDER bet at the 11.5 line, not the OVER, because the starter quality dominates the park effect over 6 innings.
 
 KXMLBTOTAL UNDER-LEAN ROUTING (NEW 2026-06-17)
