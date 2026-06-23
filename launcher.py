@@ -2,23 +2,11 @@ import os
 import subprocess
 import sys
 import threading
-import time
 import traceback
 from polymarket_bot_endpoints import start_api_server
 
-# The 4 new Kalshi agents are imported (NOT subprocessed) because the
-# trader and edge agents share state through kalshi_queue.py's in-memory
-# queues. Subprocess-spawned agents would each see an empty queue. The
-# Polymarket agents below stay subprocess-spawned because they don't
-# share state with anything else.
-import kalshi_stats
-import kalshi_edge
-import kalshi_trader
-import kalshi_winrate
-import kalshi_tracker  # whale watcher — independent of the trading pipeline
 
-
-# ── Polymarket agents (subprocess-wrapped, unchanged) ─────────────────────
+# ── Polymarket / PassivePoly agents (subprocess-wrapped) ──────────────────
 
 def run_bot():
     try:
@@ -68,97 +56,19 @@ def run_postmortem():
         traceback.print_exc()
 
 
-# ── Kalshi pipeline agents (in-process — share kalshi_queue state) ────────
-# Each wrapper has try/except so one agent crashing doesn't kill the others.
-# Stats fires daily at 06:00 UTC, edge every 30 min, trader every 5 min,
-# winrate daily at 07:00 UTC. The trader pulls from kalshi_queue stage
-# "risk" which is what edge enqueues into.
-
-def run_kalshi_stats():
-    try:
-        print("Kalshi Stats thread starting...")
-        kalshi_stats.run()
-    except Exception as e:
-        print(f"Kalshi Stats error: {e}")
-        traceback.print_exc()
-
-def run_kalshi_macro():
-    try:
-        print("Kalshi Macro thread starting...")
-        kalshi_stats.run_macro()
-    except Exception as e:
-        print(f"Kalshi Macro error: {e}")
-        traceback.print_exc()
-
-def run_kalshi_edge():
-    # Watchdog: restart the edge loop if run() ever returns or raises
-    # anything other than KeyboardInterrupt. Catches BaseException so
-    # SystemExit / MemoryError also trigger a restart instead of silently
-    # killing the thread.
-    while True:
-        try:
-            print("Kalshi Edge thread starting...")
-            kalshi_edge.run()
-        except KeyboardInterrupt:
-            raise
-        except BaseException as e:
-            print(f"Kalshi Edge error: {type(e).__name__}: {e}")
-            traceback.print_exc()
-        print("[edge] THREAD DIED — restarting", flush=True)
-        time.sleep(5)
-
-def run_kalshi_trader():
-    try:
-        print("Kalshi Trader thread starting...")
-        kalshi_trader.run()
-    except Exception as e:
-        print(f"Kalshi Trader error: {e}")
-        traceback.print_exc()
-
-def run_kalshi_winrate():
-    try:
-        print("Kalshi Win-Rate thread starting...")
-        kalshi_winrate.run()
-    except Exception as e:
-        print(f"Kalshi Win-Rate error: {e}")
-        traceback.print_exc()
-
-def run_kalshi_tracker():
-    try:
-        print("Kalshi Tracker thread starting...")
-        kalshi_tracker.run()
-    except Exception as e:
-        print(f"Kalshi Tracker error: {e}")
-        traceback.print_exc()
-
-
 print("Launcher starting all processes...")
 
-# Polymarket agents (6 subprocess wrappers, unchanged)
-t1  = threading.Thread(target=run_bot)
-t2  = threading.Thread(target=run_scanner)
-t3  = threading.Thread(target=run_research)
-t4  = threading.Thread(target=run_risk)
-t5  = threading.Thread(target=run_prediction)
-t6  = threading.Thread(target=run_postmortem)
+t1 = threading.Thread(target=run_bot)
+t2 = threading.Thread(target=run_scanner)
+t3 = threading.Thread(target=run_research)
+t4 = threading.Thread(target=run_risk)
+t5 = threading.Thread(target=run_prediction)
+t6 = threading.Thread(target=run_postmortem)
 
-# Kalshi pipeline (4 in-process threads sharing kalshi_queue state)
-t7  = threading.Thread(target=run_kalshi_stats)
-t8  = threading.Thread(target=run_kalshi_edge)
-t9  = threading.Thread(target=run_kalshi_trader)
-t10 = threading.Thread(target=run_kalshi_winrate)
-
-# Kalshi whale tracker — parallel, not part of the trading pipeline
-t11 = threading.Thread(target=run_kalshi_tracker)
-
-# Hourly macro refresh — shares the stats cache lock with the daily stats
-# thread above so concurrent writes never clobber each other.
-t12 = threading.Thread(target=run_kalshi_macro)
-
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12):
+for t in (t1, t2, t3, t4, t5, t6):
     t.start()
 
-# FastAPI server for the TikTok UGC ads pipeline (unchanged)
+# FastAPI server for the TikTok UGC ads pipeline
 threading.Thread(
     target=start_api_server,
     kwargs={"host": "0.0.0.0", "port": int(os.environ.get("PORT", 8000))},
@@ -166,5 +76,5 @@ threading.Thread(
 ).start()
 print("API server thread started on port", os.environ.get("PORT", 8000))
 
-for t in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12):
+for t in (t1, t2, t3, t4, t5, t6):
     t.join()
